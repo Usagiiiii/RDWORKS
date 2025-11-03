@@ -653,3 +653,5 @@ class MainWindow(QMainWindow):
                          '专业的激光加工控制软件\n'
                          '支持精确绘图、参数设置和加工控制')
 
+    def import_file(self):
+        print(1)
