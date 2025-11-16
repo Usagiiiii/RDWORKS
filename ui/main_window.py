@@ -3,25 +3,59 @@
 """
 主窗口类
 """
+import os
+from typing import List
 
-from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QDockWidget,
-                             QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
-                             QLabel, QFileDialog, QMessageBox, QSplitter,
-                             QToolButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox)
+from PIL import Image
+from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QIcon, QKeySequence, QColor, QPalette
+from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidget, QLabel, QFileDialog, QMessageBox,
+                             QLineEdit)
 
-from ui.whiteboard import WhiteboardWidget
+from my_io.importers.supported_filter import SUPPORTED_FILTER
 from ui.left_toolbar import LeftToolbar
 from ui.right_panel import RightPanel
-
+from ui.whiteboard import WhiteboardWidget
+from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
+from utils.logging_utils import setup_logging
+from utils.tool_utils import check_required_tools
+from ui.whiteboard import Path
 
 class MainWindow(QMainWindow):
     """主窗口类"""
-    
+
     def __init__(self):
         super().__init__()
-        self.init_ui()
+        self.logger = setup_logging()
+        self.logger.info("MainWindow初始化开始")
+        self.init_ui()  # 假设这个方法已经创建了左侧工具栏和右侧面板
+        check_required_tools(self)
+
+        # -------------------------- 关键修复：整合所有组件到布局 --------------------------
+        # 1. 创建一个容器widget作为中心区域的“总载体”
+        central_container = QWidget()
+        # 2. 使用水平布局（左-中-右）
+        main_layout = QHBoxLayout(central_container)
+        main_layout.setContentsMargins(0, 0, 0, 0)  # 去除外边框
+        main_layout.setSpacing(0)  # 去除组件间间距
+
+        # 3. 添加左侧工具栏（假设你的左侧工具栏变量名为 self.left_toolbar）
+        # 注意：这里的变量名要和你实际定义的左侧工具栏一致（比如可能叫 self.sidebar）
+        main_layout.addWidget(self.left_toolbar)
+
+        # 4. 添加白板部件（中间区域，占最大空间）
+        self.whiteboard = WhiteboardWidget()
+        main_layout.addWidget(self.whiteboard, 1)  # 权重设为1，让它占满剩余空间
+
+        # 5. 添加右侧面板（假设你的右侧面板变量名为 self.right_panel）
+        main_layout.addWidget(self.right_panel)
+
+        # 6. 把整合好的容器设为中心部件
+        self.setCentralWidget(central_container)
+        # ------------------------------------------------------------------------------
+
+        self.logger.info("MainWindow初始化完成")
         
     def init_ui(self):
         """初始化用户界面"""
@@ -42,7 +76,9 @@ class MainWindow(QMainWindow):
         
         # 状态栏
         self.statusBar().showMessage('就绪')
-        
+
+
+
     def setup_style(self):
         """设置应用程序样式"""
         # 设置调色板
@@ -84,9 +120,9 @@ class MainWindow(QMainWindow):
         
         file_menu.addSeparator()
         
-        export_action = QAction('导出图像(&E)...', self)
-        export_action.setStatusTip('导出为图像文件')
-        export_action.triggered.connect(self.export_image)
+        export_action = QAction('导入底图(&E)...', self)
+        export_action.setStatusTip('导入图像文件')
+        export_action.triggered.connect(self.import_image)
         file_menu.addAction(export_action)
         
         file_menu.addSeparator()
@@ -557,15 +593,373 @@ class MainWindow(QMainWindow):
                                                   '白板文件 (*.wbd);;所有文件 (*)')
         if filename:
             self.statusBar().showMessage(f'保存文件: {filename}')
-            
-    def export_image(self):
-        """导出图像"""
-        filename, _ = QFileDialog.getSaveFileName(self, '导出图像', '', 
-                                                  'PNG图像 (*.png);;JPEG图像 (*.jpg);;所有文件 (*)')
-        if filename:
-            self.whiteboard.export_image(filename)
-            self.statusBar().showMessage(f'已导出图像: {filename}')
-            
+
+    def import_image(self):
+        """
+        合成后的图像/矢量文件导入总函数：整合原 _on_import_any、_filter、import_file_any 所有逻辑
+        支持格式：HPGL/PLT、WBMP、BMP/PNG/JPG等位图、EPS、AI、DXF/SVG、G-code、PDF、PCX/TGA 等
+        保持原所有处理逻辑、交互提示、异常处理不变
+        """
+        # --------------------------- 原 _filter 函数逻辑（直接返回支持的过滤器） ---------------------------
+        SUPPORTED_FILTER_LOCAL = SUPPORTED_FILTER  # 复用原 SUPPORTED_FILTER 常量
+
+        # --------------------------- 原 _on_import_any 开头：文件选择与初始化 ---------------------------
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, '导入', filter=SUPPORTED_FILTER_LOCAL)
+        if not path:
+            return
+
+        lower = path.lower()
+        self.logger.info(f"开始导入文件: {path}")  # 记录导入的文件路径
+
+        try:
+            # --------------------------- HPGL/PLT文件导入部分 - 保留原简化版逻辑 ---------------------------
+            if lower.endswith(('.plt', '.hpgl')):
+                # 基础文件检查
+                if not os.path.exists(path):
+                    self.statusBar().showMessage(f"HPGL/PLT文件不存在: {os.path.basename(path)}", 5000)
+                    return
+
+                if not os.access(path, os.R_OK):
+                    self.statusBar().showMessage(f"HPGL/PLT文件不可读: {os.path.basename(path)}", 5000)
+                    return
+
+                file_size = os.path.getsize(path)
+                if file_size == 0:
+                    self.statusBar().showMessage("HPGL/PLT文件为空", 5000)
+                    return
+
+                self.statusBar().showMessage("正在导入HPGL/PLT文件...")
+                QtWidgets.QApplication.processEvents()
+
+                try:
+                    # --------------------------- 原 import_file_any 中 HPGL/PLT 处理逻辑 ---------------------------
+                    from my_io.importers.import_hpgl import import_hpgl
+                    paths = import_hpgl(path)
+
+                    if paths:
+                        # 添加路径到画布
+                        for pts in paths:
+                            if len(pts) > 0:
+                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+
+                        self.whiteboard.canvas.fit_all()
+                        path_count = len(paths)
+                        total_points = sum(len(pts) for pts in paths)
+                        self.statusBar().showMessage(
+                            f'HPGL/PLT导入成功: {os.path.basename(path)} (路径数={path_count}, 总点数={total_points})',
+                            5000)
+                    else:
+                        self.statusBar().showMessage(f'HPGL/PLT文件 {os.path.basename(path)} 中未找到可导入的图形数据', 5000)
+
+                except Exception as e:
+                    self.statusBar().showMessage(f'HPGL/PLT导入错误: {str(e)}', 5000)
+                    QtWidgets.QMessageBox.warning(self, "导入失败", f"HPGL/PLT文件导入失败:\n{str(e)}")
+
+                return  # HPGL/PLT处理完成，直接返回
+
+            # --------------------------- 处理WBMP文件 - 保留原逻辑 ---------------------------
+            if lower.endswith('.wbmp'):
+                # 尝试直接转换WBMP为PNG
+                wbmp_img = convert_wbmp_to_png(path)
+                if wbmp_img:
+                    self._current_bitmap = wbmp_img
+                    pix = pil_to_qpixmap(wbmp_img)
+                    self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                    self.whiteboard.canvas.fit_all()
+                    self.statusBar().showMessage(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
+                    return
+                else:
+                    # 尝试用inkscape转换
+                    from utils.import_utils import auto_convert_file
+                    converted_path, convert_msg = auto_convert_file(path, 'png')
+                    if converted_path:
+                        try:
+                            im = Image.open(converted_path).convert('RGBA')
+                            self._current_bitmap = im
+                            pix = pil_to_qpixmap(im)
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            self.whiteboard.canvas.fit_all()
+                            self.statusBar().showMessage(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
+                            os.unlink(converted_path)
+                            return
+                        except Exception as e2:
+                            os.unlink(converted_path)
+
+            # --------------------------- 位图/EPS/WMF/EMF 处理 - 保留原逻辑 ---------------------------
+            if lower.endswith((
+                    '.bmp', '.png', '.jpg', '.jpeg', '.gif', '.tif', '.tiff', '.webp',
+                    '.pbm', '.pgm', '.ppm', '.pnm', '.ras', '.raw', '.ico', '.cur',
+                    '.emf', '.wmf', '.eps', '.jp2'
+            )):
+                if lower.endswith('.eps'):
+                    # 先尝试矢量导入EPS
+                    self.statusBar().showMessage("正在处理EPS文件（使用软件自带工具）...")
+                    QtWidgets.QApplication.processEvents()
+
+                    # 先尝试矢量导入EPS
+                    from my_io.importers.import_eps_vector import import_eps_as_vector
+                    paths, status_msg = import_eps_as_vector(path)
+
+                    if paths is not None:
+                        # 矢量导入成功
+                        for pts in paths:
+                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                        self.whiteboard.canvas.fit_all()
+                        self.statusBar().showMessage(f"EPS矢量导入成功: {status_msg}", 5000)
+                        return
+
+                    # 矢量导入失败，尝试位图导入
+                    from my_io.importers.import_eps_bitmap import import_eps_as_bitmap
+                    im, error_msg = import_eps_as_bitmap(path)
+
+                    if im is not None:
+                        # 位图导入成功
+                        pix = self.pil_to_qpixmap(im)
+                        self._current_bitmap = im.copy()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                        self.whiteboard.canvas.fit_all()
+                        self.statusBar().showMessage(f"EPS位图导入成功", 5000)
+                    else:
+                        raise RuntimeError(f"EPS文件导入失败:\n{error_msg if error_msg else status_msg}")
+                    return
+                else:
+                    # 处理其他位图
+                    try:
+                        im = Image.open(path).convert('RGBA')
+                        self._current_bitmap = im
+                        pix = pil_to_qpixmap(im)
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                        self.whiteboard.canvas.fit_all()
+                        self.statusBar().showMessage(f'已导入位图: {os.path.basename(path)}', 5000)
+                        return
+                    except Exception as e:
+                        # 尝试转换
+                        from utils.import_utils import auto_convert_file
+                        converted_path, convert_msg = auto_convert_file(path, 'png')
+                        if converted_path:
+                            try:
+                                im = Image.open(converted_path).convert('RGBA')
+                                self._current_bitmap = im
+                                pix = pil_to_qpixmap(im)
+                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                                self.whiteboard.canvas.fit_all()
+                                self.statusBar().showMessage(f'已转换并导入位图: {os.path.basename(path)}', 5000)
+                                os.unlink(converted_path)
+                                return
+                            except Exception as e2:
+                                os.unlink(converted_path)
+
+            # --------------------------- 处理AI文件 - 保留原核心逻辑 ---------------------------
+            if lower.endswith('.ai'):
+                self.statusBar().showMessage("正在处理AI文件（使用软件自带工具）...")
+                QtWidgets.QApplication.processEvents()  # 刷新UI，显示状态
+                self.logger.info("开始处理AI文件，调用import_ai")
+
+                from my_io.importers.import_ai import import_ai
+                paths, status_msg, bitmap_image = import_ai(path)  # 调用导入函数
+
+                self.logger.info(
+                    f"import_ai返回结果: "
+                    f"paths={bool(paths)}, "
+                    f"bitmap={bool(bitmap_image)}, "
+                    f"msg={status_msg}"
+                )
+
+                # 1. 优先处理位图（如果存在）
+                if bitmap_image is not None:
+                    try:
+                        # 转换PIL图像为QPixmap
+                        pix = pil_to_qpixmap(bitmap_image)
+                        if pix.isNull():
+                            raise ValueError("位图转换为QPixmap失败（空图像）")
+
+                        # 保存位图副本并添加到画布
+                        self._current_bitmap = bitmap_image.copy()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)  # 添加到画布(0,0)位置
+                        self.whiteboard.canvas.fit_all()  # 自动调整视图以显示全图
+
+                        # 显示成功信息
+                        success_msg = f"✓ AI转换为位图成功: {os.path.basename(path)}"
+                        self.statusBar().showMessage(success_msg, 5000)  # 5秒后消失
+                        self.logger.info("AI文件作为位图成功导入")
+
+                    except Exception as e:
+                        # 位图处理失败的异常处理
+                        err_msg = f"位图显示失败: {str(e)}"
+                        self.statusBar().showMessage(err_msg, 5000)
+                        self.logger.error(f"位图处理异常: {err_msg}", exc_info=True)  # 记录堆栈
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "显示失败",
+                            f"位图导入过程出错:\n{err_msg}"
+                        )
+
+                # 2. 处理矢量路径（如果位图不存在且路径有效）
+                elif paths is not None and len(paths) > 0:
+                    try:
+                        # 日志记录路径基本信息
+                        self.logger.info(f"AI矢量路径有效，共{len(paths)}条路径")
+                        first_path_pts = paths[0] if len(paths) > 0 else []
+                        self.logger.info(
+                            f"第一条路径包含{len(first_path_pts)}个点，"
+                            f"第一个点坐标: {first_path_pts[0] if first_path_pts else '无'}"
+                        )
+
+                        # 绘制所有路径（红色，确保可见）
+                        for idx, pts in enumerate(paths):
+                            if len(pts) < 2:
+                                self.logger.warning(f"路径{idx}点数量不足（{len(pts)}个），跳过绘制")
+                                continue
+                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(255, 0, 0))  # 红色线条
+
+                        # 调整视图以显示所有路径
+                        self.whiteboard.canvas.fit_all()
+                        self.logger.info("所有有效路径已添加到画布，并调用fit_all刷新视图")
+
+                        # 显示成功信息
+                        success_msg = f"✓ AI矢量路径导入成功: {os.path.basename(path)}"
+                        self.statusBar().showMessage(success_msg, 5000)
+
+                    except Exception as e:
+                        # 矢量路径处理失败的异常处理
+                        err_msg = f"矢量路径绘制失败: {str(e)}"
+                        self.statusBar().showMessage(err_msg, 5000)
+                        self.logger.error(f"矢量路径处理异常: {err_msg}", exc_info=True)
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "绘制失败",
+                            f"矢量路径导入过程出错:\n{err_msg}"
+                        )
+
+                # 3. 所有方法均失败（无位图且无有效路径）
+                else:
+                    error_msg = f"AI文件导入失败:\n{status_msg}"
+                    self.statusBar().showMessage(error_msg, 5000)
+                    self.logger.error(f"AI导入完全失败: {error_msg}")
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "导入失败",
+                        error_msg,
+                        QtWidgets.QMessageBox.Ok
+                    )
+
+                return  # 结束AI文件处理
+
+            # --------------------------- 其他格式：原 import_file_any 核心逻辑 ---------------------------
+            paths: List[Path] = []
+            try:
+                # 处理 DXF 格式
+                if lower.endswith(('.dxf',)):
+                    from my_io.importers.import_dxf import import_dxf
+                    paths = import_dxf(path)
+                # 处理 SVG 格式
+                elif lower.endswith(('.svg',)):
+                    from my_io.importers.import_svg import import_svg
+                    paths = import_svg(path)
+                elif lower.endswith(('.nc', '.ngc', '.gcode')):
+                    from my_io.importers.import_gcode import import_gcode
+                    paths = import_gcode(path)
+                elif lower.endswith(('.pdf', '.ai')):
+                    from my_io.importers.import_pdf import import_pdf_or_ai
+                    paths = import_pdf_or_ai(path)
+                elif lower.endswith(('.eps',)):
+                    # 尝试先作为矢量导入EPS
+                    try:
+                        from my_io.importers.import_eps_vector import import_eps_as_vector
+                        vector_paths = import_eps_as_vector(path)
+                        if vector_paths:
+                            paths = vector_paths
+                    except:
+                        pass
+                elif lower.endswith('.pcx'):
+                    try:
+                        from my_io.importers.import_pcx import import_pcx
+                        pcx_paths, status_msg, bitmap_image = import_pcx(path)
+
+                        if bitmap_image is not None:
+                            # 直接显示位图
+                            pix = self.pil_to_qpixmap(bitmap_image)  # 使用实例方法
+                            self._current_bitmap = bitmap_image.copy()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            self.whiteboard.canvas.fit_all()
+                            self.statusBar().showMessage("✓ PCX文件导入成功", 5000)
+                            paths = []  # 位图导入成功，无需返回路径
+                        elif pcx_paths is not None:
+                            # 如果有矢量路径（理论上PCX不会有）
+                            for pts in pcx_paths:
+                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                            self.whiteboard.canvas.fit_all()
+                            self.statusBar().showMessage("✓ PCX文件导入成功", 5000)
+                            paths = pcx_paths
+                        else:
+                            raise RuntimeError("PCX导入失败")
+
+                    except Exception as e:
+                        self.statusBar().showMessage(f'PCX导入失败: {str(e)}', 5000)
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "PCX导入失败",
+                            "PCX文件导入失败。\n\n建议：\n1. 使用其他图像软件将PCX转换为PNG格式\n2. 或使用更新的图像格式替代PCX"
+                        )
+                        paths = []
+                # 其他图片格式保持原处理逻辑（返回空列表，不处理矢量）
+                elif lower.endswith(('.bmp', '.png', '.jpg', '.jpeg', '.gif', '.tif', '.tiff',
+                                     '.tga', '.wbmp', '.jp2', '.ppm', '.pgm', '.pnm', '.ras', '.raw',
+                                     '.ico', '.cur', '.emf', '.wmf')):
+                    paths = []
+                else:
+                    raise RuntimeError('不支持的文件类型: ' + path)
+            except Exception as e:
+                # 新增：导入失败时尝试自动转换为SVG再导入
+                from utils.import_utils import auto_convert_file
+                converted_path, convert_msg = auto_convert_file(path, 'svg')  # 转换为临时SVG
+                if converted_path:
+                    try:
+                        from my_io.importers.import_svg import import_svg
+                        paths = import_svg(converted_path)  # 解析转换后的SVG
+                    except Exception as e2:
+                        os.unlink(converted_path)  # 转换后仍失败，清理临时文件
+                        raise RuntimeError(f"导入失败，自动转换为SVG也失败: {str(e2)}") from e2
+                    finally:
+                        if os.path.exists(converted_path):
+                            os.unlink(converted_path)  # 确保临时文件被清理
+                else:
+                    raise e  # 转换失败，抛出原始错误
+
+            # --------------------------- 其他格式导入结果处理 - 保留原逻辑 ---------------------------
+            if paths:
+                for pts in paths:
+                    self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                self.whiteboard.canvas.fit_all()
+                self.statusBar().showMessage(f'已导入: {os.path.basename(path)} / 路径数={len(paths)}', 5000)
+            else:
+                # 如果是位图格式但导入失败，尝试直接作为位图处理
+                if lower.endswith(('.pcx', '.tga')):
+                    try:
+                        # 尝试使用转换工具
+                        from utils.import_utils import auto_convert_file
+                        converted_path, convert_msg = auto_convert_file(path, 'png')
+                        if converted_path:
+                            im = Image.open(converted_path).convert('RGBA')
+                            self._current_bitmap = im
+                            pix = pil_to_qpixmap(im)
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            self.whiteboard.canvas.fit_all()
+                            self.statusBar().showMessage(f'已转换并导入位图: {os.path.basename(path)}', 5000)
+                            os.unlink(converted_path)
+                            return
+                    except Exception as e:
+                        self.statusBar().showMessage(f'PCX/TGA文件导入失败: {str(e)}', 5000)
+                else:
+                    self.statusBar().showMessage(f'未从 {os.path.basename(path)} 中找到可导入的图形', 5000)
+
+        except Exception as e:
+            # 捕获所有未预料的异常 - 保留原逻辑
+            err_msg = f"导入总异常: {str(e)}"
+            self.statusBar().showMessage(err_msg, 5000)
+            self.logger.error(err_msg, exc_info=True)  # 记录完整堆栈
+            QtWidgets.QMessageBox.critical(self, "导入错误", f"无法导入文件: {str(e)}\n查看日志获取详情")
+
     # 编辑操作方法
     def undo(self):
         """撤销"""
@@ -652,4 +1046,3 @@ class MainWindow(QMainWindow):
                          '激光加工控制系统 v1.0\n\n'
                          '专业的激光加工控制软件\n'
                          '支持精确绘图、参数设置和加工控制')
-
