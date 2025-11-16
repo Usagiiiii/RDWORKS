@@ -27,56 +27,53 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # --------------------- 初始化编辑菜单动作变量 ---------------------
+        self.undo_action = None
+        self.redo_action = None
+        self.cut_action = None
+        self.copy_action = None
+        self.paste_action = None
+        self.delete_action = None
+        self.select_all_action = None
+
         self.logger = setup_logging()
         self.logger.info("MainWindow初始化开始")
-        self.init_ui()  # 假设这个方法已经创建了左侧工具栏和右侧面板
+        self.init_ui()  # 调用 init_ui()，内部会通过 create_central_widget() 创建布局
         check_required_tools(self)
 
-        # -------------------------- 关键修复：整合所有组件到布局 --------------------------
-        # 1. 创建一个容器widget作为中心区域的“总载体”
-        central_container = QWidget()
-        # 2. 使用水平布局（左-中-右）
-        main_layout = QHBoxLayout(central_container)
-        main_layout.setContentsMargins(0, 0, 0, 0)  # 去除外边框
-        main_layout.setSpacing(0)  # 去除组件间间距
-
-        # 3. 添加左侧工具栏（假设你的左侧工具栏变量名为 self.left_toolbar）
-        # 注意：这里的变量名要和你实际定义的左侧工具栏一致（比如可能叫 self.sidebar）
-        main_layout.addWidget(self.left_toolbar)
-
-        # 4. 添加白板部件（中间区域，占最大空间）
-        self.whiteboard = WhiteboardWidget()
-        main_layout.addWidget(self.whiteboard, 1)  # 权重设为1，让它占满剩余空间
-
-        # 5. 添加右侧面板（假设你的右侧面板变量名为 self.right_panel）
-        main_layout.addWidget(self.right_panel)
-
-        # 6. 把整合好的容器设为中心部件
-        self.setCentralWidget(central_container)
+        # -------------------------- 删除重复的布局代码！ --------------------------
+        # 以下代码全部删除（因为 create_central_widget() 已经完成了同样的工作）
         # ------------------------------------------------------------------------------
 
         self.logger.info("MainWindow初始化完成")
-        
+
     def init_ui(self):
         """初始化用户界面"""
         self.setWindowTitle('激光加工控制系统')
         self.setGeometry(50, 50, 1600, 950)
-        
+
         # 设置窗口样式
         self.setup_style()
-        
-        # 创建菜单栏
-        self.create_menu_bar()
-        
-        # 创建工具栏（三行）
-        self.create_toolbars()
-        
+
         # 创建中心区域（左中右布局）
         self.create_central_widget()
-        
+
+        # 创建菜单栏
+        self.create_menu_bar()
+
+        # 创建工具栏（三行）
+        self.create_toolbars()
+
         # 状态栏
         self.statusBar().showMessage('就绪')
 
+        # -------------------------- 关键：连接编辑管理器信号 --------------------------
+        em = self.whiteboard.canvas.edit_manager
+        em.undoAvailable.connect(self.undo_action.setEnabled)
+        em.redoAvailable.connect(self.redo_action.setEnabled)
+        em.cutCopyAvailable.connect(lambda b: (self.cut_action.setEnabled(b), self.copy_action.setEnabled(b)))
+        em.deleteAvailable.connect(self.delete_action.setEnabled)
+        em.selectAllAvailable.connect(self.select_all_action.setEnabled)
 
 
     def setup_style(self):
@@ -86,194 +83,195 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.Window, QColor(240, 240, 240))
         palette.setColor(QPalette.WindowText, QColor(50, 50, 50))
         self.setPalette(palette)
-        
+
     def create_menu_bar(self):
         """创建菜单栏"""
         menubar = self.menuBar()
-        
+
         # 文件菜单
         file_menu = menubar.addMenu('文件(F)')
-        
+
         new_action = QAction('新建(&N)', self)
         new_action.setShortcut(QKeySequence.New)
         new_action.setStatusTip('创建新的白板')
         new_action.triggered.connect(self.new_file)
         file_menu.addAction(new_action)
-        
+
         open_action = QAction('打开(&O)...', self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.setStatusTip('打开现有文件')
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
-        
+
         save_action = QAction('保存(&S)', self)
         save_action.setShortcut(QKeySequence.Save)
         save_action.setStatusTip('保存当前文件')
         save_action.triggered.connect(self.save_file)
         file_menu.addAction(save_action)
-        
+
         save_as_action = QAction('另存为(&A)...', self)
         save_as_action.setShortcut(QKeySequence.SaveAs)
         save_as_action.setStatusTip('另存为新文件')
         save_as_action.triggered.connect(self.save_as_file)
         file_menu.addAction(save_as_action)
-        
+
         file_menu.addSeparator()
-        
+
         export_action = QAction('导入底图(&E)...', self)
         export_action.setStatusTip('导入图像文件')
         export_action.triggered.connect(self.import_image)
         file_menu.addAction(export_action)
-        
+
         file_menu.addSeparator()
-        
+
         exit_action = QAction('退出(&X)', self)
         exit_action.setShortcut(QKeySequence.Quit)
         exit_action.setStatusTip('退出应用程序')
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
-        
+
         # 编辑菜单
         edit_menu = menubar.addMenu('编辑(E)')
-        
-        undo_action = QAction('撤销(&U)', self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.setStatusTip('撤销上一步操作')
-        undo_action.triggered.connect(self.undo)
-        edit_menu.addAction(undo_action)
-        
-        redo_action = QAction('重做(&R)', self)
-        redo_action.setShortcut(QKeySequence.Redo)
-        redo_action.setStatusTip('重做上一步操作')
-        redo_action.triggered.connect(self.redo)
-        edit_menu.addAction(redo_action)
-        
+
+        # 定义为实例变量，方便后续连接信号
+        self.undo_action = QAction('撤销(&U)', self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.setStatusTip('撤销上一步操作')
+        self.undo_action.triggered.connect(self.whiteboard.canvas.edit_manager.undo)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction('重做(&R)', self)
+        self.redo_action.setShortcut(QKeySequence.Redo)
+        self.redo_action.setStatusTip('重做上一步操作')
+        self.redo_action.triggered.connect(self.whiteboard.canvas.edit_manager.redo)
+        edit_menu.addAction(self.redo_action)
+
         edit_menu.addSeparator()
-        
-        cut_action = QAction('剪切(&T)', self)
-        cut_action.setShortcut(QKeySequence.Cut)
-        cut_action.setStatusTip('剪切选中内容')
-        cut_action.triggered.connect(self.cut)
-        edit_menu.addAction(cut_action)
-        
-        copy_action = QAction('复制(&C)', self)
-        copy_action.setShortcut(QKeySequence.Copy)
-        copy_action.setStatusTip('复制选中内容')
-        copy_action.triggered.connect(self.copy)
-        edit_menu.addAction(copy_action)
-        
-        paste_action = QAction('粘贴(&P)', self)
-        paste_action.setShortcut(QKeySequence.Paste)
-        paste_action.setStatusTip('粘贴内容')
-        paste_action.triggered.connect(self.paste)
-        edit_menu.addAction(paste_action)
-        
+
+        self.cut_action = QAction('剪切(&T)', self)
+        self.cut_action.setShortcut(QKeySequence.Cut)
+        self.cut_action.setStatusTip('剪切选中内容')
+        self.cut_action.triggered.connect(self.whiteboard.canvas.edit_manager.cut)
+        edit_menu.addAction(self.cut_action)
+
+        self.copy_action = QAction('复制(&C)', self)
+        self.copy_action.setShortcut(QKeySequence.Copy)
+        self.copy_action.setStatusTip('复制选中内容')
+        self.copy_action.triggered.connect(self.whiteboard.canvas.edit_manager.copy)
+        edit_menu.addAction(self.copy_action)
+
+        self.paste_action = QAction('粘贴(&P)', self)
+        self.paste_action.setShortcut(QKeySequence.Paste)
+        self.paste_action.setStatusTip('粘贴内容')
+        self.paste_action.triggered.connect(self.whiteboard.canvas.edit_manager.paste)
+        edit_menu.addAction(self.paste_action)
+
         edit_menu.addSeparator()
-        
-        delete_action = QAction('删除(&D)', self)
-        delete_action.setShortcut(QKeySequence.Delete)
-        delete_action.setStatusTip('删除选中内容')
-        delete_action.triggered.connect(self.delete)
-        edit_menu.addAction(delete_action)
-        
-        select_all_action = QAction('全选(&A)', self)
-        select_all_action.setShortcut(QKeySequence.SelectAll)
-        select_all_action.setStatusTip('选择全部内容')
-        select_all_action.triggered.connect(self.select_all)
-        edit_menu.addAction(select_all_action)
-        
+
+        self.delete_action = QAction('删除(&D)', self)
+        self.delete_action.setShortcut(QKeySequence.Delete)
+        self.delete_action.setStatusTip('删除选中内容')
+        self.delete_action.triggered.connect(self.whiteboard.canvas.edit_manager.delete)
+        edit_menu.addAction(self.delete_action)
+
+        self.select_all_action = QAction('全选(&A)', self)
+        self.select_all_action.setShortcut(QKeySequence.SelectAll)
+        self.select_all_action.setStatusTip('选择全部内容')
+        self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
+        edit_menu.addAction(self.select_all_action)
+
         # 视图菜单
         view_menu = menubar.addMenu('视图(D)')
-        
+
         # 重命名为视图而不是View
         view_menu.setTitle('视图(D)')
-        
+
         zoom_in_action = QAction('放大(&I)', self)
         zoom_in_action.setShortcut(QKeySequence.ZoomIn)
         zoom_in_action.setStatusTip('放大视图')
         zoom_in_action.triggered.connect(self.zoom_in)
         view_menu.addAction(zoom_in_action)
-        
+
         zoom_out_action = QAction('缩小(&O)', self)
         zoom_out_action.setShortcut(QKeySequence.ZoomOut)
         zoom_out_action.setStatusTip('缩小视图')
         zoom_out_action.triggered.connect(self.zoom_out)
         view_menu.addAction(zoom_out_action)
-        
+
         zoom_reset_action = QAction('实际大小(&R)', self)
         zoom_reset_action.setShortcut('Ctrl+0')
         zoom_reset_action.setStatusTip('重置为100%')
         zoom_reset_action.triggered.connect(self.zoom_reset)
         view_menu.addAction(zoom_reset_action)
-        
+
         view_menu.addSeparator()
-        
+
         fullscreen_action = QAction('全屏(&F)', self)
         fullscreen_action.setShortcut('F11')
         fullscreen_action.setStatusTip('切换全屏模式')
         fullscreen_action.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen_action)
-        
+
         # 设置菜单
         settings_menu = menubar.addMenu('设置(S)')
         settings_menu.addAction(QAction('参数设置', self))
         settings_menu.addAction(QAction('系统配置', self))
-        
+
         # 处理菜单
         process_menu = menubar.addMenu('处理(W)')
         process_menu.addAction(QAction('开始加工', self))
         process_menu.addAction(QAction('停止加工', self))
-        
+
         # 工具菜单
         tools_menu = menubar.addMenu('工具(T)')
-        
+
         pen_action = QAction('画笔(&P)', self)
         pen_action.setStatusTip('选择画笔工具')
         pen_action.triggered.connect(self.select_pen)
         tools_menu.addAction(pen_action)
-        
+
         eraser_action = QAction('橡皮擦(&E)', self)
         eraser_action.setStatusTip('选择橡皮擦工具')
         eraser_action.triggered.connect(self.select_eraser)
         tools_menu.addAction(eraser_action)
-        
+
         line_action = QAction('直线(&L)', self)
         line_action.setStatusTip('绘制直线')
         line_action.triggered.connect(self.select_line)
         tools_menu.addAction(line_action)
-        
+
         rectangle_action = QAction('矩形(&R)', self)
         rectangle_action.setStatusTip('绘制矩形')
         rectangle_action.triggered.connect(self.select_rectangle)
         tools_menu.addAction(rectangle_action)
-        
+
         circle_action = QAction('圆形(&C)', self)
         circle_action.setStatusTip('绘制圆形')
         circle_action.triggered.connect(self.select_circle)
         tools_menu.addAction(circle_action)
-        
+
         # 主配置菜单
         main_config_menu = menubar.addMenu('主配置(M)')
         main_config_menu.addAction(QAction('主要配置', self))
-        
+
         # 查看菜单
         view2_menu = menubar.addMenu('查看(H)')
         view2_menu.addAction(QAction('查看选项', self))
-        
+
         # 属性菜单
         prop_menu = menubar.addMenu('属性(H)')
         prop_menu.addAction(QAction('对象属性', self))
-        
+
         # 社区菜单
         community_menu = menubar.addMenu('社区')
         community_menu.addAction(QAction('在线帮助', self))
         community_menu.addAction(QAction('用户论坛', self))
-        
+
         about_action = QAction('关于', self)
         about_action.setStatusTip('关于本应用程序')
         about_action.triggered.connect(self.show_about)
         community_menu.addAction(about_action)
-        
+
     def create_toolbars(self):
         """创建三行工具栏"""
         # 第一行工具栏 - toolbar_row1_icons 的所有图标
@@ -545,28 +543,28 @@ class MainWindow(QMainWindow):
         if callback:
             action.triggered.connect(callback)
         return action
-        
+
     def create_central_widget(self):
         """创建中心部件 - 左中右三栏布局"""
         central_widget = QWidget()
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
+
         # 左侧工具栏
         self.left_toolbar = LeftToolbar()
         main_layout.addWidget(self.left_toolbar)
-        
+
         # 中间白板区域
         self.whiteboard = WhiteboardWidget()
         main_layout.addWidget(self.whiteboard, 1)  # stretch factor = 1
-        
+
         # 右侧属性面板
         self.right_panel = RightPanel()
         main_layout.addWidget(self.right_panel)
-        
+
         self.setCentralWidget(central_widget)
-        
+
     # 文件操作方法
     def new_file(self):
         """新建文件"""
@@ -575,21 +573,21 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self.whiteboard.clear()
             self.statusBar().showMessage('已创建新白板')
-            
+
     def open_file(self):
         """打开文件"""
-        filename, _ = QFileDialog.getOpenFileName(self, '打开文件', '', 
+        filename, _ = QFileDialog.getOpenFileName(self, '打开文件', '',
                                                   '白板文件 (*.wbd);;所有文件 (*)')
         if filename:
             self.statusBar().showMessage(f'打开文件: {filename}')
-            
+
     def save_file(self):
         """保存文件"""
         self.statusBar().showMessage('保存文件')
-        
+
     def save_as_file(self):
         """另存为文件"""
-        filename, _ = QFileDialog.getSaveFileName(self, '另存为', '', 
+        filename, _ = QFileDialog.getSaveFileName(self, '另存为', '',
                                                   '白板文件 (*.wbd);;所有文件 (*)')
         if filename:
             self.statusBar().showMessage(f'保存文件: {filename}')
@@ -965,84 +963,84 @@ class MainWindow(QMainWindow):
         """撤销"""
         self.whiteboard.undo()
         self.statusBar().showMessage('撤销')
-        
+
     def redo(self):
         """重做"""
         self.whiteboard.redo()
         self.statusBar().showMessage('重做')
-        
+
     def cut(self):
         """剪切"""
         self.statusBar().showMessage('剪切')
-        
+
     def copy(self):
         """复制"""
         self.statusBar().showMessage('复制')
-        
+
     def paste(self):
         """粘贴"""
         self.statusBar().showMessage('粘贴')
-        
+
     def delete(self):
         """删除"""
         self.statusBar().showMessage('删除')
-        
+
     def select_all(self):
         """全选"""
         self.statusBar().showMessage('全选')
-        
+
     # 视图操作方法
     def zoom_in(self):
         """放大"""
         self.whiteboard.zoom_in()
         self.statusBar().showMessage(f'缩放: {self.whiteboard.get_zoom_percent()}%')
-        
+
     def zoom_out(self):
         """缩小"""
         self.whiteboard.zoom_out()
         self.statusBar().showMessage(f'缩放: {self.whiteboard.get_zoom_percent()}%')
-        
+
     def zoom_reset(self):
         """重置缩放"""
         self.whiteboard.zoom_reset()
         self.statusBar().showMessage('缩放: 100%')
-        
+
     def toggle_fullscreen(self):
         """切换全屏"""
         if self.isFullScreen():
             self.showNormal()
         else:
             self.showFullScreen()
-            
+
     # 工具选择方法
     def select_pen(self):
         """选择画笔"""
         self.whiteboard.set_tool('pen')
         self.statusBar().showMessage('画笔工具')
-        
+
     def select_eraser(self):
         """选择橡皮擦"""
         self.whiteboard.set_tool('eraser')
         self.statusBar().showMessage('橡皮擦工具')
-        
+
     def select_line(self):
         """选择直线"""
         self.whiteboard.set_tool('line')
         self.statusBar().showMessage('直线工具')
-        
+
     def select_rectangle(self):
         """选择矩形"""
         self.whiteboard.set_tool('rectangle')
         self.statusBar().showMessage('矩形工具')
-        
+
     def select_circle(self):
         """选择圆形"""
         self.whiteboard.set_tool('circle')
         self.statusBar().showMessage('圆形工具')
-        
+
     def show_about(self):
         """显示关于对话框"""
-        QMessageBox.about(self, '关于', 
+        QMessageBox.about(self, '关于',
                          '激光加工控制系统 v1.0\n\n'
                          '专业的激光加工控制软件\n'
                          '支持精确绘图、参数设置和加工控制')
