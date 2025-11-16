@@ -8,12 +8,15 @@
 import logging
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsScene,
-                             QGraphicsView, QGraphicsPixmapItem)
+                             QGraphicsView, QGraphicsPixmapItem, QGraphicsItem)
 from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF
 from PyQt5.QtGui import (QPainter, QPen, QColor, QPixmap, QBrush, QFont,
                          QPainterPath, QWheelEvent, QTransform, QMouseEvent)
 import math
 from typing import List, Tuple, Optional
+
+from edit.commands import AddItemCommand
+from edit.edit_manager import EditManager
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -136,6 +139,34 @@ class GridCanvas(QGraphicsView):
         self._fiducial_item = None
         self._fiducial_size = 6.0
 
+        # -------------------------- 新增：初始化编辑管理器 --------------------------
+        self.edit_manager = EditManager(self)
+        # 连接场景的选中状态变化信号 → 通知EditManager更新可用性
+        self.scene.selectionChanged.connect(self._on_selection_changed)
+
+    # -------------------------- 新增：选中状态变化处理 --------------------------
+    def _on_selection_changed(self):
+        """当画布选中项变化时，通知EditManager"""
+        has_selection = len(self.get_selected_items()) > 0
+        self.edit_manager.set_has_selection(has_selection)
+
+    # -------------------------- 新增：供EditManager调用的接口 --------------------------
+    def get_selected_items(self) -> List[QGraphicsItem]:
+        """获取所有选中的图形项（排除定位点和工作区网格）"""
+        exclude_items = [self._work_item, self._fiducial_item]
+        return [
+            item for item in self.scene.selectedItems()
+            if item not in exclude_items  # 不处理网格和定位点
+               and isinstance(item, (EditablePathItem, QGraphicsPixmapItem))  # 只处理图形和图片
+        ]
+
+    def select_all_items(self):
+        """全选所有图形项（排除定位点和工作区网格）"""
+        exclude_items = [self._work_item, self._fiducial_item]
+        for item in self.scene.items():
+            if item not in exclude_items and isinstance(item, (EditablePathItem, QGraphicsPixmapItem)):
+                item.setSelected(True)
+
     # --- 定位点相关方法 ---
     def set_fiducial_size(self, size: float):
         self._fiducial_size = size
@@ -223,17 +254,18 @@ class GridCanvas(QGraphicsView):
             pen = thick if y % 50 == 0 else thin
             self.scene.addLine(0, y, self._work_w, y, pen)
 
-    def add_polyline(self, points, color):
-        logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
-        path = QPainterPath()
-        if points:
-            path.moveTo(points[0][0], points[0][1])
-            for x, y in points[1:]:
-                path.lineTo(x, y)
-            item = QGraphicsPathItem(path)
-            item.setPen(QPen(color, 0.5))
+        # -------------------------- 修改：图形添加方法（使用EditablePathItem + 命令模式） --------------------------
+        def add_polyline(self, points, color):
+            logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
+            # 替换为可编辑路径项（支持选中、节点编辑）
+            item = EditablePathItem(points, color)
             self.scene.addItem(item)
-        return item
+
+            # 创建"添加图形"命令，压入撤销栈
+            cmd = AddItemCommand(self, item)
+            self.edit_manager.push_undo(cmd)
+
+            return item
 
     def add_rect(self, x: float, y: float, w: float, h: float, color: QColor = QColor(0, 0, 0)):
         pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
@@ -244,6 +276,7 @@ class GridCanvas(QGraphicsView):
                range(steps + 1)]
         return self.add_polyline(pts, color)
 
+    # -------------------------- 修改：添加图片方法（支持选中 + 命令模式） --------------------------
     def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0):
         item = QGraphicsPixmapItem(qpixmap)
         item.setOffset(x, y)
@@ -253,6 +286,11 @@ class GridCanvas(QGraphicsView):
         s = 25.4 / 96.0  # 96dpi -> 毫米
         item.setTransform(QTransform().scale(s, -s))
         self.scene.addItem(item)
+
+        # 创建"添加图片"命令，压入撤销栈
+        cmd = AddItemCommand(self, item)
+        self.edit_manager.push_undo(cmd)
+
         self._last_img_item = item
         self._bitmap_count += 1
         return item
@@ -635,13 +673,42 @@ class WhiteboardWidget(QWidget):
     def clear(self):
         self.canvas.clear()
 
+        # -------------------------- 修改：撤销/重做/剪切/复制/粘贴/删除/全选 方法 --------------------------
+
     def undo(self):
-        """GridCanvas暂不支持撤销，保留方法提示"""
-        logger.warning("当前画布不支持撤销功能")
+        """撤销（转发给EditManager）"""
+        self.canvas.edit_manager.undo()
+        logger.info("执行撤销操作")
 
     def redo(self):
-        """GridCanvas暂不支持重做，保留方法提示"""
-        logger.warning("当前画布不支持重做功能")
+        """重做（转发给EditManager）"""
+        self.canvas.edit_manager.redo()
+        logger.info("执行重做操作")
+
+    def cut(self):
+        """剪切（转发给EditManager）"""
+        self.canvas.edit_manager.cut()
+        logger.info("执行剪切操作")
+
+    def copy(self):
+        """复制（转发给EditManager）"""
+        self.canvas.edit_manager.copy()
+        logger.info("执行复制操作")
+
+    def paste(self):
+        """粘贴（转发给EditManager）"""
+        self.canvas.edit_manager.paste()
+        logger.info("执行粘贴操作")
+
+    def delete(self):
+        """删除（转发给EditManager）"""
+        self.canvas.edit_manager.delete()
+        logger.info("执行删除操作")
+
+    def select_all(self):
+        """全选（转发给EditManager）"""
+        self.canvas.edit_manager.select_all()
+        logger.info("执行全选操作")
 
     def zoom_in(self):
         self.canvas.zoom_in()
