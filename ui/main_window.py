@@ -21,6 +21,7 @@ from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
 from utils.logging_utils import setup_logging
 from utils.tool_utils import check_required_tools
 from ui.whiteboard import Path
+from my_io.gcode.gcode_exporter import export_to_nc, get_default_config
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -117,10 +118,16 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        export_action = QAction('导入底图(&E)...', self)
+        export_action = QAction('导入(&E)...', self)
         export_action.setStatusTip('导入图像文件')
         export_action.triggered.connect(self.import_image)
         file_menu.addAction(export_action)
+
+        # 添加导出动作
+        export_nc_action = QAction('导出为NC(&X)...', self)
+        export_nc_action.setStatusTip('导出为G代码NC文件')
+        export_nc_action.triggered.connect(self.export_to_nc)
+        file_menu.addAction(export_nc_action)
 
         file_menu.addSeparator()
 
@@ -957,6 +964,127 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(err_msg, 5000)
             self.logger.error(err_msg, exc_info=True)  # 记录完整堆栈
             QtWidgets.QMessageBox.critical(self, "导入错误", f"无法导入文件: {str(e)}\n查看日志获取详情")
+
+    def export_to_nc(self):
+        """导出为NC文件 - 增强版（支持矢量和位图）"""
+        try:
+            # 详细分析画布内容
+            content_info = self._analyze_canvas_content()
+            self.logger.info(f"画布内容分析: {content_info}")
+
+            if not content_info['has_any_content']:
+                QMessageBox.warning(self, "导出失败", "画布中没有可导出的内容")
+                return
+
+            # 如果只有图片，提示用户
+            if content_info['has_images'] and not content_info['has_paths']:
+                reply = QMessageBox.question(
+                    self,
+                    "导出图片",
+                    "检测到画布中只有图片。\n导出图片将生成其外轮廓G代码。\n是否继续？",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+
+            # 选择保存文件路径
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                '导出为NC文件',
+                '',
+                'NC文件 (*.nc);;G代码文件 (*.gcode);;所有文件 (*)'
+            )
+
+            if not filename:
+                return  # 用户取消
+
+            # 确保文件扩展名
+            if not filename.lower().endswith(('.nc', '.gcode')):
+                filename += '.nc'
+
+            # 显示导出进度
+            self.statusBar().showMessage("正在导出G代码...")
+
+            # 配置导出参数
+            config = get_default_config()
+
+            # 执行导出
+            success = export_to_nc(self.whiteboard.canvas, filename, config)
+
+            if success:
+                message = f'成功导出G代码: {os.path.basename(filename)}'
+                if content_info['has_images']:
+                    message += f" (包含 {content_info['image_count']} 张图片)"
+                if content_info['has_paths']:
+                    message += f" (包含 {content_info['path_count']} 条路径)"
+
+                self.statusBar().showMessage(message, 5000)
+                QMessageBox.information(self, "导出成功",
+                                        f"G代码导出完成！\n文件已保存到: {filename}")
+            else:
+                self.statusBar().showMessage('导出失败', 5000)
+                QMessageBox.warning(self, "导出失败", "G代码导出失败，请查看日志获取详细信息")
+
+        except Exception as e:
+            error_msg = f"导出过程中发生错误: {str(e)}"
+            self.logger.error(error_msg)
+            self.statusBar().showMessage('导出错误', 5000)
+            QMessageBox.critical(self, "导出错误", error_msg)
+
+    def _analyze_canvas_content(self):
+        """详细分析画布内容"""
+        from PyQt5.QtWidgets import QGraphicsPixmapItem
+
+        info = {
+            'has_paths': False,
+            'has_images': False,
+            'has_any_content': False,
+            'path_count': 0,
+            'image_count': 0
+        }
+
+        for item in self.whiteboard.canvas.scene.items():
+            # 排除工作区网格等系统项
+            if hasattr(self.whiteboard.canvas, '_work_item') and item == self.whiteboard.canvas._work_item:
+                continue
+            if hasattr(self.whiteboard.canvas, '_fiducial_item') and item == self.whiteboard.canvas._fiducial_item:
+                continue
+
+            # 矢量路径
+            if hasattr(item, '_points') and hasattr(item, 'points'):
+                info['has_paths'] = True
+                info['path_count'] += 1
+
+            # 位图图片
+            elif isinstance(item, QGraphicsPixmapItem):
+                info['has_images'] = True
+                info['image_count'] += 1
+
+        info['has_any_content'] = info['has_paths'] or info['has_images']
+        return info
+
+    def _has_exportable_content(self) -> bool:
+        """检查画布中是否有可导出的内容（支持矢量和位图）"""
+        try:
+            from PyQt5.QtWidgets import QGraphicsPixmapItem
+
+            # 检查是否有路径项或图片项
+            for item in self.whiteboard.canvas.scene.items():
+                # 检查矢量路径
+                if hasattr(item, '_points') and hasattr(item, 'points'):
+                    points = item.points()
+                    if len(points) >= 2:
+                        return True
+
+                # 检查位图图片
+                if isinstance(item, QGraphicsPixmapItem):
+                    if not item.pixmap().isNull():
+                        return True
+
+            return False
+        except Exception as e:
+            self.logger.error(f"检查可导出内容时出错: {e}")
+            return False
 
     # 编辑操作方法
     def undo(self):
