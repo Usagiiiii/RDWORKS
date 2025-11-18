@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-G代码导出模块
-将画布中的图形转换为G代码（NC文件）
+修复版G代码导出模块 - 解决位图导出问题
 """
 
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from PyQt5.QtCore import QPointF
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsPixmapItem
+from PyQt5.QtGui import QPixmap, QImage
+import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 # 类型定义
-Point = Tuple[float, float]  # (x, y) 坐标点
-Path = List[Point]  # 路径，由多个点组成
+Point = Tuple[float, float]
+Path = List[Point]
 
 
 class GCodeExporter:
-    """G代码导出器"""
+    """G代码导出器（修复版）"""
 
     def __init__(self):
         self.gcode_lines = []
@@ -27,131 +29,324 @@ class GCodeExporter:
         self.current_y = 0.0
         self.laser_on = False
 
-        # G代码配置参数
+        # 修复配置参数
         self.config = {
             'feed_rate': 1000,  # 进给速度 mm/min
-            'laser_power': 255,  # 激光功率 (0-255)
+            'max_laser_power': 255,  # 最大激光功率
             'rapid_move_rate': 3000,  # 快速移动速度
             'units': 'G21',  # 毫米单位
             'absolute_positioning': 'G90',  # 绝对坐标
+            'scan_interval': 0.1,  # 扫描间隔（毫米）
+            'grayscale_threshold': 128,  # 灰度阈值
+            'dpi': 96.0,  # 图像DPI
+            'min_segment_length': 0.5,  # 最小段长度（避免过短路径）
         }
 
     def set_config(self, config: dict):
         """设置导出配置"""
-        self.config.update(config)
+        if config:
+            self.config.update(config)
 
     def export_canvas(self, canvas) -> List[str]:
-        """
-        导出整个画布为G代码
-
-        Args:
-            canvas: 画布对象，包含图形项
-
-        Returns:
-            G代码行列表
-        """
+        """导出整个画布为G代码"""
         self.gcode_lines = []
 
-        # 添加文件头
-        self._add_header()
+        try:
+            # 添加文件头
+            self._add_header()
 
-        # 获取画布中的所有路径项
-        path_items = self._get_path_items(canvas)
+            # 获取所有可导出项
+            exportable_items = self._get_exportable_items(canvas)
+            logger.info(f"找到 {len(exportable_items)} 个可导出项目")
 
-        if not path_items:
-            logger.warning("画布中没有可导出的路径")
-            self._add_no_content_warning()
-        else:
-            # 处理每个路径项
-            for item in path_items:
-                self._process_path_item(item)
+            if not exportable_items:
+                logger.warning("画布中没有可导出的内容")
+                self._add_no_content_warning()
+            else:
+                # 处理每个项目
+                for item_data in exportable_items:
+                    self._process_exportable_item(item_data)
 
-        # 添加文件尾
-        self._add_footer()
+            # 添加文件尾
+            self._add_footer()
+
+        except Exception as e:
+            logger.error(f"导出过程中发生错误: {e}")
+            self._add_error_message(f"导出错误: {str(e)}")
 
         return self.gcode_lines
 
-    def _get_path_items(self, canvas) -> List[QGraphicsItem]:
-        """获取画布中所有的可导出项（包括矢量和位图）"""
-        from PyQt5.QtWidgets import QGraphicsPixmapItem
+    def _get_exportable_items(self, canvas) -> List[tuple]:
+        """获取所有可导出项"""
+        items = []
 
-        path_items = []
+        try:
+            for item in canvas.scene.items():
+                # 排除系统项
+                if self._is_system_item(item, canvas):
+                    continue
 
-        for item in canvas.scene.items():
-            # 排除工作区网格等系统项
-            if hasattr(canvas, '_work_item') and item == canvas._work_item:
-                continue
-            if hasattr(canvas, '_fiducial_item') and item == canvas._fiducial_item:
-                continue
+                # 矢量路径项
+                if hasattr(item, 'points') and callable(getattr(item, 'points')):
+                    try:
+                        points = item.points()
+                        if points and len(points) >= 2:
+                            items.append(('vector', item))
+                    except Exception as e:
+                        logger.warning(f"获取矢量路径点时出错: {e}")
 
-            # 矢量路径项
-            if hasattr(item, '_points') and hasattr(item, 'points'):
-                path_items.append(item)
+                # 位图项
+                elif isinstance(item, QGraphicsPixmapItem):
+                    if not item.pixmap().isNull():
+                        items.append(('bitmap', item))
 
-            # 位图项
-            elif isinstance(item, QGraphicsPixmapItem):
-                path_items.append(item)
+        except Exception as e:
+            logger.error(f"获取可导出项时出错: {e}")
 
-        logger.info(f"找到 {len(path_items)} 个可导出的项目")
-        return path_items
+        return items
 
-    def _process_image_item(self, item):
-        """处理位图项 - 将图片转换为边界框路径"""
+    def _is_system_item(self, item, canvas) -> bool:
+        """判断是否为系统项"""
+        try:
+            system_attrs = ['_work_item', '_fiducial_item', '_grid_item']
+            for attr in system_attrs:
+                if hasattr(canvas, attr) and item == getattr(canvas, attr):
+                    return True
+        except Exception as e:
+            logger.debug(f"检查系统项时出错: {e}")
+        return False
+
+    def _process_exportable_item(self, item_data):
+        """处理可导出项"""
+        try:
+            item_type, item = item_data
+
+            if item_type == 'vector':
+                self._process_vector_item(item)
+            elif item_type == 'bitmap':
+                self._process_bitmap_item(item)
+
+        except Exception as e:
+            logger.error(f"处理{item_type}项时出错: {e}")
+
+    def _process_vector_item(self, item):
+        """处理矢量路径项"""
+        try:
+            points = item.points()
+            if points and len(points) >= 2:
+                logger.info(f"处理矢量路径，包含 {len(points)} 个点")
+                self._process_polyline(points)
+        except Exception as e:
+            logger.error(f"处理矢量项时出错: {e}")
+
+    def _process_bitmap_item(self, item):
+        """处理位图项 - 完全重写"""
         try:
             if not isinstance(item, QGraphicsPixmapItem):
                 return
 
-            # 获取图片的边界框
-            bounding_rect = item.sceneBoundingRect()
-            if bounding_rect.isNull():
+            pixmap = item.pixmap()
+            if pixmap.isNull():
                 return
 
-            logger.info(f"处理图片项，边界框: {bounding_rect}")
+            logger.info("开始处理位图项")
 
-            # 将图片矩形转换为路径点（毫米单位）
-            points = [
-                (bounding_rect.left(), bounding_rect.top()),
-                (bounding_rect.right(), bounding_rect.top()),
-                (bounding_rect.right(), bounding_rect.bottom()),
-                (bounding_rect.left(), bounding_rect.bottom()),
-                (bounding_rect.left(), bounding_rect.top())  # 闭合
-            ]
+            # 获取位图在场景中的边界框
+            bounding_rect = item.sceneBoundingRect()
+            if bounding_rect.isNull():
+                logger.warning("无法获取位图边界框")
+                return
 
-            # 处理矩形路径
-            self._process_polyline(points)
+            # 方法1：首先尝试轮廓检测（生成连续路径）
+            if self._try_contour_detection(pixmap, bounding_rect):
+                logger.info("轮廓检测成功")
+                return
+
+            # 方法2：如果轮廓检测失败，使用光栅扫描
+            logger.info("轮廓检测失败，使用光栅扫描")
+            self._raster_scan_bitmap(pixmap, bounding_rect)
 
         except Exception as e:
-            logger.error(f"处理图片项时出错: {e}")
+            logger.error(f"位图处理失败: {e}")
+            # 最终降级：生成边界框
+            self._process_bounding_box(bounding_rect)
 
-    def _process_path_item(self, item):
-        """处理单个路径项（支持矢量和位图）"""
+    def _try_contour_detection(self, pixmap: QPixmap, bounding_rect) -> bool:
+        """尝试使用轮廓检测生成连续路径"""
         try:
-            # 处理矢量路径
-            if hasattr(item, 'points'):
-                points = item.points()
-                if len(points) >= 2:
-                    self._process_polyline(points)
+            # 检查OpenCV是否可用
+            try:
+                import cv2
+            except ImportError:
+                logger.warning("未安装OpenCV，跳过轮廓检测")
+                return False
 
-            # 处理位图
-            elif isinstance(item, QGraphicsPixmapItem):
-                self._process_image_item(item)
+            # 转换QPixmap为OpenCV格式
+            qimage = pixmap.toImage()
+            if qimage.isNull():
+                return False
+
+            # 转换为numpy数组
+            ptr = qimage.bits()
+            ptr.setsize(qimage.byteCount())
+            arr = np.array(ptr).reshape(qimage.height(), qimage.width(), 4)
+
+            # 转换为灰度图
+            if arr.shape[2] == 4:
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
+            else:
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+            # 二值化
+            threshold = self.config['grayscale_threshold']
+            _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+
+            # 查找轮廓
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                logger.info("未找到轮廓")
+                return False
+
+            # 转换轮廓为路径
+            scale_x = bounding_rect.width() / qimage.width()
+            scale_y = bounding_rect.height() / qimage.height()
+            offset_x = bounding_rect.left()
+            offset_y = bounding_rect.top()
+
+            contour_paths = []
+            for contour in contours:
+                if len(contour) >= 3:  # 至少需要3个点
+                    points = []
+                    for point in contour:
+                        x = offset_x + point[0][0] * scale_x
+                        y = offset_y + point[0][1] * scale_y
+                        points.append((x, y))
+
+                    if len(points) >= 3:
+                        # 闭合路径
+                        points.append(points[0])
+                        contour_paths.append(points)
+
+            if contour_paths:
+                logger.info(f"找到 {len(contour_paths)} 个轮廓")
+                for path in contour_paths:
+                    self._process_polyline(path)
+                return True
+
+            return False
 
         except Exception as e:
-            logger.error(f"处理路径项时出错: {e}")
+            logger.warning(f"轮廓检测失败: {e}")
+            return False
+
+    def _raster_scan_bitmap(self, pixmap: QPixmap, bounding_rect):
+        """光栅扫描位图（修复激光控制逻辑）"""
+        try:
+            # 转换为PIL图像
+            qimage = pixmap.toImage()
+            pil_image = Image.fromqimage(qimage).convert('L')  # 直接转换为灰度
+
+            # 计算缩放比例
+            scale_x = bounding_rect.width() / pil_image.width
+            scale_y = bounding_rect.height() / pil_image.height
+            offset_x = bounding_rect.left()
+            offset_y = bounding_rect.top()
+
+            threshold = self.config['grayscale_threshold']
+            scan_interval = self.config['scan_interval']
+            min_segment_length = self.config['min_segment_length']
+
+            # 计算行数（基于扫描间隔）
+            pixel_step = max(1, int(scan_interval / scale_y))
+
+            logger.info(f"开始光栅扫描，行步长: {pixel_step} 像素")
+
+            path_count = 0
+            total_points = 0
+
+            for y in range(0, pil_image.height, pixel_step):
+                # 收集当前行的有效点
+                current_segment = []
+                for x in range(pil_image.width):
+                    gray = pil_image.getpixel((x, y))
+                    if gray < threshold:  # 低于阈值才雕刻
+                        real_x = offset_x + x * scale_x
+                        real_y = offset_y + y * scale_y
+                        current_segment.append((real_x, real_y))
+
+                # 处理当前行的连续段
+                if current_segment:
+                    # 检查段长度是否足够
+                    if self._calculate_segment_length(current_segment) >= min_segment_length:
+                        self._process_raster_segment(current_segment)
+                        path_count += 1
+                        total_points += len(current_segment)
+
+            logger.info(f"光栅扫描完成: {path_count} 条路径, {total_points} 个点")
+
+        except Exception as e:
+            logger.error(f"光栅扫描失败: {e}")
+            raise
+
+    def _process_raster_segment(self, points: List[Point]):
+        """处理光栅扫描段（修复激光控制）"""
+        if len(points) < 2:
+            return
+
+        # 移动到起点（快速移动，激光关闭）
+        start_x, start_y = points[0]
+        self._add_rapid_move(start_x, start_y)
+
+        # 开启激光（整条路径保持开启）
+        self._add_laser_on()
+
+        # 连续移动到每个点
+        for i in range(1, len(points)):
+            x, y = points[i]
+            self._add_linear_move(x, y)
+
+        # 关闭激光（整条路径结束才关闭）
+        self._add_laser_off()
+
+    def _process_bounding_box(self, bounding_rect):
+        """处理边界框（降级方案）"""
+        points = [
+            (bounding_rect.left(), bounding_rect.top()),
+            (bounding_rect.right(), bounding_rect.top()),
+            (bounding_rect.right(), bounding_rect.bottom()),
+            (bounding_rect.left(), bounding_rect.bottom()),
+            (bounding_rect.left(), bounding_rect.top())
+        ]
+        self._process_polyline(points)
+
+    def _calculate_segment_length(self, points: List[Point]) -> float:
+        """计算路径段长度"""
+        if len(points) < 2:
+            return 0.0
+
+        total_length = 0.0
+        for i in range(1, len(points)):
+            x1, y1 = points[i - 1]
+            x2, y2 = points[i]
+            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            total_length += length
+
+        return total_length
 
     def _process_polyline(self, points: List[Point]):
         """处理折线路径"""
         if len(points) < 2:
             return
 
-        # 移动到路径起点（快速移动，激光关闭）
+        # 移动到起点
         start_x, start_y = points[0]
         self._add_rapid_move(start_x, start_y)
 
         # 开启激光
         self._add_laser_on()
 
-        # 按顺序移动到每个点（切削移动）
+        # 连续移动
         for i in range(1, len(points)):
             x, y = points[i]
             self._add_linear_move(x, y)
@@ -160,54 +355,63 @@ class GCodeExporter:
         self._add_laser_off()
 
     def _add_header(self):
-        """添加G代码文件头"""
+        """添加文件头"""
         header = [
-            "%",  # 文件开始标记
-            "O1000",  # 程序号
-            f"{self.config['units']}",  # 毫米单位
-            f"{self.config['absolute_positioning']}",  # 绝对坐标
-            "G17",  # XY平面选择
-            "G40",  # 取消刀具半径补偿
-            "G49",  # 取消刀具长度补偿
-            "G80",  # 取消固定循环
-            "G54",  # 工作坐标系
-            "",  # 空行
-            "M05",  # 确保激光关闭
-            "G00 Z10",  # 快速移动到安全高度
-            "",  # 空行
+            "%",
+            "O1000 (激光加工G代码)",
+            f"{self.config['units']} (毫米单位)",
+            f"{self.config['absolute_positioning']} (绝对坐标)",
+            "G17 (XY平面选择)",
+            "G40 (取消刀具半径补偿)",
+            "G49 (取消刀具长度补偿)",
+            "G80 (取消固定循环)",
+            "G54 (工作坐标系)",
+            "",
+            "M05 (确保激光关闭)",
+            "G00 Z10 (快速移动到安全高度)",
+            "",
+            "(开始加工路径)",
         ]
         self.gcode_lines.extend(header)
 
     def _add_footer(self):
-        """添加G代码文件尾"""
+        """添加文件尾"""
         footer = [
-            "",  # 空行
-            "M05",  # 关闭激光
-            "G00 Z10",  # 移动到安全高度
-            "G00 X0 Y0",  # 回到原点
-            "M30",  # 程序结束
-            "%",  # 文件结束标记
+            "",
+            "(结束加工路径)",
+            "M05 (关闭激光)",
+            "G00 Z10 (移动到安全高度)",
+            "G00 X0 Y0 (回到原点)",
+            "M30 (程序结束)",
+            "%",
         ]
         self.gcode_lines.extend(footer)
 
     def _add_no_content_warning(self):
-        """添加无内容警告"""
+        """无内容警告"""
         warning = [
             "(警告: 没有找到可导出的图形)",
-            "(WARNING: No exportable graphics found)",
-            "M00",  # 程序暂停
+            "M00 (程序暂停)",
         ]
         self.gcode_lines.extend(warning)
 
+    def _add_error_message(self, message: str):
+        """错误消息"""
+        error_msg = [
+            f"(错误: {message})",
+            "M00 (程序暂停)",
+        ]
+        self.gcode_lines.extend(error_msg)
+
     def _add_rapid_move(self, x: float, y: float):
-        """添加快速移动指令"""
+        """快速移动"""
         line = f"G00 X{x:.3f} Y{y:.3f}"
         self.gcode_lines.append(line)
         self.current_x = x
         self.current_y = y
 
     def _add_linear_move(self, x: float, y: float):
-        """添加线性移动指令（切削移动）"""
+        """线性移动"""
         line = f"G01 X{x:.3f} Y{y:.3f} F{self.config['feed_rate']}"
         self.gcode_lines.append(line)
         self.current_x = x
@@ -216,58 +420,48 @@ class GCodeExporter:
     def _add_laser_on(self):
         """开启激光"""
         if not self.laser_on:
-            self.gcode_lines.append(f"M03 S{self.config['laser_power']}")  # 开启激光
+            self.gcode_lines.append(f"M03 S{self.config['max_laser_power']}")
             self.laser_on = True
 
     def _add_laser_off(self):
         """关闭激光"""
         if self.laser_on:
-            self.gcode_lines.append("M05")  # 关闭激光
-            self.laser_on = False
+            self.gcode_lines.append("M05")
+        self.laser_on = False
 
 
 def export_to_nc(canvas, filename: str, config: dict = None) -> bool:
-    """
-    导出画布为NC文件
-
-    Args:
-        canvas: 画布对象
-        filename: 输出文件名
-        config: 导出配置
-
-    Returns:
-        bool: 导出是否成功
-    """
+    """导出画布为NC文件"""
     try:
         exporter = GCodeExporter()
 
         if config:
             exporter.set_config(config)
 
-        # 生成G代码
         gcode_lines = exporter.export_canvas(canvas)
 
-        # 写入文件
         with open(filename, 'w', encoding='utf-8') as f:
             for line in gcode_lines:
                 f.write(line + '\n')
 
         logger.info(f"成功导出G代码到: {filename}")
-        logger.info(f"生成 {len(gcode_lines)} 行G代码")
-
         return True
 
     except Exception as e:
-        logger.error(f"导出G代码失败: {e}")
+        logger.error(f"导出失败: {e}")
         return False
 
 
 def get_default_config() -> dict:
-    """获取默认的导出配置"""
+    """获取默认配置"""
     return {
-        'feed_rate': 1000,  # 进给速度 mm/min
-        'laser_power': 255,  # 激光功率 (0-255)
-        'rapid_move_rate': 3000,  # 快速移动速度
-        'units': 'G21',  # 毫米单位
-        'absolute_positioning': 'G90',  # 绝对坐标
+        'feed_rate': 1000,
+        'max_laser_power': 255,
+        'rapid_move_rate': 3000,
+        'units': 'G21',
+        'absolute_positioning': 'G90',
+        'scan_interval': 0.1,
+        'grayscale_threshold': 128,
+        'dpi': 96.0,
+        'min_segment_length': 0.5,
     }

@@ -21,7 +21,7 @@ from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
 from utils.logging_utils import setup_logging
 from utils.tool_utils import check_required_tools
 from ui.whiteboard import Path
-from my_io.gcode.gcode_exporter import export_to_nc, get_default_config
+from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -976,12 +976,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "导出失败", "画布中没有可导出的内容")
                 return
 
-            # 如果只有图片，提示用户
+            # 如果只有图片，更新提示语
             if content_info['has_images'] and not content_info['has_paths']:
                 reply = QMessageBox.question(
                     self,
                     "导出图片",
-                    "检测到画布中只有图片。\n导出图片将生成其外轮廓G代码。\n是否继续？",
+                    "检测到画布中只有图片。\n将生成灰度雕刻G代码（可调整参数控制精度）。\n是否继续？",
                     QMessageBox.Yes | QMessageBox.No
                 )
                 if reply == QMessageBox.No:
@@ -1008,31 +1008,54 @@ class MainWindow(QMainWindow):
             # 配置导出参数
             config = get_default_config()
 
+            # 根据内容类型优化配置
+            if content_info['has_images']:
+                # 对于图片，使用更精细的扫描间隔
+                config['scan_interval'] = 0.05  # 更精细的扫描
+                config['grayscale_threshold'] = 128  # 中等灰度阈值
+
             # 执行导出
             success = export_to_nc(self.whiteboard.canvas, filename, config)
 
             if success:
-                message = f'成功导出G代码: {os.path.basename(filename)}'
-                if content_info['has_images']:
-                    message += f" (包含 {content_info['image_count']} 张图片)"
-                if content_info['has_paths']:
-                    message += f" (包含 {content_info['path_count']} 条路径)"
+                # 读取生成的文件以获取更多信息
+                try:
+                    with open(filename, 'r', encoding='utf-8') as f:
+                        gcode_lines = f.readlines()
+                        line_count = len(gcode_lines)
 
-                self.statusBar().showMessage(message, 5000)
-                QMessageBox.information(self, "导出成功",
-                                        f"G代码导出完成！\n文件已保存到: {filename}")
+                        # 统计实际加工指令
+                        move_count = sum(1 for line in gcode_lines if line.startswith(('G00', 'G01')))
+                        laser_on_count = sum(1 for line in gcode_lines if 'M03' in line)
+
+                        message = f'成功导出G代码: {os.path.basename(filename)}'
+                        message += f" (共 {line_count} 行, {move_count} 个移动指令)"
+
+                        if content_info['has_images']:
+                            message += f" (包含 {content_info['image_count']} 张图片)"
+                        if content_info['has_paths']:
+                            message += f" (包含 {content_info['path_count']} 条路径)"
+
+                        self.statusBar().showMessage(message, 5000)
+                        QMessageBox.information(self, "导出成功",
+                                                f"G代码导出完成！\n文件已保存到: {filename}\n"
+                                                f"共生成 {line_count} 行G代码，{move_count} 个移动指令")
+                except Exception as read_error:
+                    self.logger.warning(f"读取G代码文件失败: {read_error}")
+                    self.statusBar().showMessage(f'成功导出G代码: {os.path.basename(filename)}', 5000)
+                    QMessageBox.information(self, "导出成功", f"G代码导出完成！\n文件已保存到: {filename}")
             else:
                 self.statusBar().showMessage('导出失败', 5000)
                 QMessageBox.warning(self, "导出失败", "G代码导出失败，请查看日志获取详细信息")
 
         except Exception as e:
             error_msg = f"导出过程中发生错误: {str(e)}"
-            self.logger.error(error_msg)
+            self.logger.error(error_msg, exc_info=True)
             self.statusBar().showMessage('导出错误', 5000)
             QMessageBox.critical(self, "导出错误", error_msg)
 
     def _analyze_canvas_content(self):
-        """详细分析画布内容"""
+        """详细分析画布内容（增强版）"""
         from PyQt5.QtWidgets import QGraphicsPixmapItem
 
         info = {
@@ -1040,27 +1063,50 @@ class MainWindow(QMainWindow):
             'has_images': False,
             'has_any_content': False,
             'path_count': 0,
-            'image_count': 0
+            'image_count': 0,
+            'total_points': 0,
+            'image_sizes': []
         }
 
-        for item in self.whiteboard.canvas.scene.items():
-            # 排除工作区网格等系统项
-            if hasattr(self.whiteboard.canvas, '_work_item') and item == self.whiteboard.canvas._work_item:
-                continue
-            if hasattr(self.whiteboard.canvas, '_fiducial_item') and item == self.whiteboard.canvas._fiducial_item:
-                continue
+        try:
+            for item in self.whiteboard.canvas.scene.items():
+                # 排除工作区网格等系统项
+                if hasattr(self.whiteboard.canvas, '_work_item') and item == self.whiteboard.canvas._work_item:
+                    continue
+                if hasattr(self.whiteboard.canvas, '_fiducial_item') and item == self.whiteboard.canvas._fiducial_item:
+                    continue
 
-            # 矢量路径
-            if hasattr(item, '_points') and hasattr(item, 'points'):
-                info['has_paths'] = True
-                info['path_count'] += 1
+                # 矢量路径
+                if hasattr(item, '_points') and hasattr(item, 'points'):
+                    try:
+                        points = item.points()
+                        if points and len(points) >= 2:
+                            info['has_paths'] = True
+                            info['path_count'] += 1
+                            info['total_points'] += len(points)
+                    except Exception as e:
+                        self.logger.warning(f"获取路径点时出错: {e}")
 
-            # 位图图片
-            elif isinstance(item, QGraphicsPixmapItem):
-                info['has_images'] = True
-                info['image_count'] += 1
+                # 位图图片
+                elif isinstance(item, QGraphicsPixmapItem):
+                    if not item.pixmap().isNull():
+                        info['has_images'] = True
+                        info['image_count'] += 1
+                        # 记录图片尺寸
+                        pixmap = item.pixmap()
+                        info['image_sizes'].append(f"{pixmap.width()}x{pixmap.height()}")
 
-        info['has_any_content'] = info['has_paths'] or info['has_images']
+            info['has_any_content'] = info['has_paths'] or info['has_images']
+
+            # 添加详细日志
+            if info['has_paths']:
+                self.logger.info(f"找到 {info['path_count']} 条路径，共 {info['total_points']} 个点")
+            if info['has_images']:
+                self.logger.info(f"找到 {info['image_count']} 张图片，尺寸: {', '.join(info['image_sizes'])}")
+
+        except Exception as e:
+            self.logger.error(f"分析画布内容时出错: {e}")
+
         return info
 
     def _has_exportable_content(self) -> bool:
