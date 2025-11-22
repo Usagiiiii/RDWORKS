@@ -42,6 +42,7 @@ class LeftToolbar(QWidget):
             ("◐", "水平镜像", "left_sidebar_icons/sidebar_icon12.png"),
             ("✱", "垂直镜像", "left_sidebar_icons/sidebar_icon13.png"),
             ("T", "图形停靠", "left_sidebar_icons/sidebar_icon14.png"),
+            ("", "阵列复制", "left_sidebar_icons/sidebar_icon15.png"),
         ]
 
         for icon_text, tooltip, icon_path in tools:
