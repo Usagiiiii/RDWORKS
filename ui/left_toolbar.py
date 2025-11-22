@@ -28,20 +28,20 @@ class LeftToolbar(QWidget):
         
         # 工具列表 - 使用 left_sidebar_icons 中的图标
         tools = [
-            ("↖", "选择工具", "left_sidebar_icons/sidebar_icon1.png"),
-            ("✏", "画笔工具", "left_sidebar_icons/sidebar_icon2.png"),
-            ("▭", "矩形工具", "left_sidebar_icons/sidebar_icon3.png"),
-            ("○", "圆形工具", "left_sidebar_icons/sidebar_icon4.png"),
-            ("⬢", "多边形工具", "left_sidebar_icons/sidebar_icon5.png"),
-            ("▲", "三角形", "left_sidebar_icons/sidebar_icon6.png"),
-            ("◀", "箭头", "left_sidebar_icons/sidebar_icon7.png"),
-            ("☰", "直线", "left_sidebar_icons/sidebar_icon8.png"),
-            ("≋", "波浪线", "left_sidebar_icons/sidebar_icon9.png"),
-            ("⊞", "网格", "left_sidebar_icons/sidebar_icon10.png"),
-            ("✂", "剪切", "left_sidebar_icons/sidebar_icon11.png"),
-            ("◐", "扇形", "left_sidebar_icons/sidebar_icon12.png"),
-            ("✱", "星形", "left_sidebar_icons/sidebar_icon13.png"),
-            ("T", "文字工具", "left_sidebar_icons/sidebar_icon14.png"),
+            ("↖", "图形选取", "left_sidebar_icons/sidebar_icon1.png"),
+            ("✏", "节点编辑", "left_sidebar_icons/sidebar_icon2.png"),
+            ("▭", "直线", "left_sidebar_icons/sidebar_icon3.png"),
+            ("○", "折线", "left_sidebar_icons/sidebar_icon4.png"),
+            ("⬢", "曲线", "left_sidebar_icons/sidebar_icon5.png"),
+            ("▲", "矩形", "left_sidebar_icons/sidebar_icon6.png"),
+            ("◀", "椭圆", "left_sidebar_icons/sidebar_icon7.png"),
+            ("☰", "文字", "left_sidebar_icons/sidebar_icon8.png"),
+            ("≋", "点", "left_sidebar_icons/sidebar_icon9.png"),
+            ("⊞", "生成网络", "left_sidebar_icons/sidebar_icon10.png"),
+            ("✂", "删除", "left_sidebar_icons/sidebar_icon11.png"),
+            ("◐", "水平镜像", "left_sidebar_icons/sidebar_icon12.png"),
+            ("✱", "垂直镜像", "left_sidebar_icons/sidebar_icon13.png"),
+            ("T", "图形停靠", "left_sidebar_icons/sidebar_icon14.png"),
         ]
 
         for icon_text, tooltip, icon_path in tools:
