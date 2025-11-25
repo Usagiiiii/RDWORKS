@@ -27,7 +27,6 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        # --------------------- 初始化编辑菜单动作变量 ---------------------
         self.undo_action = None
         self.redo_action = None
         self.cut_action = None
@@ -38,13 +37,8 @@ class MainWindow(QMainWindow):
 
         self.logger = setup_logging()
         self.logger.info("MainWindow初始化开始")
-        self.init_ui()  # 调用 init_ui()，内部会通过 create_central_widget() 创建布局
+        self.init_ui()
         check_required_tools(self)
-
-        # -------------------------- 删除重复的布局代码！ --------------------------
-        # 以下代码全部删除（因为 create_central_widget() 已经完成了同样的工作）
-        # ------------------------------------------------------------------------------
-
         self.logger.info("MainWindow初始化完成")
 
     def init_ui(self):
@@ -52,22 +46,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('激光加工控制系统')
         self.setGeometry(50, 50, 1600, 950)
 
-        # 设置窗口样式
         self.setup_style()
 
-        # 创建中心区域（左中右布局）
         self.create_central_widget()
 
-        # 创建菜单栏
         self.create_menu_bar()
 
-        # 创建工具栏（三行）
         self.create_toolbars()
 
-        # 状态栏
         self.statusBar().showMessage('就绪')
-
-        # -------------------------- 关键：连接编辑管理器信号 --------------------------
+        """连接编辑管理器信号"""
         em = self.whiteboard.canvas.edit_manager
         em.undoAvailable.connect(self.undo_action.setEnabled)
         em.redoAvailable.connect(self.redo_action.setEnabled)
@@ -88,7 +76,6 @@ class MainWindow(QMainWindow):
         """创建菜单栏"""
         menubar = self.menuBar()
 
-        # 文件菜单
         file_menu = menubar.addMenu('文件(F)')
 
         new_action = QAction('新建(&N)', self)
@@ -130,10 +117,8 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        # 编辑菜单
         edit_menu = menubar.addMenu('编辑(E)')
 
-        # 定义为实例变量，方便后续连接信号
         self.undo_action = QAction('撤销(&U)', self)
         self.undo_action.setShortcut(QKeySequence.Undo)
         self.undo_action.setStatusTip('撤销上一步操作')
@@ -180,10 +165,7 @@ class MainWindow(QMainWindow):
         self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
         edit_menu.addAction(self.select_all_action)
 
-        # 视图菜单
         view_menu = menubar.addMenu('视图(D)')
-
-        # 重命名为视图而不是View
         view_menu.setTitle('视图(D)')
 
         zoom_in_action = QAction('放大(&I)', self)
@@ -212,17 +194,14 @@ class MainWindow(QMainWindow):
         fullscreen_action.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen_action)
 
-        # 设置菜单
         settings_menu = menubar.addMenu('设置(S)')
         settings_menu.addAction(QAction('参数设置', self))
         settings_menu.addAction(QAction('系统配置', self))
 
-        # 处理菜单
         process_menu = menubar.addMenu('处理(W)')
         process_menu.addAction(QAction('开始加工', self))
         process_menu.addAction(QAction('停止加工', self))
 
-        # 工具菜单
         tools_menu = menubar.addMenu('工具(T)')
 
         pen_action = QAction('画笔(&P)', self)
@@ -250,19 +229,15 @@ class MainWindow(QMainWindow):
         circle_action.triggered.connect(self.select_circle)
         tools_menu.addAction(circle_action)
 
-        # 主配置菜单
         main_config_menu = menubar.addMenu('主配置(M)')
         main_config_menu.addAction(QAction('主要配置', self))
 
-        # 查看菜单
         view2_menu = menubar.addMenu('查看(H)')
         view2_menu.addAction(QAction('查看选项', self))
 
-        # 属性菜单
         prop_menu = menubar.addMenu('属性(H)')
         prop_menu.addAction(QAction('对象属性', self))
 
-        # 社区菜单
         community_menu = menubar.addMenu('社区')
         community_menu.addAction(QAction('在线帮助', self))
         community_menu.addAction(QAction('用户论坛', self))
@@ -283,27 +258,34 @@ class MainWindow(QMainWindow):
         # 左侧新建和打开按钮
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column1.png', '新建', self.new_file))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column2.png', '打开', self.open_file))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', None))
         toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', None))
+        toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', None))
+        toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围 ', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', None))
+        toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置导入导出', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', None))
+        toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', None))
+        toolbar1.addSeparator()
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column19.png', '自动群组', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column20.png', '群组', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column21.png', '解散群组', None))
 
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '文件', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '编辑', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '查看', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '插入', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '格式', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '排列', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '文字', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '绘制', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '形状', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '线条', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '曲线', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '填充', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '选择', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '缩放', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '测量', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '对齐', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column19.png', '工具', None))
 
-        # 第二行工具栏 - toolbar_row2_icons 的所有19个图标
+        # 第二行工具栏
         toolbar2 = QToolBar('工具栏2')
         toolbar2.setIconSize(QSize(28, 28))
         toolbar2.setMovable(False)
@@ -312,58 +294,51 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBar(Qt.TopToolBarArea, toolbar2)
 
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column1.png', '新建', self.new_file))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column2.png', '打开文件夹', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '打开', self.open_file))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column4.png', '保存', self.save_file))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '打印', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column1.png', '投影切割', self.new_file))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column2.png', '', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '测量工具', self.open_file))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column4.png', 'Mark点定位', self.save_file))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '曲线平滑', None))
         toolbar2.addSeparator()
-
-        # 视图操作
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column6.png', '显示', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column7.png', '隐藏', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column6.png', '位图处理', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column7.png', '曲线自动闭合', None))
         toolbar2.addSeparator()
-
-        # 缩放工具
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column8.png', '放大', self.zoom_in))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column9.png', '缩小', self.zoom_out))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column10.png', '缩放', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column11.png', '适应窗口', self.zoom_reset))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column12.png', '全选', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column13.png', '框选', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column14.png', '查看', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column8.png', '切割优化', self.zoom_in))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column9.png', '合并相连线', self.zoom_out))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column10.png', '删除重线', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column11.png', '平行线', self.zoom_reset))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column12.png', '数据检查', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column13.png', '拍照', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column14.png', '框选提边', None))
         toolbar2.addSeparator()
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column15.png', '提边设置', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column16.png', '扶正功能', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column17.png', '放置图形', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column18.png', '底图显示', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column19.png', '画布参数设置', None))
 
-        # 显示模式
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column15.png', '显示', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column16.png', '亮度', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column17.png', '设置', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column18.png', '模式1', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column19.png', '模式2', None))
-
-        # 第三行工具栏 - 属性输入区域（堆叠布局）+ 图标工具 - toolbar_row3_icons
+        # 第三行工具栏
         toolbar3 = QToolBar('工具栏3')
-        toolbar3.setIconSize(QSize(32, 32))  # 加大图标尺寸到32x32
+        toolbar3.setIconSize(QSize(32, 32))
         toolbar3.setMovable(False)
-        toolbar3.setMinimumHeight(70)  # 增加工具栏高度到70
+        toolbar3.setMinimumHeight(70)
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBar(Qt.TopToolBarArea, toolbar3)
 
-        # 创建属性输入区域（使用网格布局确保对齐）
+        # 创建属性输入区域
         from PyQt5.QtWidgets import QGridLayout
 
         properties_widget = QWidget()
-        properties_widget.setMinimumHeight(65)  # 增加最小高度
-        properties_widget.setMaximumHeight(65)  # 增加最大高度
-        properties_widget.setMaximumWidth(450)  # 调整宽度
+        properties_widget.setMinimumHeight(65)
+        properties_widget.setMaximumHeight(65)
+        properties_widget.setMaximumWidth(450)
         properties_layout = QGridLayout(properties_widget)
-        properties_layout.setContentsMargins(5, 5, 5, 5)  # 增加内边距
-        properties_layout.setSpacing(3)  # 减小整体间距
-        properties_layout.setHorizontalSpacing(3)  # 减小横向间距
-        properties_layout.setVerticalSpacing(5)  # 增加纵向间距
+        properties_layout.setContentsMargins(5, 5, 5, 5)
+        properties_layout.setSpacing(3)
+        properties_layout.setHorizontalSpacing(3)
+        properties_layout.setVerticalSpacing(5)
 
         # 第一行
-        # X
         properties_layout.addWidget(QLabel("X"), 0, 0)
         x_input = QLineEdit("0")
         x_input.setMaximumWidth(55)
@@ -428,26 +403,25 @@ class MainWindow(QMainWindow):
 
         toolbar3.addWidget(properties_widget)
 
-        # 变换工具（前三个按钮紧贴百分比，无分隔符）
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '倾斜', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column2.png', '水平翻转', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column3.png', '垂直翻转', None, False))
-        toolbar3.addSeparator()  # 在第三个按钮后添加分隔符
+        # 变换工具
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '锁住', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column2.png', '选择位置坐标基准', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column3.png', '修改尺寸', None))
+        toolbar3.addSeparator()
 
-        # 对齐工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '左对齐', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '恢复', None, False))
 
         # 角度输入框和加工序号输入框（合并到一个widget中，防止全屏时分开）
         from PyQt5.QtWidgets import QSizePolicy
 
         angle_order_widget = QWidget()
-        angle_order_widget.setMinimumWidth(280)  # 设置最小宽度，防止被压缩
-        angle_order_widget.setMaximumWidth(280)  # 设置最大宽度，防止被拉伸
+        angle_order_widget.setMinimumWidth(280)
+        angle_order_widget.setMaximumWidth(280)
         angle_order_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)  # 固定宽度
 
         angle_order_layout = QHBoxLayout(angle_order_widget)
         angle_order_layout.setContentsMargins(3, 0, 3, 0)
-        angle_order_layout.setSpacing(5)  # 两个输入框之间的间距
+        angle_order_layout.setSpacing(5)
 
         # 角度输入框
         angle_input = QLineEdit("0")
@@ -476,44 +450,32 @@ class MainWindow(QMainWindow):
 
         toolbar3.addWidget(angle_order_widget)
 
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column5.png', '中心对齐', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column5.png', '恢复', None,False))
         toolbar3.addSeparator()  # 在第五个按钮后添加分隔符
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '右对齐', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '顶部对齐', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '中间对齐', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底部对齐', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', None))
         toolbar3.addSeparator()
-
-        # 分布工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平分布', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直分布', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', None))
         toolbar3.addSeparator()
-
-        # 组合和排列工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '取消组合', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '锁定', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', None))
         toolbar3.addSeparator()
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '', None, False))
 
-        # 排序工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '置于顶层', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '置于底层', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '上移一层', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '下移一层', None, False))
-        toolbar3.addSeparator()
-
-        # 路径和编辑工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '合并', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '拆分', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '焊接', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '偏移', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '布尔运算', None, False))
-        toolbar3.addSeparator()
-
-        # 其他工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '文字', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '更多', None, False))
-
-        # 添加伸缩空间
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().Expanding, spacer.sizePolicy().Preferred)
         toolbar3.addWidget(spacer)
@@ -545,7 +507,7 @@ class MainWindow(QMainWindow):
         return action
 
     def create_central_widget(self):
-        """创建中心部件 - 左中右三栏布局"""
+        """创建中心部件左中右三栏布局"""
         central_widget = QWidget()
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
