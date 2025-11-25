@@ -17,6 +17,7 @@ from typing import List, Tuple, Optional
 
 from edit.commands import AddItemCommand
 from edit.edit_manager import EditManager
+from my_io.gcode.gcode_exporter import Point
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -134,10 +135,9 @@ class GridCanvas(QGraphicsView):
         self._drawing_pts: Path = []
         self._drawing_tmp: Optional[QGraphicsPathItem] = None
 
-        # 定位点相关属性
-        self._fiducial: Optional[Tuple[Pt, str]] = None
-        self._fiducial_item = None
-        self._fiducial_size = 6.0
+        # 定位点相关属性 - 使用新的管理器
+        from my_io.fiducial.fiducial_manager import FiducialManager
+        self.fiducial_manager = FiducialManager(self)
 
         # -------------------------- 新增：初始化编辑管理器 --------------------------
         self.edit_manager = EditManager(self)
@@ -153,7 +153,14 @@ class GridCanvas(QGraphicsView):
     # -------------------------- 新增：供EditManager调用的接口 --------------------------
     def get_selected_items(self) -> List[QGraphicsItem]:
         """获取所有选中的图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item, self._fiducial_item]
+        exclude_items = [self._work_item]
+
+        # 使用新的 FiducialManager 获取定位点项
+        if hasattr(self, 'fiducial_manager'):
+            fiducial_item = self.fiducial_manager.get_fiducial_item()
+            if fiducial_item:
+                exclude_items.append(fiducial_item)
+
         return [
             item for item in self.scene.selectedItems()
             if item not in exclude_items  # 不处理网格和定位点
@@ -162,22 +169,30 @@ class GridCanvas(QGraphicsView):
 
     def select_all_items(self):
         """全选所有图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item, self._fiducial_item]
+        exclude_items = [self._work_item]
+
+        # 使用新的 FiducialManager 获取定位点项
+        if hasattr(self, 'fiducial_manager'):
+            fiducial_item = self.fiducial_manager.get_fiducial_item()
+            if fiducial_item:
+                exclude_items.append(fiducial_item)
+
         for item in self.scene.items():
             if item not in exclude_items and isinstance(item, (EditablePathItem, QGraphicsPixmapItem)):
                 item.setSelected(True)
 
-    # --- 定位点相关方法 ---
+    # --- 定位点相关方法（更新为使用管理器）---
     def set_fiducial_size(self, size: float):
-        self._fiducial_size = size
-        if self._fiducial:
-            self._redraw_fiducial()
+        self.fiducial_manager.set_fiducial_size(size)
 
-    def add_fiducial(self, point: Pt, shape: str):
-        self.remove_fiducial()
-        self._fiducial = (point, shape)
-        self._redraw_fiducial()
-        logger.info(f"添加定位点: {point}, 形状: {shape}, 尺寸: {self._fiducial_size}")
+    def add_fiducial(self, point: Point, shape: str):
+        self.fiducial_manager.add_fiducial(point, shape)
+
+    def remove_fiducial(self):
+        self.fiducial_manager.remove_fiducial()
+
+    def get_fiducial(self) -> Optional[Tuple[Point, str]]:
+        return self.fiducial_manager.get_fiducial()
 
     def _redraw_fiducial(self):
         if not self._fiducial:
@@ -198,16 +213,6 @@ class GridCanvas(QGraphicsView):
         pen = QPen(QColor(255, 0, 0), 0.3)
         self._fiducial_item.setPen(pen)
         self.scene.addItem(self._fiducial_item)
-
-    def remove_fiducial(self):
-        if self._fiducial_item:
-            self.scene.removeItem(self._fiducial_item)
-            self._fiducial_item = None
-        self._fiducial = None
-        logger.info("已删除定位点")
-
-    def get_fiducial(self) -> Optional[Tuple[Pt, str]]:
-        return self._fiducial
 
     # --- 缩放/平移相关 ---
     def wheelEvent(self, e: QWheelEvent):
@@ -444,6 +449,12 @@ class GridCanvas(QGraphicsView):
         elif self._tool in (self.Tool.ADD_FID_CROSS, self.Tool.ADD_FID_CIRCLE):
             shape = 'cross' if self._tool == self.Tool.ADD_FID_CROSS else 'circle'
             self.add_fiducial((pos.x(), pos.y()), shape)
+            # +++ 新增：添加定位点后自动退出定位点模式，回到选择模式 +++
+            self.set_tool(self.Tool.SELECT)
+            # 发送状态更新信号（如果主窗口有监听）
+            if hasattr(self, 'toolChanged'):
+                self.toolChanged.emit(self.Tool.SELECT)
+            # +++ 结束新增 +++
         else:
             super().mousePressEvent(e)
 
