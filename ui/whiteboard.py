@@ -254,18 +254,18 @@ class GridCanvas(QGraphicsView):
             pen = thick if y % 50 == 0 else thin
             self.scene.addLine(0, y, self._work_w, y, pen)
 
-        # -------------------------- 修改：图形添加方法（使用EditablePathItem + 命令模式） --------------------------
-        def add_polyline(self, points, color):
-            logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
-            # 替换为可编辑路径项（支持选中、节点编辑）
-            item = EditablePathItem(points, color)
-            self.scene.addItem(item)
+    # -------------------------- 修改：图形添加方法（使用EditablePathItem + 命令模式） --------------------------
+    def add_polyline(self, points, color):
+        logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
+        # 替换为可编辑路径项（支持选中、节点编辑）
+        item = EditablePathItem(points, color)
+        self.scene.addItem(item)
 
-            # 创建"添加图形"命令，压入撤销栈
-            cmd = AddItemCommand(self, item)
-            self.edit_manager.push_undo(cmd)
+        # 创建"添加图形"命令，压入撤销栈
+        cmd = AddItemCommand(self, item)
+        self.edit_manager.push_undo(cmd)
 
-            return item
+        return item
 
     def add_rect(self, x: float, y: float, w: float, h: float, color: QColor = QColor(0, 0, 0)):
         pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
@@ -278,21 +278,112 @@ class GridCanvas(QGraphicsView):
 
     # -------------------------- 修改：添加图片方法（支持选中 + 命令模式） --------------------------
     def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0):
-        item = QGraphicsPixmapItem(qpixmap)
-        item.setOffset(x, y)
+        # ========== 1. 计算图片尺寸和缩放比例 ==========
+        # 获取工作区域尺寸
+        work_area_width = self._work_w
+        work_area_height = self._work_h
+
+        # 计算图片原始尺寸（毫米）
+        pixel_to_mm = 25.4 / 96.0  # 96dpi → 毫米的换算系数
+        img_width_mm = qpixmap.width() * pixel_to_mm
+        img_height_mm = qpixmap.height() * pixel_to_mm
+
+        # 计算缩放比例，使图片适应工作区域但不超过100%
+        # 使用较小的边距，让图片更大
+        MARGIN = 5.0  # 减少边距
+        max_width = work_area_width - 2 * MARGIN
+        max_height = work_area_height - 2 * MARGIN
+
+        # 确保图片不会太小，但也不要超过原始尺寸
+        scale_ratio = min(max_width / img_width_mm, max_height / img_height_mm, 1.0)
+
+        # 如果图片很小，可以适当放大
+        if img_width_mm * scale_ratio < 50 and img_height_mm * scale_ratio < 50:
+            # 小图片适当放大
+            scale_ratio = min(100 / img_width_mm, 100 / img_height_mm, 2.0)  # 最大放大2倍
+
+        # 计算缩放后的尺寸
+        new_width_mm = img_width_mm * scale_ratio
+        new_height_mm = img_height_mm * scale_ratio
+        new_width_px = int(qpixmap.width() * scale_ratio)
+        new_height_px = int(qpixmap.height() * scale_ratio)
+
+        # 缩放图片
+        scaled_pixmap = qpixmap.scaled(new_width_px, new_height_px,
+                                       Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        # ========== 2. 计算精确的居中位置 ==========
+        # 使用场景的中心点而不是工作区域的中心点
+        scene_center_x = self.scene.sceneRect().center().x()
+        scene_center_y = self.scene.sceneRect().center().y()
+
+        # 如果场景矩形无效，使用工作区域中心
+        if scene_center_x == 0 and scene_center_y == 0:
+            scene_center_x = work_area_width / 2
+            scene_center_y = work_area_height / 2
+
+        # 计算图片左上角的位置（使图片在场景中央）
+        img_x = scene_center_x - new_width_mm / 2
+        img_y = scene_center_y - new_height_mm / 2
+
+        # ========== 3. 添加图片到画布 ==========
+        item = QGraphicsPixmapItem(scaled_pixmap)
+
+        # 设置图片位置（精确居中）
+        item.setPos(img_x, img_y)
+        item.setOffset(0, 0)  # 偏移量为0，位置已通过setPos设置
+
         item.setTransformationMode(Qt.SmoothTransformation)
         item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
         item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
-        s = 25.4 / 96.0  # 96dpi -> 毫米
-        item.setTransform(QTransform().scale(s, -s))
+
+        # 应用缩放转换（像素到毫米）
+        s = 25.4 / 96.0  # 96dpi → 毫米的缩放系数
+        item.setTransform(QTransform().scale(s, -s))  # Y轴翻转适配Qt坐标系统
+
         self.scene.addItem(item)
 
-        # 创建"添加图片"命令，压入撤销栈
+        # ========== 4. 调整视图以确保图片完全居中显示 ==========
+        # 计算图片的场景边界框
+        img_scene_rect = item.sceneBoundingRect()
+
+        # 扩展场景矩形以包含新图片，但不强制保留边框
+        current_scene_rect = self.scene.sceneRect()
+
+        # 计算新的场景矩形（包含所有内容的最小矩形）
+        if current_scene_rect.isNull() or current_scene_rect.width() == 0:
+            # 如果当前场景矩形无效，使用图片矩形
+            new_scene_rect = img_scene_rect
+        else:
+            # 合并当前场景矩形和图片矩形
+            new_scene_rect = current_scene_rect.united(img_scene_rect)
+
+        # 添加很小的边距，避免贴边
+        SMALL_MARGIN = 2.0
+        new_scene_rect_adjusted = new_scene_rect.adjusted(
+            -SMALL_MARGIN, -SMALL_MARGIN, SMALL_MARGIN, SMALL_MARGIN
+        )
+
+        # 设置新的场景矩形
+        self.scene.setSceneRect(new_scene_rect_adjusted)
+
+        # 适配视图以显示所有内容，但不保留边框
+        # 使用图片的边界框来适配视图，确保图片完全可见
+        self.fitInView(img_scene_rect, Qt.KeepAspectRatio)
+
+        # 发送视图变化信号更新标尺
+        self._emit_view_changed()
+
+        # ========== 5. 添加到撤销栈 ==========
         cmd = AddItemCommand(self, item)
         self.edit_manager.push_undo(cmd)
 
         self._last_img_item = item
         self._bitmap_count += 1
+
+        logger.info(f"图片已添加并居中，位置: ({img_x:.2f}, {img_y:.2f})，尺寸: {new_width_mm:.2f}×{new_height_mm:.2f}mm")
+        logger.info(f"缩放比例: {scale_ratio:.3f}")
+
         return item
 
     def all_paths(self) -> List[EditablePathItem]:
