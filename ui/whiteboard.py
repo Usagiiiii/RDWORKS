@@ -181,38 +181,27 @@ class GridCanvas(QGraphicsView):
             if item not in exclude_items and isinstance(item, (EditablePathItem, QGraphicsPixmapItem)):
                 item.setSelected(True)
 
-    # --- 定位点相关方法（更新为使用管理器）---
+    # --- 定位点相关方法（更新为使用命令模式）---
     def set_fiducial_size(self, size: float):
         self.fiducial_manager.set_fiducial_size(size)
 
     def add_fiducial(self, point: Point, shape: str):
-        self.fiducial_manager.add_fiducial(point, shape)
+        """添加定位点（使用命令模式）"""
+        from edit.commands import AddFiducialCommand
+        cmd = AddFiducialCommand(self, point, shape)
+        self.edit_manager.push_undo(cmd)
+        cmd.redo()  # 执行添加操作
 
     def remove_fiducial(self):
-        self.fiducial_manager.remove_fiducial()
+        """删除定位点（使用命令模式）"""
+        from edit.commands import RemoveFiducialCommand
+        if self.fiducial_manager.get_fiducial():
+            cmd = RemoveFiducialCommand(self)
+            self.edit_manager.push_undo(cmd)
+            cmd.redo()  # 执行删除操作
 
     def get_fiducial(self) -> Optional[Tuple[Point, str]]:
         return self.fiducial_manager.get_fiducial()
-
-    def _redraw_fiducial(self):
-        if not self._fiducial:
-            return
-        point, shape = self._fiducial
-        x, y = point
-        size = self._fiducial_size
-        path = QPainterPath()
-        if shape == 'cross':
-            half = size / 2.0
-            path.moveTo(x - half, y)
-            path.lineTo(x + half, y)
-            path.moveTo(x, y - half)
-            path.lineTo(x, y + half)
-        else:
-            path.addEllipse(QPointF(x, y), size / 2, size / 2)
-        self._fiducial_item = QGraphicsPathItem(path)
-        pen = QPen(QColor(255, 0, 0), 0.3)
-        self._fiducial_item.setPen(pen)
-        self.scene.addItem(self._fiducial_item)
 
     # --- 缩放/平移相关 ---
     def wheelEvent(self, e: QWheelEvent):
@@ -448,8 +437,14 @@ class GridCanvas(QGraphicsView):
             self._drawing_pts = [(pos.x(), pos.y())]
         elif self._tool in (self.Tool.ADD_FID_CROSS, self.Tool.ADD_FID_CIRCLE):
             shape = 'cross' if self._tool == self.Tool.ADD_FID_CROSS else 'circle'
-            self.add_fiducial((pos.x(), pos.y()), shape)
-            # +++ 新增：添加定位点后自动退出定位点模式，回到选择模式 +++
+
+            # +++ 修改：使用命令模式添加定位点 +++
+            from edit.commands import AddFiducialCommand
+            cmd = AddFiducialCommand(self, (pos.x(), pos.y()), shape)
+            self.edit_manager.push_undo(cmd)
+            cmd.redo()  # 执行添加操作
+
+            # 自动退出定位点模式，回到选择模式
             self.set_tool(self.Tool.SELECT)
             # 发送状态更新信号（如果主窗口有监听）
             if hasattr(self, 'toolChanged'):

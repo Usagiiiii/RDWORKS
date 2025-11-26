@@ -76,6 +76,15 @@ class MainWindow(QMainWindow):
         em.deleteAvailable.connect(self.delete_action.setEnabled)
         em.selectAllAvailable.connect(self.select_all_action.setEnabled)
 
+        # +++ 新增：初始化时禁用编辑操作 +++
+        self.undo_action.setEnabled(False)
+        self.redo_action.setEnabled(False)
+        self.cut_action.setEnabled(False)
+        self.copy_action.setEnabled(False)
+        self.delete_action.setEnabled(False)
+        # 全选在没有内容时也应该禁用
+        self.select_all_action.setEnabled(False)
+
         self.current_file = None
 
     def setup_style(self):

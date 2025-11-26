@@ -1,5 +1,9 @@
+import logging
+
 from PyQt5.QtCore import QObject, pyqtSignal
 from typing import List, Any
+logger = logging.getLogger(__name__)
+from PyQt5.QtWidgets import QGraphicsPixmapItem
 
 from edit.commands import DeleteItemsCommand, AddItemCommand
 
@@ -44,12 +48,36 @@ class EditManager(QObject):
         self.undoAvailable.emit(True)
         self.redoAvailable.emit(len(self.redo_stack) > 0)
 
+    # 修改 EditManager 类的 set_has_selection 方法
     def set_has_selection(self, has_selection: bool):
         """更新选中状态，触发菜单项可用性变化"""
         self.has_selection = has_selection
         self.cutCopyAvailable.emit(has_selection)
         self.deleteAvailable.emit(has_selection)
-        self.selectAllAvailable.emit(not has_selection)
+
+        # +++ 修改：检查画布是否有内容来决定全选是否可用 +++
+        has_content = self._check_canvas_has_content()
+        self.selectAllAvailable.emit(has_content)
+
+    def _check_canvas_has_content(self) -> bool:
+        """检查画布是否有可选择的图形内容"""
+        try:
+            for item in self.canvas.scene.items():
+                # 排除工作区网格和定位点
+                if (hasattr(self.canvas, '_work_item') and item == self.canvas._work_item):
+                    continue
+                if (hasattr(self.canvas, 'fiducial_manager') and
+                        self.canvas.fiducial_manager.get_fiducial_item() == item):
+                    continue
+
+                # 如果有图形项或图片项，则认为有内容
+                if (hasattr(item, '_points') or  # 路径项
+                        isinstance(item, QGraphicsPixmapItem)):  # 图片项
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"检查画布内容时出错: {e}")
+            return False
 
     def cut(self):
         if self.has_selection:
