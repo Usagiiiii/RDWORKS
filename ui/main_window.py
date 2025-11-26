@@ -11,7 +11,7 @@ from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QIcon, QKeySequence, QColor, QPalette
 from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidget, QLabel, QFileDialog, QMessageBox,
-                             QLineEdit)
+                             QLineEdit, QGraphicsPixmapItem)
 
 from my_io.importers.supported_filter import SUPPORTED_FILTER
 from ui.left_toolbar import LeftToolbar
@@ -21,6 +21,7 @@ from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
 from utils.logging_utils import setup_logging
 from utils.tool_utils import check_required_tools
 from ui.whiteboard import Path
+from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -63,6 +64,7 @@ class MainWindow(QMainWindow):
         em.deleteAvailable.connect(self.delete_action.setEnabled)
         em.selectAllAvailable.connect(self.select_all_action.setEnabled)
 
+        self.current_file = None
 
     def setup_style(self):
         """设置应用程序样式"""
@@ -80,34 +82,40 @@ class MainWindow(QMainWindow):
 
         new_action = QAction('新建(&N)', self)
         new_action.setShortcut(QKeySequence.New)
-        new_action.setStatusTip('创建新的白板')
+        new_action.setStatusTip('创建新的RLD文件')
         new_action.triggered.connect(self.new_file)
         file_menu.addAction(new_action)
 
         open_action = QAction('打开(&O)...', self)
         open_action.setShortcut(QKeySequence.Open)
-        open_action.setStatusTip('打开现有文件')
+        open_action.setStatusTip('打开现有RLD文件')
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
 
         save_action = QAction('保存(&S)', self)
         save_action.setShortcut(QKeySequence.Save)
-        save_action.setStatusTip('保存当前文件')
+        save_action.setStatusTip('保存当前RLD文件')
         save_action.triggered.connect(self.save_file)
         file_menu.addAction(save_action)
 
         save_as_action = QAction('另存为(&A)...', self)
         save_as_action.setShortcut(QKeySequence.SaveAs)
-        save_as_action.setStatusTip('另存为新文件')
+        save_as_action.setStatusTip('另存为新RLD文件')
         save_as_action.triggered.connect(self.save_as_file)
         file_menu.addAction(save_as_action)
 
         file_menu.addSeparator()
 
-        export_action = QAction('导入底图(&E)...', self)
+        export_action = QAction('导入(&E)...', self)
         export_action.setStatusTip('导入图像文件')
         export_action.triggered.connect(self.import_image)
         file_menu.addAction(export_action)
+
+        # 添加导出动作
+        export_nc_action = QAction('导出为NC(&X)...', self)
+        export_nc_action.setStatusTip('导出为G代码NC文件')
+        export_nc_action.triggered.connect(self.export_to_nc)
+        file_menu.addAction(export_nc_action)
 
         file_menu.addSeparator()
 
@@ -165,6 +173,28 @@ class MainWindow(QMainWindow):
         self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
         edit_menu.addAction(self.select_all_action)
 
+        # ========== 新增：定位点菜单 ==========
+        edit_menu.addSeparator()
+
+        # 添加十字定位点
+        self.add_cross_fiducial_action = QAction('添加十字定位点', self)
+        self.add_cross_fiducial_action.setStatusTip('添加十字形定位点（右键点击设置位置）')
+        self.add_cross_fiducial_action.triggered.connect(self.enable_cross_fiducial_mode)
+        edit_menu.addAction(self.add_cross_fiducial_action)
+
+        # 添加圆形定位点
+        self.add_circle_fiducial_action = QAction('添加圆形定位点', self)
+        self.add_circle_fiducial_action.setStatusTip('添加圆形定位点（右键点击设置位置）')
+        self.add_circle_fiducial_action.triggered.connect(self.enable_circle_fiducial_mode)
+        edit_menu.addAction(self.add_circle_fiducial_action)
+
+        # 删除定位点
+        self.remove_fiducial_action = QAction('删除定位点', self)
+        self.remove_fiducial_action.setStatusTip('删除当前定位点')
+        self.remove_fiducial_action.triggered.connect(self.remove_fiducial)
+        edit_menu.addAction(self.remove_fiducial_action)
+
+        # 视图菜单
         view_menu = menubar.addMenu('视图(D)')
         view_menu.setTitle('视图(D)')
 
@@ -527,32 +557,87 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central_widget)
 
-    # 文件操作方法
     def new_file(self):
-        """新建文件"""
-        reply = QMessageBox.question(self, '新建', '是否要清空当前白板？',
-                                    QMessageBox.Yes | QMessageBox.No)
+        """新建RLD文件"""
+        reply = QMessageBox.question(self, '新建RLD文件', '是否要清空当前白板并创建新文件？',
+                                     QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.whiteboard.clear()
-            self.statusBar().showMessage('已创建新白板')
+            self.current_file = None
+            self.setWindowTitle('激光加工控制系统 - 新文件')
+            self.statusBar().showMessage('已创建新RLD文件')
+            self.logger.info("创建新RLD文件")
 
     def open_file(self):
-        """打开文件"""
-        filename, _ = QFileDialog.getOpenFileName(self, '打开文件', '',
-                                                  '白板文件 (*.wbd);;所有文件 (*)')
-        if filename:
-            self.statusBar().showMessage(f'打开文件: {filename}')
+        """打开RLD文件"""
+        from my_io.RLD.init_rld import RLDFileHandler
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            '打开RLD文件',
+            '',
+            'RLD文件 (*.rld *.rldf);;所有文件 (*)'
+        )
+
+        if filename and RLDFileHandler.is_rld_file(filename):
+            try:
+                # 加载文件
+                success = RLDFileHandler.load_from_file(self.whiteboard.canvas, filename)
+                if success:
+                    self.current_file = filename
+                    self.setWindowTitle(f'激光加工控制系统 - {os.path.basename(filename)}')
+                    self.statusBar().showMessage(f'已打开RLD文件: {os.path.basename(filename)}')
+                    self.logger.info(f"打开RLD文件: {filename}")
+                else:
+                    QMessageBox.warning(self, "打开失败", "无法打开RLD文件，文件可能已损坏")
+            except Exception as e:
+                QMessageBox.critical(self, "打开错误", f"打开文件时发生错误:\n{str(e)}")
+        elif filename:
+            QMessageBox.warning(self, "文件格式错误", "请选择有效的RLD文件格式(.rld, .rldf)")
 
     def save_file(self):
-        """保存文件"""
-        self.statusBar().showMessage('保存文件')
+        """保存RLD文件"""
+        from my_io.RLD.init_rld import RLDFileHandler
+
+        if hasattr(self, 'current_file') and self.current_file:
+            # 保存到当前文件
+            success = RLDFileHandler.save_to_file(self.whiteboard.canvas, self.current_file)
+            if success:
+                self.statusBar().showMessage(f'已保存RLD文件: {os.path.basename(self.current_file)}')
+                self.logger.info(f"保存RLD文件: {self.current_file}")
+            else:
+                QMessageBox.warning(self, "保存失败", "保存文件失败，请检查文件权限")
+        else:
+            # 没有当前文件，执行另存为
+            self.save_as_file()
 
     def save_as_file(self):
-        """另存为文件"""
-        filename, _ = QFileDialog.getSaveFileName(self, '另存为', '',
-                                                  '白板文件 (*.wbd);;所有文件 (*)')
+        """另存为RLD文件"""
+        from my_io.RLD.init_rld import RLDFileHandler
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            '另存为RLD文件',
+            '',
+            'RLD文件 (*.rld);;所有文件 (*)'
+        )
+
         if filename:
-            self.statusBar().showMessage(f'保存文件: {filename}')
+            # 确保文件扩展名
+            if not filename.lower().endswith('.rld'):
+                filename += '.rld'
+
+            try:
+                success = RLDFileHandler.save_to_file(self.whiteboard.canvas, filename)
+                if success:
+                    self.current_file = filename
+                    self.setWindowTitle(f'激光加工控制系统 - {os.path.basename(filename)}')
+                    self.statusBar().showMessage(f'已另存为RLD文件: {os.path.basename(filename)}')
+                    self.logger.info(f"另存为RLD文件: {filename}")
+                else:
+                    QMessageBox.warning(self, "保存失败", "保存文件失败，请检查文件权限")
+            except Exception as e:
+                QMessageBox.critical(self, "保存错误", f"保存文件时发生错误:\n{str(e)}")
 
     def import_image(self):
         """
@@ -920,6 +1005,188 @@ class MainWindow(QMainWindow):
             self.logger.error(err_msg, exc_info=True)  # 记录完整堆栈
             QtWidgets.QMessageBox.critical(self, "导入错误", f"无法导入文件: {str(e)}\n查看日志获取详情")
 
+    def export_to_nc(self):
+        """导出为NC文件 - 增强版（支持矢量和位图）"""
+        try:
+            # 详细分析画布内容
+            content_info = self._analyze_canvas_content()
+            self.logger.info(f"画布内容分析: {content_info}")
+
+            if not content_info['has_any_content']:
+                QMessageBox.warning(self, "导出失败", "画布中没有可导出的内容")
+                return
+
+            # 如果只有图片，更新提示语
+            if content_info['has_images'] and not content_info['has_paths']:
+                reply = QMessageBox.question(
+                    self,
+                    "导出图片",
+                    "检测到画布中只有图片。\n将生成灰度雕刻G代码（可调整参数控制精度）。\n是否继续？",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+
+            # 选择保存文件路径
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                '导出为NC文件',
+                '',
+                'NC文件 (*.nc);;G代码文件 (*.gcode);;所有文件 (*)'
+            )
+
+            if not filename:
+                return  # 用户取消
+
+            # 确保文件扩展名
+            if not filename.lower().endswith(('.nc', '.gcode')):
+                filename += '.nc'
+
+            # 显示导出进度
+            self.statusBar().showMessage("正在导出G代码...")
+
+            # 配置导出参数
+            config = get_default_config()
+
+            # 根据内容类型优化配置
+            if content_info['has_images']:
+                # 对于图片，使用更精细的扫描间隔
+                config['scan_interval'] = 0.05  # 更精细的扫描
+                config['grayscale_threshold'] = 128  # 中等灰度阈值
+
+            # 执行导出
+            success = export_to_nc(self.whiteboard.canvas, filename, config)
+
+            if success:
+                # 读取生成的文件以获取更多信息
+                try:
+                    with open(filename, 'r', encoding='utf-8') as f:
+                        gcode_lines = f.readlines()
+                        line_count = len(gcode_lines)
+
+                        # 统计实际加工指令
+                        move_count = sum(1 for line in gcode_lines if line.startswith(('G00', 'G01')))
+                        laser_on_count = sum(1 for line in gcode_lines if 'M03' in line)
+
+                        message = f'成功导出G代码: {os.path.basename(filename)}'
+                        message += f" (共 {line_count} 行, {move_count} 个移动指令)"
+
+                        if content_info['has_images']:
+                            message += f" (包含 {content_info['image_count']} 张图片)"
+                        if content_info['has_paths']:
+                            message += f" (包含 {content_info['path_count']} 条路径)"
+
+                        self.statusBar().showMessage(message, 5000)
+                        QMessageBox.information(self, "导出成功",
+                                                f"G代码导出完成！\n文件已保存到: {filename}\n"
+                                                f"共生成 {line_count} 行G代码，{move_count} 个移动指令")
+                except Exception as read_error:
+                    self.logger.warning(f"读取G代码文件失败: {read_error}")
+                    self.statusBar().showMessage(f'成功导出G代码: {os.path.basename(filename)}', 5000)
+                    QMessageBox.information(self, "导出成功", f"G代码导出完成！\n文件已保存到: {filename}")
+            else:
+                self.statusBar().showMessage('导出失败', 5000)
+                QMessageBox.warning(self, "导出失败", "G代码导出失败，请查看日志获取详细信息")
+
+        except Exception as e:
+            error_msg = f"导出过程中发生错误: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            self.statusBar().showMessage('导出错误', 5000)
+            QMessageBox.critical(self, "导出错误", error_msg)
+
+    def _analyze_canvas_content(self):
+        """详细分析画布内容（增强版）"""
+        from PyQt5.QtWidgets import QGraphicsPixmapItem
+
+        info = {
+            'has_paths': False,
+            'has_images': False,
+            'has_any_content': False,
+            'path_count': 0,
+            'image_count': 0,
+            'total_points': 0,
+            'image_sizes': []
+        }
+
+        try:
+            for item in self.whiteboard.canvas.scene.items():
+                # 排除工作区网格等系统项
+                if hasattr(self.whiteboard.canvas, '_work_item') and item == self.whiteboard.canvas._work_item:
+                    continue
+                if hasattr(self.whiteboard.canvas, '_fiducial_item') and item == self.whiteboard.canvas._fiducial_item:
+                    continue
+
+                # 矢量路径
+                if hasattr(item, '_points') and hasattr(item, 'points'):
+                    try:
+                        points = item.points()
+                        if points and len(points) >= 2:
+                            info['has_paths'] = True
+                            info['path_count'] += 1
+                            info['total_points'] += len(points)
+                    except Exception as e:
+                        self.logger.warning(f"获取路径点时出错: {e}")
+
+                # 位图图片
+                elif isinstance(item, QGraphicsPixmapItem):
+                    if not item.pixmap().isNull():
+                        info['has_images'] = True
+                        info['image_count'] += 1
+                        # 记录图片尺寸
+                        pixmap = item.pixmap()
+                        info['image_sizes'].append(f"{pixmap.width()}x{pixmap.height()}")
+
+            info['has_any_content'] = info['has_paths'] or info['has_images']
+
+            # 添加详细日志
+            if info['has_paths']:
+                self.logger.info(f"找到 {info['path_count']} 条路径，共 {info['total_points']} 个点")
+            if info['has_images']:
+                self.logger.info(f"找到 {info['image_count']} 张图片，尺寸: {', '.join(info['image_sizes'])}")
+
+        except Exception as e:
+            self.logger.error(f"分析画布内容时出错: {e}")
+
+        return info
+
+    def _has_exportable_content(self) -> bool:
+        """检查画布中是否有可导出的内容（支持矢量和位图）"""
+        try:
+            from PyQt5.QtWidgets import QGraphicsPixmapItem
+
+            # 检查是否有路径项或图片项
+            for item in self.whiteboard.canvas.scene.items():
+                # 检查矢量路径
+                if hasattr(item, '_points') and hasattr(item, 'points'):
+                    points = item.points()
+                    if len(points) >= 2:
+                        return True
+
+                # 检查位图图片
+                if isinstance(item, QGraphicsPixmapItem):
+                    if not item.pixmap().isNull():
+                        return True
+
+            return False
+        except Exception as e:
+            self.logger.error(f"检查可导出内容时出错: {e}")
+            return False
+
+    def enable_cross_fiducial_mode(self):
+        """启用十字定位点模式"""
+        self.whiteboard.canvas.set_tool(self.whiteboard.canvas.Tool.ADD_FID_CROSS)
+        self.statusBar().showMessage('十字定位点模式：请在画布上右键点击设置定位点（点击后自动退出）')
+
+    def enable_circle_fiducial_mode(self):
+        """启用圆形定位点模式"""
+        self.whiteboard.canvas.set_tool(self.whiteboard.canvas.Tool.ADD_FID_CIRCLE)
+        self.statusBar().showMessage('圆形定位点模式：请在画布上右键点击设置定位点（点击后自动退出）')
+
+    def remove_fiducial(self):
+        """删除定位点"""
+        self.whiteboard.remove_fiducial()
+        self.statusBar().showMessage('定位点已删除')
+
     # 编辑操作方法
     def undo(self):
         """撤销"""
@@ -1006,3 +1273,90 @@ class MainWindow(QMainWindow):
                          '激光加工控制系统 v1.0\n\n'
                          '专业的激光加工控制软件\n'
                          '支持精确绘图、参数设置和加工控制')
+
+    def closeEvent(self, event):
+        """关闭事件处理 - 在用户尝试关闭窗口时调用"""
+        if self._has_unsaved_changes():
+            reply = QMessageBox.question(
+                self,
+                '未保存的更改',
+                '文档已修改，是否保存更改？',
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save  # 默认选择保存
+            )
+
+            if reply == QMessageBox.Save:
+                # 尝试保存文件
+                try:
+                    self.save_file()
+                    event.accept()  # 接受关闭事件
+                    self.logger.info("用户选择保存并关闭")
+                except Exception as e:
+                    # 保存失败，让用户选择
+                    retry_reply = QMessageBox.question(
+                        self,
+                        '保存失败',
+                        f'保存文件失败: {str(e)}\n是否不保存直接退出？',
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if retry_reply == QMessageBox.Yes:
+                        event.accept()
+                    else:
+                        event.ignore()  # 忽略关闭事件
+                        self.logger.info("用户取消关闭")
+            elif reply == QMessageBox.Discard:
+                # 不保存直接退出
+                event.accept()
+                self.logger.info("用户选择不保存直接关闭")
+            else:
+                # 取消关闭
+                event.ignore()
+                self.logger.info("用户取消关闭操作")
+        else:
+            # 没有未保存的更改，直接关闭
+            event.accept()
+            self.logger.info("无未保存更改，直接关闭")
+
+    def _has_unsaved_changes(self) -> bool:
+        """检查是否有未保存的更改"""
+        try:
+            # 如果有当前文件，检查是否修改过
+            # 这里简化处理：只要画布有内容就认为可能有未保存更改
+            # 实际应用中可以根据需要实现更精确的修改检测
+
+            # 检查画布是否有内容（排除工作区网格和定位点）
+            has_content = False
+
+            for item in self.whiteboard.canvas.scene.items():
+                # 跳过工作区网格
+                if hasattr(self.whiteboard.canvas, '_work_item') and item == self.whiteboard.canvas._work_item:
+                    continue
+
+                # 跳过定位点
+                if hasattr(self.whiteboard.canvas, 'fiducial_manager'):
+                    fiducial_manager = self.whiteboard.canvas.fiducial_manager
+                    fiducial_item = fiducial_manager.get_fiducial_item() if fiducial_manager else None
+                    if fiducial_item and item == fiducial_item:
+                        continue
+
+                # 如果有任何图形项或图片项，认为有内容
+                if (hasattr(item, '_points') or  # 路径项
+                        hasattr(item, 'pixmap') or  # 图片项
+                        isinstance(item, QGraphicsPixmapItem)):
+                    has_content = True
+                    break
+
+            # 如果有内容且没有关联文件，或者有内容且文件是新创建的，认为有未保存更改
+            if has_content and (not hasattr(self, 'current_file') or self.current_file is None):
+                return True
+
+            # 这里可以添加更复杂的修改检测逻辑
+            # 例如：记录初始状态，比较当前状态与保存状态
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"检查未保存更改时出错: {e}")
+            # 出错时保守处理，提示用户保存
+            return True

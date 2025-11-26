@@ -17,6 +17,7 @@ from typing import List, Tuple, Optional
 
 from edit.commands import AddItemCommand
 from edit.edit_manager import EditManager
+from my_io.gcode.gcode_exporter import Point
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -134,10 +135,9 @@ class GridCanvas(QGraphicsView):
         self._drawing_pts: Path = []
         self._drawing_tmp: Optional[QGraphicsPathItem] = None
 
-        # 定位点相关属性
-        self._fiducial: Optional[Tuple[Pt, str]] = None
-        self._fiducial_item = None
-        self._fiducial_size = 6.0
+        # 定位点相关属性 - 使用新的管理器
+        from my_io.fiducial.fiducial_manager import FiducialManager
+        self.fiducial_manager = FiducialManager(self)
 
         # -------------------------- 新增：初始化编辑管理器 --------------------------
         self.edit_manager = EditManager(self)
@@ -153,7 +153,14 @@ class GridCanvas(QGraphicsView):
     # -------------------------- 新增：供EditManager调用的接口 --------------------------
     def get_selected_items(self) -> List[QGraphicsItem]:
         """获取所有选中的图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item, self._fiducial_item]
+        exclude_items = [self._work_item]
+
+        # 使用新的 FiducialManager 获取定位点项
+        if hasattr(self, 'fiducial_manager'):
+            fiducial_item = self.fiducial_manager.get_fiducial_item()
+            if fiducial_item:
+                exclude_items.append(fiducial_item)
+
         return [
             item for item in self.scene.selectedItems()
             if item not in exclude_items  # 不处理网格和定位点
@@ -162,22 +169,30 @@ class GridCanvas(QGraphicsView):
 
     def select_all_items(self):
         """全选所有图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item, self._fiducial_item]
+        exclude_items = [self._work_item]
+
+        # 使用新的 FiducialManager 获取定位点项
+        if hasattr(self, 'fiducial_manager'):
+            fiducial_item = self.fiducial_manager.get_fiducial_item()
+            if fiducial_item:
+                exclude_items.append(fiducial_item)
+
         for item in self.scene.items():
             if item not in exclude_items and isinstance(item, (EditablePathItem, QGraphicsPixmapItem)):
                 item.setSelected(True)
 
-    # --- 定位点相关方法 ---
+    # --- 定位点相关方法（更新为使用管理器）---
     def set_fiducial_size(self, size: float):
-        self._fiducial_size = size
-        if self._fiducial:
-            self._redraw_fiducial()
+        self.fiducial_manager.set_fiducial_size(size)
 
-    def add_fiducial(self, point: Pt, shape: str):
-        self.remove_fiducial()
-        self._fiducial = (point, shape)
-        self._redraw_fiducial()
-        logger.info(f"添加定位点: {point}, 形状: {shape}, 尺寸: {self._fiducial_size}")
+    def add_fiducial(self, point: Point, shape: str):
+        self.fiducial_manager.add_fiducial(point, shape)
+
+    def remove_fiducial(self):
+        self.fiducial_manager.remove_fiducial()
+
+    def get_fiducial(self) -> Optional[Tuple[Point, str]]:
+        return self.fiducial_manager.get_fiducial()
 
     def _redraw_fiducial(self):
         if not self._fiducial:
@@ -198,16 +213,6 @@ class GridCanvas(QGraphicsView):
         pen = QPen(QColor(255, 0, 0), 0.3)
         self._fiducial_item.setPen(pen)
         self.scene.addItem(self._fiducial_item)
-
-    def remove_fiducial(self):
-        if self._fiducial_item:
-            self.scene.removeItem(self._fiducial_item)
-            self._fiducial_item = None
-        self._fiducial = None
-        logger.info("已删除定位点")
-
-    def get_fiducial(self) -> Optional[Tuple[Pt, str]]:
-        return self._fiducial
 
     # --- 缩放/平移相关 ---
     def wheelEvent(self, e: QWheelEvent):
@@ -254,18 +259,18 @@ class GridCanvas(QGraphicsView):
             pen = thick if y % 50 == 0 else thin
             self.scene.addLine(0, y, self._work_w, y, pen)
 
-        # -------------------------- 修改：图形添加方法（使用EditablePathItem + 命令模式） --------------------------
-        def add_polyline(self, points, color):
-            logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
-            # 替换为可编辑路径项（支持选中、节点编辑）
-            item = EditablePathItem(points, color)
-            self.scene.addItem(item)
+    # -------------------------- 修改：图形添加方法（使用EditablePathItem + 命令模式） --------------------------
+    def add_polyline(self, points, color):
+        logger.info(f"画布添加折线：{len(points)}个点，颜色={color.getRgb()}")
+        # 替换为可编辑路径项（支持选中、节点编辑）
+        item = EditablePathItem(points, color)
+        self.scene.addItem(item)
 
-            # 创建"添加图形"命令，压入撤销栈
-            cmd = AddItemCommand(self, item)
-            self.edit_manager.push_undo(cmd)
+        # 创建"添加图形"命令，压入撤销栈
+        cmd = AddItemCommand(self, item)
+        self.edit_manager.push_undo(cmd)
 
-            return item
+        return item
 
     def add_rect(self, x: float, y: float, w: float, h: float, color: QColor = QColor(0, 0, 0)):
         pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
@@ -278,21 +283,112 @@ class GridCanvas(QGraphicsView):
 
     # -------------------------- 修改：添加图片方法（支持选中 + 命令模式） --------------------------
     def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0):
-        item = QGraphicsPixmapItem(qpixmap)
-        item.setOffset(x, y)
+        # ========== 1. 计算图片尺寸和缩放比例 ==========
+        # 获取工作区域尺寸
+        work_area_width = self._work_w
+        work_area_height = self._work_h
+
+        # 计算图片原始尺寸（毫米）
+        pixel_to_mm = 25.4 / 96.0  # 96dpi → 毫米的换算系数
+        img_width_mm = qpixmap.width() * pixel_to_mm
+        img_height_mm = qpixmap.height() * pixel_to_mm
+
+        # 计算缩放比例，使图片适应工作区域但不超过100%
+        # 使用较小的边距，让图片更大
+        MARGIN = 5.0  # 减少边距
+        max_width = work_area_width - 2 * MARGIN
+        max_height = work_area_height - 2 * MARGIN
+
+        # 确保图片不会太小，但也不要超过原始尺寸
+        scale_ratio = min(max_width / img_width_mm, max_height / img_height_mm, 1.0)
+
+        # 如果图片很小，可以适当放大
+        if img_width_mm * scale_ratio < 50 and img_height_mm * scale_ratio < 50:
+            # 小图片适当放大
+            scale_ratio = min(100 / img_width_mm, 100 / img_height_mm, 2.0)  # 最大放大2倍
+
+        # 计算缩放后的尺寸
+        new_width_mm = img_width_mm * scale_ratio
+        new_height_mm = img_height_mm * scale_ratio
+        new_width_px = int(qpixmap.width() * scale_ratio)
+        new_height_px = int(qpixmap.height() * scale_ratio)
+
+        # 缩放图片
+        scaled_pixmap = qpixmap.scaled(new_width_px, new_height_px,
+                                       Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        # ========== 2. 计算精确的居中位置 ==========
+        # 使用场景的中心点而不是工作区域的中心点
+        scene_center_x = self.scene.sceneRect().center().x()
+        scene_center_y = self.scene.sceneRect().center().y()
+
+        # 如果场景矩形无效，使用工作区域中心
+        if scene_center_x == 0 and scene_center_y == 0:
+            scene_center_x = work_area_width / 2
+            scene_center_y = work_area_height / 2
+
+        # 计算图片左上角的位置（使图片在场景中央）
+        img_x = scene_center_x - new_width_mm / 2
+        img_y = scene_center_y - new_height_mm / 2
+
+        # ========== 3. 添加图片到画布 ==========
+        item = QGraphicsPixmapItem(scaled_pixmap)
+
+        # 设置图片位置（精确居中）
+        item.setPos(img_x, img_y)
+        item.setOffset(0, 0)  # 偏移量为0，位置已通过setPos设置
+
         item.setTransformationMode(Qt.SmoothTransformation)
         item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
         item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
-        s = 25.4 / 96.0  # 96dpi -> 毫米
-        item.setTransform(QTransform().scale(s, -s))
+
+        # 应用缩放转换（像素到毫米）
+        s = 25.4 / 96.0  # 96dpi → 毫米的缩放系数
+        item.setTransform(QTransform().scale(s, -s))  # Y轴翻转适配Qt坐标系统
+
         self.scene.addItem(item)
 
-        # 创建"添加图片"命令，压入撤销栈
+        # ========== 4. 调整视图以确保图片完全居中显示 ==========
+        # 计算图片的场景边界框
+        img_scene_rect = item.sceneBoundingRect()
+
+        # 扩展场景矩形以包含新图片，但不强制保留边框
+        current_scene_rect = self.scene.sceneRect()
+
+        # 计算新的场景矩形（包含所有内容的最小矩形）
+        if current_scene_rect.isNull() or current_scene_rect.width() == 0:
+            # 如果当前场景矩形无效，使用图片矩形
+            new_scene_rect = img_scene_rect
+        else:
+            # 合并当前场景矩形和图片矩形
+            new_scene_rect = current_scene_rect.united(img_scene_rect)
+
+        # 添加很小的边距，避免贴边
+        SMALL_MARGIN = 2.0
+        new_scene_rect_adjusted = new_scene_rect.adjusted(
+            -SMALL_MARGIN, -SMALL_MARGIN, SMALL_MARGIN, SMALL_MARGIN
+        )
+
+        # 设置新的场景矩形
+        self.scene.setSceneRect(new_scene_rect_adjusted)
+
+        # 适配视图以显示所有内容，但不保留边框
+        # 使用图片的边界框来适配视图，确保图片完全可见
+        self.fitInView(img_scene_rect, Qt.KeepAspectRatio)
+
+        # 发送视图变化信号更新标尺
+        self._emit_view_changed()
+
+        # ========== 5. 添加到撤销栈 ==========
         cmd = AddItemCommand(self, item)
         self.edit_manager.push_undo(cmd)
 
         self._last_img_item = item
         self._bitmap_count += 1
+
+        logger.info(f"图片已添加并居中，位置: ({img_x:.2f}, {img_y:.2f})，尺寸: {new_width_mm:.2f}×{new_height_mm:.2f}mm")
+        logger.info(f"缩放比例: {scale_ratio:.3f}")
+
         return item
 
     def all_paths(self) -> List[EditablePathItem]:
@@ -353,6 +449,12 @@ class GridCanvas(QGraphicsView):
         elif self._tool in (self.Tool.ADD_FID_CROSS, self.Tool.ADD_FID_CIRCLE):
             shape = 'cross' if self._tool == self.Tool.ADD_FID_CROSS else 'circle'
             self.add_fiducial((pos.x(), pos.y()), shape)
+            # +++ 新增：添加定位点后自动退出定位点模式，回到选择模式 +++
+            self.set_tool(self.Tool.SELECT)
+            # 发送状态更新信号（如果主窗口有监听）
+            if hasattr(self, 'toolChanged'):
+                self.toolChanged.emit(self.Tool.SELECT)
+            # +++ 结束新增 +++
         else:
             super().mousePressEvent(e)
 
