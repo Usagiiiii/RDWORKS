@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
                              QRadioButton, QGridLayout, QStackedWidget)
+from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 
@@ -34,6 +35,8 @@ class RightPanel(QWidget):
         self.tabs.addTab(self.create_user_tab(), "用户")
         self.tabs.addTab(self.create_test_tab(), "测试")
         self.tabs.addTab(self.create_transform_tab(), "变换")
+        # 新增：历史面板（列出撤销/重做历史）
+        self.tabs.addTab(self.create_history_tab(), "历史")
 
         root_layout.addWidget(self.tabs, 1)
 
@@ -956,6 +959,64 @@ class RightPanel(QWidget):
         main_layout.addWidget(self.transform_stack)
 
         return widget
+
+    def create_history_tab(self):
+        """创建历史记录标签页：显示撤销/重做历史并支持跳转"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        info_label = QLabel("操作历史（双击某项跳转到该状态）：")
+        layout.addWidget(info_label)
+
+        self.history_list = QListWidget()
+        self.history_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.history_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.history_list.setAlternatingRowColors(True)
+        layout.addWidget(self.history_list, 1)
+
+        # 跳转说明和清空按钮
+        btn_row = QHBoxLayout()
+        self.history_jump_btn = QPushButton("跳转到选中")
+        self.history_clear_btn = QPushButton("清空历史")
+        btn_row.addWidget(self.history_jump_btn)
+        btn_row.addWidget(self.history_clear_btn)
+        layout.addLayout(btn_row)
+
+        # 事件连接由 MainWindow 负责（需要访问 edit_manager）
+        # 但提供本地槽以便被 MainWindow 连接
+        # 事件将在 MainWindow 中连接到 edit_manager 的操作
+        self.history_jump_btn.clicked.connect(lambda: None)
+        self.history_clear_btn.clicked.connect(lambda: None)
+
+        return widget
+
+    def update_history(self, descriptions: list, current_index: int):
+        """外部调用以更新历史列表显示。"""
+        try:
+            self.history_list.clear()
+            for i, d in enumerate(descriptions):
+                item = QListWidgetItem(f"{i+1}. {d}")
+                # 默认样式
+                item.setBackground(QColor(255, 255, 255))
+                item.setForeground(QColor(40, 40, 40))
+                self.history_list.addItem(item)
+
+            # current_index 表示下一个将被 redo 的索引
+            # 我们高亮当前状态前一项（即已执行的最后一项）
+            cur_row = current_index - 1
+            for r in range(self.history_list.count()):
+                it = self.history_list.item(r)
+                if r == cur_row:
+                    # 深色高亮
+                    it.setBackground(QColor(30, 120, 200))
+                    it.setForeground(QColor(255, 255, 255))
+                else:
+                    it.setBackground(QColor(255, 255, 255))
+                    it.setForeground(QColor(40, 40, 40))
+        except Exception:
+            pass
 
     #5个页面的创建函数
     def create_position_page(self):

@@ -75,6 +75,11 @@ class MainWindow(QMainWindow):
         em.cutCopyAvailable.connect(lambda b: (self.cut_action.setEnabled(b), self.copy_action.setEnabled(b)))
         em.deleteAvailable.connect(self.delete_action.setEnabled)
         em.selectAllAvailable.connect(self.select_all_action.setEnabled)
+        # 历史列表更新
+        try:
+            em.historyChanged.connect(self.right_panel.update_history)
+        except Exception:
+            pass
 
         # +++ 新增：初始化时禁用编辑操作 +++
         self.undo_action.setEnabled(False)
@@ -86,6 +91,37 @@ class MainWindow(QMainWindow):
         self.select_all_action.setEnabled(False)
 
         self.current_file = None
+
+        # 连接右侧历史面板的交互（双击跳转、按钮）
+        try:
+            hl = self.right_panel.history_list
+            hl.itemDoubleClicked.connect(lambda item: self._on_history_item_activated(item))
+            self.right_panel.history_jump_btn.clicked.connect(lambda: self._on_history_jump())
+            self.right_panel.history_clear_btn.clicked.connect(lambda: self._on_history_clear())
+        except Exception:
+            pass
+
+    def _on_history_item_activated(self, item):
+        try:
+            row = self.right_panel.history_list.row(item)
+            # 用户希望跳转到包含该项的状态 -> target_index = row + 1
+            self.whiteboard.canvas.edit_manager.go_to(row + 1)
+        except Exception:
+            pass
+
+    def _on_history_jump(self):
+        try:
+            row = self.right_panel.history_list.currentRow()
+            if row >= 0:
+                self.whiteboard.canvas.edit_manager.go_to(row + 1)
+        except Exception:
+            pass
+
+    def _on_history_clear(self):
+        try:
+            self.whiteboard.canvas.edit_manager.clear_history()
+        except Exception:
+            pass
 
     def setup_style(self):
         """设置应用程序样式"""
@@ -157,9 +193,9 @@ class MainWindow(QMainWindow):
         self.undo_action.triggered.connect(self.whiteboard.canvas.edit_manager.undo)
         edit_menu.addAction(self.undo_action)
 
-        self.redo_action = QAction('重做(&R)', self)
+        self.redo_action = QAction('恢复(&R)', self)
         self.redo_action.setShortcut(QKeySequence.Redo)
-        self.redo_action.setStatusTip('重做上一步操作')
+        self.redo_action.setStatusTip('恢复上一步操作')
         self.redo_action.triggered.connect(self.whiteboard.canvas.edit_manager.redo)
         edit_menu.addAction(self.redo_action)
 
@@ -321,13 +357,13 @@ class MainWindow(QMainWindow):
         # 左侧新建和打开按钮
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column1.png', '新建', self.new_file))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column2.png', '打开', self.open_file))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', self.save_file))
         toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', self.import_image))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', self.export_to_nc))
         toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', self.undo))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', self.redo))
         toolbar1.addSeparator()
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', None))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', None))
@@ -486,17 +522,46 @@ class MainWindow(QMainWindow):
         angle_order_layout.setContentsMargins(3, 0, 3, 0)
         angle_order_layout.setSpacing(5)
 
-        # 角度输入框
-        angle_input = QLineEdit("0")
-        angle_input.setMaximumWidth(70)
-        angle_input.setMinimumHeight(40)
-        angle_input.setMaximumHeight(40)
-        angle_input.setAlignment(Qt.AlignCenter)
-        angle_order_layout.addWidget(angle_input)
+        # 角度输入框（公开为 self.angle_input）
+        self.angle_input = QLineEdit("0")
+        self.angle_input.setMaximumWidth(70)
+        self.angle_input.setMinimumHeight(40)
+        self.angle_input.setMaximumHeight(40)
+        self.angle_input.setAlignment(Qt.AlignCenter)
+        angle_order_layout.addWidget(self.angle_input)
 
         degree_label = QLabel("°")
         degree_label.setStyleSheet("font-size: 20px; font-weight: bold;")
         angle_order_layout.addWidget(degree_label)
+
+        # 旋转应用按钮（点击应用输入角度）
+        from PyQt5.QtWidgets import QPushButton
+        apply_btn = QPushButton()
+        apply_btn.setToolTip('按输入角度旋转选中项')
+        apply_btn.setFixedSize(36, 36)
+        try:
+            apply_btn.setIcon(QtGui.QIcon('toolbar_row3_icons/rotate_icon.png'))
+        except Exception:
+            pass
+        angle_order_layout.addWidget(apply_btn)
+
+        # 精确旋转按钮（打开对话框，支持增量/绝对）
+        precise_btn = QPushButton()
+        precise_btn.setToolTip('精确旋转...')
+        precise_btn.setFixedSize(28, 28)
+        try:
+            precise_btn.setIcon(QtGui.QIcon('toolbar_row3_icons/rotate_precise.png'))
+        except Exception:
+            precise_btn.setText('...')
+        angle_order_layout.addWidget(precise_btn)
+
+        # 连接信号：按回车或点击按钮时应用角度旋转
+        try:
+            self.angle_input.returnPressed.connect(lambda: self.rotate_selected_by_angle())
+            apply_btn.clicked.connect(lambda: self.rotate_selected_by_angle())
+            precise_btn.clicked.connect(lambda: self.open_rotate_dialog())
+        except Exception:
+            pass
 
         # 加工序号标签
         order_label = QLabel("加工序号")
@@ -589,6 +654,104 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.right_panel)
 
         self.setCentralWidget(central_widget)
+
+        # 连接左侧工具栏信号
+        self.left_toolbar.toolChanged.connect(self.on_tool_changed)
+        # 快捷键：缩放选中项（Ctrl+Shift++ / Ctrl+Shift+-）——若无选中则缩放视图
+        try:
+            from PyQt5.QtWidgets import QShortcut
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt
+
+            def _scale_plus():
+                self._scale_or_zoom_selected(1.2)
+
+            def _scale_minus():
+                self._scale_or_zoom_selected(1.0 / 1.2)
+
+            # 使用明确的 Qt key 常量并设置为 ApplicationShortcut，以优先于菜单快捷键
+            sc1 = QShortcut(QKeySequence(Qt.CTRL + Qt.SHIFT + Qt.Key_Plus), self)
+            sc1.setContext(Qt.ApplicationShortcut)
+            sc1.activated.connect(_scale_plus)
+
+            sc2 = QShortcut(QKeySequence(Qt.CTRL + Qt.SHIFT + Qt.Key_Minus), self)
+            sc2.setContext(Qt.ApplicationShortcut)
+            sc2.activated.connect(_scale_minus)
+        except Exception:
+            pass
+
+    def on_tool_changed(self, tool_id):
+        """左侧工具栏工具切换"""
+        # 工具ID映射：LeftToolbar工具ID -> Whiteboard工具ID
+        tool_mapping = {
+            LeftToolbar.TOOL_SELECT: self.whiteboard.canvas.Tool.SELECT,
+            LeftToolbar.TOOL_NODE_EDIT: self.whiteboard.canvas.Tool.NODE_EDIT,
+            LeftToolbar.TOOL_LINE: self.whiteboard.canvas.Tool.DRAW_LINE,
+            LeftToolbar.TOOL_POLYLINE: self.whiteboard.canvas.Tool.DRAW_POLY,
+            LeftToolbar.TOOL_CURVE: self.whiteboard.canvas.Tool.DRAW_CURVE,
+            LeftToolbar.TOOL_RECTANGLE: self.whiteboard.canvas.Tool.DRAW_RECT,
+            LeftToolbar.TOOL_ELLIPSE: self.whiteboard.canvas.Tool.DRAW_ELLIPSE,
+            LeftToolbar.TOOL_TEXT: self.whiteboard.canvas.Tool.DRAW_TEXT,
+            LeftToolbar.TOOL_POINT: self.whiteboard.canvas.Tool.DRAW_POINT,
+            LeftToolbar.TOOL_GRID: self.whiteboard.canvas.Tool.DRAW_GRID,
+            LeftToolbar.TOOL_DELETE: self.whiteboard.canvas.Tool.DELETE,
+            LeftToolbar.TOOL_H_MIRROR: self.whiteboard.canvas.Tool.H_MIRROR,
+            LeftToolbar.TOOL_V_MIRROR: self.whiteboard.canvas.Tool.V_MIRROR,
+            LeftToolbar.TOOL_DOCK: self.whiteboard.canvas.Tool.DOCK,
+            LeftToolbar.TOOL_ARRAY: self.whiteboard.canvas.Tool.ARRAY,
+        }
+
+        if tool_id in tool_mapping:
+            whiteboard_tool = tool_mapping[tool_id]
+            self.whiteboard.set_tool(whiteboard_tool)
+
+            # 更新状态栏提示
+            tool_names = {
+                LeftToolbar.TOOL_SELECT: "选择工具",
+                LeftToolbar.TOOL_NODE_EDIT: "节点编辑工具",
+                LeftToolbar.TOOL_LINE: "直线工具",
+                LeftToolbar.TOOL_POLYLINE: "折线工具",
+                LeftToolbar.TOOL_CURVE: "曲线工具",
+                LeftToolbar.TOOL_RECTANGLE: "矩形工具",
+                LeftToolbar.TOOL_ELLIPSE: "椭圆工具",
+                LeftToolbar.TOOL_TEXT: "文字工具",
+                LeftToolbar.TOOL_POINT: "点工具",
+                LeftToolbar.TOOL_GRID: "网格工具",
+                LeftToolbar.TOOL_DELETE: "删除工具",
+                LeftToolbar.TOOL_H_MIRROR: "水平镜像",
+                LeftToolbar.TOOL_V_MIRROR: "垂直镜像",
+                LeftToolbar.TOOL_DOCK: "图形停靠",
+                LeftToolbar.TOOL_ARRAY: "阵列复制",
+            }
+
+            if tool_id in tool_names:
+                self.statusBar().showMessage(f'已选择: {tool_names[tool_id]}')
+
+            # 特殊工具处理
+            if tool_id == LeftToolbar.TOOL_DELETE:
+                self.whiteboard.canvas.edit_manager.delete()
+                # 删除后自动回到选择工具
+                self.left_toolbar.button_group.buttons()[0].setChecked(True)
+                self.whiteboard.set_tool(self.whiteboard.canvas.Tool.SELECT)
+            # 镜像工具：立即对选中项执行镜像，然后回到选择工具（便于连续点击）
+            if tool_id in (LeftToolbar.TOOL_H_MIRROR, LeftToolbar.TOOL_V_MIRROR):
+                try:
+                    selected = self.whiteboard.canvas.get_selected_items()
+                    if selected:
+                        from edit.commands import MirrorCommand
+                        horizontal = (tool_id == LeftToolbar.TOOL_H_MIRROR)
+                        cmd = MirrorCommand(self.whiteboard.canvas, selected, horizontal=horizontal)
+                        # 先执行操作再推入历史
+                        cmd.redo()
+                        self.whiteboard.canvas.edit_manager.push_undo(cmd)
+                except Exception:
+                    pass
+                # 执行后恢复为选择工具，方便用户再次点击镜像按钮执行多次操作
+                try:
+                    self.left_toolbar.button_group.buttons()[0].setChecked(True)
+                except Exception:
+                    pass
+                self.whiteboard.set_tool(self.whiteboard.canvas.Tool.SELECT)
 
     def new_file(self):
         """新建RLD文件"""
@@ -1254,18 +1417,48 @@ class MainWindow(QMainWindow):
     # 视图操作方法
     def zoom_in(self):
         """放大"""
-        self.whiteboard.zoom_in()
+        # 如果有选中项则放大选中项，否则放大视图
+        try:
+            self._scale_or_zoom_selected(1.15)
+        except Exception:
+            try:
+                self.whiteboard.zoom_in()
+            except Exception:
+                pass
         self.statusBar().showMessage(f'缩放: {self.whiteboard.get_zoom_percent()}%')
 
     def zoom_out(self):
         """缩小"""
-        self.whiteboard.zoom_out()
+        try:
+            self._scale_or_zoom_selected(1 / 1.15)
+        except Exception:
+            try:
+                self.whiteboard.zoom_out()
+            except Exception:
+                pass
         self.statusBar().showMessage(f'缩放: {self.whiteboard.get_zoom_percent()}%')
 
     def zoom_reset(self):
         """重置缩放"""
         self.whiteboard.zoom_reset()
         self.statusBar().showMessage('缩放: 100%')
+
+    def _scale_or_zoom_selected(self, factor: float):
+        """如果有选中项则缩放选中项，否则缩放视图。"""
+        try:
+            selected = self.whiteboard.canvas.get_selected_items()
+            if selected:
+                self.whiteboard.canvas.scale_selected_items(factor)
+                self.statusBar().showMessage(f'缩放所选: {int(factor*100)}%')
+            else:
+                # 缩放视图
+                if factor > 1.0:
+                    self.whiteboard.zoom_in()
+                else:
+                    self.whiteboard.zoom_out()
+                self.statusBar().showMessage(f'缩放: {self.whiteboard.get_zoom_percent()}%')
+        except Exception:
+            pass
 
     def toggle_fullscreen(self):
         """切换全屏"""
@@ -1299,6 +1492,74 @@ class MainWindow(QMainWindow):
         """选择圆形"""
         self.whiteboard.set_tool('circle')
         self.statusBar().showMessage('圆形工具')
+
+    def rotate_selected_by_angle(self):
+        """读取角度输入并对当前选中项进行旋转（纳入历史）。"""
+        try:
+            text = self.angle_input.text().strip()
+            if not text:
+                return
+            angle = float(text)
+        except Exception:
+            QMessageBox.warning(self, '输入错误', '请输入有效的角度数值')
+            return
+        try:
+            self.whiteboard.canvas.rotate_selected(angle)
+            self.statusBar().showMessage(f'已按 {angle}° 旋转选中项')
+        except Exception as e:
+            self.logger.error(f'旋转失败: {e}', exc_info=True)
+            QMessageBox.warning(self, '旋转失败', f'旋转选中项时发生错误: {e}')
+
+    def open_rotate_dialog(self):
+        """打开精确旋转对话框，支持增量(相对)与绝对两种模式。"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QDialogButtonBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('精确旋转')
+        vbox = QVBoxLayout(dlg)
+
+        # 模式选择
+        rb_rel = QRadioButton('增量旋转（相对当前角度）')
+        rb_rel.setChecked(True)
+        rb_abs = QRadioButton('绝对角度（设置为指定角度）')
+        vbox.addWidget(rb_rel)
+        vbox.addWidget(rb_abs)
+
+        # 角度输入
+        from PyQt5.QtWidgets import QLabel
+        lbl = QLabel('角度 (°):')
+        ang_input = QLineEdit('0')
+        ang_input.setMaximumWidth(120)
+        h = QHBoxLayout()
+        h.addWidget(lbl)
+        h.addWidget(ang_input)
+        vbox.addLayout(h)
+
+        # 说明
+        note = QLabel('提示: 按确定应用。对路径项使用绝对模式时会尝试根据质心计算当前方向并调整。')
+        vbox.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        vbox.addWidget(buttons)
+
+        if dlg.exec_() == QDialog.Accepted:
+            try:
+                angle = float(ang_input.text().strip())
+            except Exception:
+                QMessageBox.warning(self, '输入错误', '请输入有效角度')
+                return
+            try:
+                if rb_rel.isChecked():
+                    self.whiteboard.canvas.rotate_selected(angle)
+                else:
+                    # 绝对：对每项按其当前角度计算增量
+                    self.whiteboard.canvas.rotate_selected_absolute(angle)
+                self.statusBar().showMessage(f'已按对话框设置旋转: {angle}°')
+            except Exception as e:
+                self.logger.error(f'精确旋转失败: {e}', exc_info=True)
+                QMessageBox.warning(self, '旋转失败', f'精确旋转失败: {e}')
 
     def show_about(self):
         """显示关于对话框"""
