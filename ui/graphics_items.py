@@ -21,7 +21,10 @@ class EditablePathItem(QGraphicsPathItem):
         # 记录上一次拖动请求的位置（用于增量计算）
         self._last_pos = QPointF(0, 0)
         self._update_path()
+        # 允许选择、拖动，并发送几何变化通知（用于在 itemChange 中捕获位移）
+        from PyQt5.QtWidgets import QGraphicsItem
         self.setFlags(QGraphicsPathItem.ItemIsSelectable | QGraphicsPathItem.ItemIsMovable)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         # 用于记录拖动前的原始点（用于生成移动命令）
         self._move_orig_points = None
 
@@ -120,6 +123,14 @@ class EditablePathItem(QGraphicsPathItem):
                         self._points = [(p[0] + dx, p[1] + dy) for p in self._points]
                         # 更新路径并保持项位置为 (0,0)
                         self._update_path()
+                        # --- 新增：如果当前处于节点编辑模式，同时平移所有节点句柄 ---
+                        if getattr(self, '_node_edit_enabled', False) and self._handles:
+                            try:
+                                for h in self._handles:
+                                    h.moveBy(dx, dy)
+                            except Exception:
+                                # 如果平移句柄失败，至少不要影响正常拖动
+                                pass
                     except Exception:
                         pass
                     # 记录本次请求的位置作为 last_pos（用于下一次增量计算），
