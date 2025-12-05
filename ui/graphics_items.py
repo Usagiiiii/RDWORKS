@@ -110,20 +110,6 @@ class EditablePathItem(QGraphicsPathItem):
         from PyQt5.QtWidgets import QGraphicsItem
         try:
             if change == QGraphicsItem.ItemPositionChange:
-                # 计算本次拖动的增量，让节点句柄在拖动过程中跟随显示
-                try:
-                    old_pos = self.pos()
-                    new_pos = value
-                    dx = float(new_pos.x() - old_pos.x())
-                    dy = float(new_pos.y() - old_pos.y())
-                    if (dx or dy) and getattr(self, '_node_edit_enabled', False) and self._handles:
-                        for h in self._handles:
-                            try:
-                                h.moveBy(dx, dy)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
                 return value
         except Exception:
             pass
@@ -140,38 +126,14 @@ class EditablePathItem(QGraphicsPathItem):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        """释放鼠标时，将累计的项位移折算到点坐标，并把项位置复位。
-
-        这样可保持外部接口约定：路径点使用场景坐标，项的 pos 恒为初始值（通常为 0,0）。
-        同时把本次操作纳入撤销/重做历史。
-        """
         try:
-            # 计算从按下到释放的累计位移
-            press_pos = getattr(self, '_press_item_pos', QPointF(0, 0))
-            cur_pos = self.pos()
-            dx = float(cur_pos.x() - press_pos.x())
-            dy = float(cur_pos.y() - press_pos.y())
-
-            if dx != 0.0 or dy != 0.0:
-                # 记录旧点，并生成新点（折算累计位移到点坐标）
-                old_points = getattr(self, '_move_orig_points', self.points())
-                new_points = [(p[0] + dx, p[1] + dy) for p in old_points]
-
-                # 应用新点
-                self.set_points(new_points)
-                # 将项位置复位到按下时（通常为 0,0）
-                try:
-                    self.setPos(press_pos)
-                except Exception:
-                    pass
-
-                # 若在节点编辑模式下，同步重建/平移句柄（set_points 已处理重建）
-
-                # 推入撤销/重做历史
+            new_points = self.points()
+            old_points = getattr(self, '_move_orig_points', None)
+            if old_points is not None and new_points != old_points:
+                # 寻找拥有 edit_manager 的 view
                 try:
                     views = self.scene().views()
                     edit_mgr = None
-                    canvas = None
                     for v in views:
                         if hasattr(v, 'edit_manager'):
                             edit_mgr = getattr(v, 'edit_manager')
@@ -181,6 +143,7 @@ class EditablePathItem(QGraphicsPathItem):
                         from edit.commands import MoveItemsCommand
                         items_states = [('path', self, old_points, new_points)]
                         cmd = MoveItemsCommand(canvas, items_states)
+                        # 移动已完成，直接将命令记录到历史
                         edit_mgr.push_undo(cmd)
                 except Exception:
                     pass
