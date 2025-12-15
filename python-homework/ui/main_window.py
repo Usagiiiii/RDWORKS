@@ -127,7 +127,8 @@ class MainWindow(QMainWindow):
         如果是永久信息（timeout == 0），更新 status_label（与坐标共存）。
         """
         if timeout > 0:
-            self.show_status_message(message, timeout)
+            # 使用 QMainWindow 提供的 showMessage 显示临时信息，避免递归调用
+            self.statusBar().showMessage(message, int(timeout))
         else:
             self.status_label.setText(message)
             # 确保清除可能存在的临时消息，以便显示永久消息
@@ -688,17 +689,28 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        from PyQt5.QtWidgets import QSplitter
+        from PyQt5.QtCore import Qt as _Qt
+
+        # 使用 QSplitter 管理三列，避免在窗口放大时单列被异常拉伸
+        splitter = QSplitter(_Qt.Horizontal)
+
         # 左侧工具栏
         self.left_toolbar = LeftToolbar()
-        main_layout.addWidget(self.left_toolbar)
+        splitter.addWidget(self.left_toolbar)
 
-        # 中间白板区域
+        # 中间白板区域（优先扩展）
         self.whiteboard = WhiteboardWidget()
-        main_layout.addWidget(self.whiteboard, 1)  # stretch factor = 1
+        splitter.addWidget(self.whiteboard)
 
         # 右侧属性面板
         self.right_panel = RightPanel()
-        main_layout.addWidget(self.right_panel)
+        splitter.addWidget(self.right_panel)
+
+        # 初始分配宽度（左, 中, 右）——中间白板优先扩展
+        splitter.setSizes([80, 1000, 420])
+
+        main_layout.addWidget(splitter)
         
         # 将画布引用传递给右侧面板
         self.right_panel.set_canvas(self.whiteboard.canvas)

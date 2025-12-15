@@ -8,7 +8,7 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView)
+                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QPixmap
@@ -55,24 +55,24 @@ class RightPanel(QWidget):
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
 
-        # 创建标签页
+        # 创建标签页并为每页添加可滚动区域，避免放大/缩放时内部控件被异常拉伸
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.create_processing_tab(), "加工")
-        self.tabs.addTab(self.create_output_tab(), "输出")
-        self.tabs.addTab(self.create_file_tab(), "文档")
-        self.tabs.addTab(self.create_user_tab(), "用户")
-        self.tabs.addTab(self.create_test_tab(), "测试")
-        # 已移除：不再显示单独的“变换”选项卡（由顶部工具与右侧其它面板替代）
-        # 新增：历史面板（列出撤销/重做历史）
-        self.tabs.addTab(self.create_history_tab(), "历史")
+        self.tabs.addTab(self._wrap_tab(self.create_processing_tab()), "加工")
+        self.tabs.addTab(self._wrap_tab(self.create_output_tab()), "输出")
+        self.tabs.addTab(self._wrap_tab(self.create_file_tab()), "文档")
+        self.tabs.addTab(self._wrap_tab(self.create_user_tab()), "用户")
+        self.tabs.addTab(self._wrap_tab(self.create_test_tab()), "测试")
+        # 历史面板（列出撤销/重做历史）
+        self.tabs.addTab(self._wrap_tab(self.create_history_tab()), "历史")
 
         root_layout.addWidget(self.tabs, 1)
 
         self.create_fixed_bottom_area(root_layout)
 
-        # 设置最小宽度和最大宽度（允许用户调整）
-        self.setMinimumWidth(380)
-        self.setMaximumWidth(600)
+        # 设置最小宽度并限制最大宽度，防止全屏时右侧面板被过度拉伸导致内部控件变形
+        self.setMinimumWidth(320)
+        self.setMaximumWidth(520)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         # 样式
         self.setStyleSheet("""
@@ -137,6 +137,11 @@ class RightPanel(QWidget):
         bottom_layout.setContentsMargins(8, 8, 8, 8)
         bottom_layout.setSpacing(6)  # 缩小布局间距
 
+        # 防止在高 DPI / 全屏时被过度拉伸：限制底部区域最大高度并固定其纵向策略
+        from PyQt5.QtWidgets import QSizePolicy as _QSizePolicy
+        bottom_widget.setSizePolicy(_QSizePolicy.Preferred, _QSizePolicy.Fixed)
+        bottom_widget.setMaximumHeight(360)
+
         process_group = QGroupBox("数据加工")
         process_layout = QVBoxLayout()
         process_layout.setContentsMargins(5, 5, 5, 5)
@@ -148,12 +153,18 @@ class RightPanel(QWidget):
         start_btn = QPushButton("开始")
         start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 15px;")
         start_btn.setMinimumHeight(28)  # 缩小按钮高度
+        start_btn.setMaximumHeight(42)
+        start_btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         pause_btn = QPushButton("暂停/继续")
         pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 15px;")
         pause_btn.setMinimumHeight(28)
+        pause_btn.setMaximumHeight(42)
+        pause_btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         stop_btn = QPushButton("停止")
         stop_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; font-size: 15px;")
         stop_btn.setMinimumHeight(28)
+        stop_btn.setMaximumHeight(42)
+        stop_btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         control_btn_layout.addWidget(start_btn, 1)
         control_btn_layout.addWidget(pause_btn, 1)
         control_btn_layout.addWidget(stop_btn, 1)
@@ -163,16 +174,22 @@ class RightPanel(QWidget):
         file_btn1 = QPushButton("保存为版位文件")
         file_btn1.setStyleSheet("font-size: 15px;")
         file_btn1.setMinimumHeight(26)  # 缩小按钮高度
+        file_btn1.setMaximumHeight(36)
+        file_btn1.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         process_layout.addWidget(file_btn1)
 
         file_btn2 = QPushButton("载机文件输出")
         file_btn2.setStyleSheet("font-size: 15px;")
         file_btn2.setMinimumHeight(26)
+        file_btn2.setMaximumHeight(36)
+        file_btn2.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         process_layout.addWidget(file_btn2)
 
         file_btn3 = QPushButton("下载")
         file_btn3.setStyleSheet("font-size: 15px;")
         file_btn3.setMinimumHeight(26)
+        file_btn3.setMaximumHeight(36)
+        file_btn3.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         process_layout.addWidget(file_btn3)
 
         # 图形定位行：缩小组件尺寸
@@ -183,6 +200,8 @@ class RightPanel(QWidget):
         pos_combo.addItems(["当前位置", "左上角", "中心"])
         pos_combo.setStyleSheet("font-size: 12px;")
         pos_combo.setMinimumHeight(24)  # 缩小下拉框高度
+        pos_combo.setMaximumHeight(30)
+        pos_combo.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         pos_layout.addWidget(pos_combo, 1)
         process_layout.addLayout(pos_layout)
 
@@ -190,17 +209,26 @@ class RightPanel(QWidget):
         optimize_check = QCheckBox("确定优化")
         optimize_check.setStyleSheet("font-size: 15px;")
         optimize_check.setMinimumHeight(22)
+        optimize_check.setMaximumHeight(30)
+        optimize_check.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         optimize_check.setChecked(True)
         process_layout.addWidget(optimize_check)
 
         # 其他操作按钮：缩小高度、调整字体
         other_layout = QHBoxLayout()
         other_layout.setSpacing(2)
-        other_layout.addWidget(QPushButton("切换坐标"), 1)
-        other_layout.addWidget(QPushButton("走边"), 1)
-        for btn in other_layout.findChildren(QPushButton):
-            btn.setStyleSheet("font-size: 15px;")
-            btn.setMinimumHeight(26)
+        btn_left = QPushButton("切换坐标")
+        btn_right = QPushButton("走边")
+        btn_left.setMinimumHeight(26)
+        btn_left.setMaximumHeight(36)
+        btn_left.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+        btn_left.setStyleSheet("font-size: 15px;")
+        btn_right.setMinimumHeight(26)
+        btn_right.setMaximumHeight(36)
+        btn_right.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+        btn_right.setStyleSheet("font-size: 15px;")
+        other_layout.addWidget(btn_left, 1)
+        other_layout.addWidget(btn_right, 1)
         process_layout.addLayout(other_layout)
 
         process_group.setLayout(process_layout)
@@ -348,6 +376,23 @@ class RightPanel(QWidget):
         main_layout.addWidget(grid_group)
 
         return widget
+
+    def _wrap_tab(self, widget: QWidget) -> QWidget:
+        """Wrap a tab page in a QScrollArea so content scrolls instead of stretching."""
+        from PyQt5.QtWidgets import QScrollArea, QWidget, QVBoxLayout
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.NoFrame)
+        scroll.setWidget(widget)
+
+        layout.addWidget(scroll)
+        return container
 
     def update_layer_list(self):
         """扫描画布，更新图层列表"""
@@ -791,76 +836,37 @@ class RightPanel(QWidget):
         layout.setContentsMargins(8,8,8,8)
         layout.setSpacing(8)
 
-        table_widget=QWidget()
-        table_layout=QVBoxLayout(table_widget)
-        table_layout.setSpacing(0)
-
-        header_widget=QWidget()
-        header_widget.setStyleSheet("background-color:transparent;")
-        header_layout=QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0,0,0,0)
-        header_layout.setSpacing(1)
-
-        header_btns=[
-            ("编号",self.on_number_header_btn_click),
-            ("文件名",self.on_filename_header_btn_click),
-            ("工时(时:分:秒:毫秒)",self.on_worktime_header_btn_click),
-            ("件数",self.on_quantity_header_btn_click)
-        ]
-        for btn_text,btn_callback in header_btns:
-            btn=QPushButton(btn_text)
-            btn.setStyleSheet("""
-                                QPushButton {
-                                    border:1px solid #d0d0d0;
-                                    border-radius:4px;
-                                    background-color:#f0f0f0;
-                                    font-weight:bold;
-                                    font-size:12px;
-                                    text-align:center;
-                                    padding:8px 0;
-                                    margin:0;
-                                }
-                                QPushButton:hover {
-                                    background-color:#e0e0e0;
-                                    border-color:#b0b0b0;
-                                }
-                                QPushButton:pressed {
-                                    background-color:#d0d0d0;
-                                    border-color:#909090;
-                                }
-                            """)
-            btn.clicked.connect(btn_callback)
-            header_layout.addWidget(btn,1)
-
-        layer_table=QTableWidget()
+        # 用正式表头替代自定义 header 按钮，保证列与表头对齐且可自适应宽度
+        layer_table = QTableWidget()
         layer_table.setColumnCount(4)
         layer_table.setRowCount(19)
-        layer_table.setMinimumHeight(240)
+        layer_table.setMinimumHeight(200)
+        layer_table.setHorizontalHeaderLabels(["编号", "文件名", "工时(时:分:秒:毫秒)", "件数"])
         layer_table.verticalHeader().setVisible(False)
-        layer_table.verticalHeader().setDefaultSectionSize(12)
-        layer_table.horizontalHeader().setDefaultSectionSize(135)
-        layer_table.horizontalHeader().setVisible(False)
-        layer_table.horizontalHeader().setStretchLastSection(True)
+        layer_table.horizontalHeader().setStretchLastSection(False)
+        from PyQt5.QtWidgets import QHeaderView
+        layer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        layer_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         layer_table.setStyleSheet("""
-                            QTableWidget {
-                                border:1px solid #d0d0d0;
-                                border-radius:4px;
-                                background-color:#ffffff;
-                                gridline-color:#d0d0d0;
-                            }
-                            QTableWidget::item {
-                                padding:4px;
-                                border:none;
-                            }
-                            QTableWidget::item:selected {
-                                background-color:#e8f0fe;
-                                color:#000;
-                            }
-                        """)
+            QTableWidget {
+                border:1px solid #d0d0d0;
+                border-radius:4px;
+                background-color:#ffffff;
+                gridline-color:#d0d0d0;
+            }
+            QTableWidget::item {
+                padding:4px;
+                border:none;
+            }
+            QTableWidget::item:selected {
+                background-color:#e8f0fe;
+                color:#000;
+            }
+        """)
 
-        table_layout.addWidget(header_widget)
-        table_layout.addWidget(layer_table)
-        layout.addWidget(table_widget)
+        layout.addWidget(layer_table)
 
         btn_group=QWidget()
         btn_layout=QVBoxLayout(btn_group)

@@ -211,22 +211,27 @@ class GCodeExporter:
             except ImportError:
                 logger.warning("未安装OpenCV，跳过轮廓检测")
                 return False
+            # 安全地将QPixmap转换为PIL图像，然后转换为numpy数组供OpenCV使用
+            from PyQt5.QtCore import QBuffer, QIODevice, QByteArray
+            from io import BytesIO
 
-            # 转换QPixmap为OpenCV格式
             qimage = pixmap.toImage()
             if qimage.isNull():
                 return False
 
-            # 转换为numpy数组
-            ptr = qimage.bits()
-            ptr.setsize(qimage.byteCount())
-            arr = np.array(ptr).reshape(qimage.height(), qimage.width(), 4)
+            # 将QImage保存到内存缓冲（PNG），避免直接访问底层指针导致的崩溃
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            if not buf.open(QIODevice.WriteOnly):
+                logger.warning("无法打开内存缓冲，跳过轮廓检测")
+                return False
+            qimage.save(buf, 'PNG')
+            buf.close()
 
-            # 转换为灰度图
-            if arr.shape[2] == 4:
-                gray = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
-            else:
-                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            pil_img = Image.open(BytesIO(ba.data())).convert('L')
+            arr_gray = np.array(pil_img)
+
+            gray = arr_gray
 
             # 二值化
             threshold = self.config['grayscale_threshold']
@@ -274,15 +279,24 @@ class GCodeExporter:
     def _raster_scan_bitmap(self, pixmap: QPixmap, bounding_rect, fiducial_offset: Tuple[float, float]):
         """光栅扫描位图（应用定位点偏移）"""
         try:
-            # 转换为PIL图像
-            from PyQt5.QtGui import QImage
-            # 将QImage转换为PIL Image的正确方法
+            # 安全地将QPixmap转换为PIL图像，避免直接访问底层指针
+            from PyQt5.QtCore import QBuffer, QIODevice, QByteArray
+            from io import BytesIO
+
             qimage = pixmap.toImage()
-            qimage = qimage.convertToFormat(QImage.Format_RGBA8888)
-            ptr = qimage.bits()
-            ptr.setsize(qimage.byteCount())
-            arr = np.frombuffer(ptr, np.uint8).reshape(qimage.height(), qimage.width(), 4)
-            pil_image = Image.fromarray(arr, 'RGBA').convert('L')
+            if qimage.isNull():
+                logger.warning("位图QImage为空，跳过光栅扫描")
+                return
+
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            if not buf.open(QIODevice.WriteOnly):
+                logger.warning("无法打开内存缓冲，跳过光栅扫描")
+                return
+            qimage.save(buf, 'PNG')
+            buf.close()
+
+            pil_image = Image.open(BytesIO(ba.data())).convert('L')
 
             # 计算缩放比例
             scale_x = bounding_rect.width() / pil_image.width
