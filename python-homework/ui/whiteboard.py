@@ -9,11 +9,11 @@ import logging
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsScene,
                              QGraphicsView, QGraphicsPixmapItem, QGraphicsItem,
-                             QGraphicsTextItem, QInputDialog, QMessageBox)
+                             QGraphicsTextItem, QInputDialog, QMessageBox, QGraphicsRectItem)
 from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF
 from PyQt5.QtGui import (QPainter, QPen, QColor, QPixmap, QBrush, QFont,
                          QPainterPath, QWheelEvent, QTransform, QMouseEvent,
-                         QFontMetrics, QImage)
+                         QFontMetrics, QImage, QPolygonF)
 import math
 from typing import List, Tuple, Optional
 
@@ -27,6 +27,69 @@ logging.basicConfig(level=logging.INFO)
 # 目标画布相关类定义
 Pt = Tuple[float, float]
 Path = List[Pt]
+
+from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF, QLineF
+
+class PathPreviewItem(QGraphicsItem):
+    """显示切割路径预览的项"""
+    def __init__(self, travels: List[QLineF], markers: List[QPointF], parent=None):
+        super().__init__(parent)
+        self.travels = travels
+        self.markers = markers
+        self.setZValue(9999) # 确保在最上层
+        
+    def boundingRect(self):
+        rect = QRectF()
+        for line in self.travels:
+            rect = rect.united(QRectF(line.p1(), line.p2()).normalized())
+        for pt in self.markers:
+            rect = rect.united(QRectF(pt.x()-5, pt.y()-5, 10, 10))
+        return rect.adjusted(-20, -20, 20, 20)
+        
+    def paint(self, painter, option, widget):
+        # 绘制空移路径（虚线）
+        pen = QPen(QColor(0, 0, 255))
+        pen.setStyle(Qt.DashLine)
+        pen.setWidth(1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        
+        for line in self.travels:
+            painter.drawLine(line)
+        
+        # 获取当前缩放比例
+        scale = 1.0
+        if widget:
+            t = painter.transform()
+            scale = t.m11()
+        arrow_size = 8.0 / scale if scale > 0 else 8.0
+        marker_size = 6.0 / scale if scale > 0 else 6.0
+        
+        # 绘制箭头（在空移路径中间）
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 255)))
+        
+        for line in self.travels:
+            p1 = line.p1()
+            p2 = line.p2()
+            mid = (p1 + p2) / 2
+            vec = p2 - p1
+            length = math.sqrt(vec.x()**2 + vec.y()**2)
+            if length < 1e-6: continue
+            
+            angle = math.atan2(vec.y(), vec.x())
+            p_arrow = mid
+            p_a1 = p_arrow - QPointF(math.cos(angle - math.pi/6), math.sin(angle - math.pi/6)) * arrow_size
+            p_a2 = p_arrow - QPointF(math.cos(angle + math.pi/6), math.sin(angle + math.pi/6)) * arrow_size
+            painter.drawPolygon(QPolygonF([p_arrow, p_a1, p_a2]))
+            
+        # 绘制起点标记（绿色方块）
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        painter.setBrush(QBrush(QColor(0, 255, 0)))
+        
+        for pt in self.markers:
+            painter.drawRect(QRectF(pt.x() - marker_size/2, pt.y() - marker_size/2, marker_size, marker_size))
 
 class _DragHandle(QGraphicsEllipseItem):
     def __init__(self, owner: EditablePathItem, idx: int, x: float, y: float):
@@ -86,6 +149,188 @@ class _DragHandle(QGraphicsEllipseItem):
 
         self.headMoved.emit(x, y)
         super().mouseMoveEvent(e)
+
+
+class ScaleHandle(QGraphicsRectItem):
+    """缩放控制手柄"""
+    def __init__(self, canvas, pos_type, rect, parent=None):
+        s = 8.0
+        super().__init__(-s/2, -s/2, s, s, parent)
+        self.canvas = canvas
+        self.pos_type = pos_type # tl, tc, tr, ml, mr, bl, bc, br
+        self.setBrush(QBrush(QColor(255, 255, 255)))
+        self.setPen(QPen(QColor(0, 0, 0)))
+        self.setFlags(QGraphicsItem.ItemIgnoresTransformations)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+        self.setZValue(2000)
+        self._update_cursor()
+        self._dragging = False
+        self._start_pos = None
+        self._initial_rect = rect
+        self._initial_states = []
+
+    def _update_cursor(self):
+        cursors = {
+            'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
+            'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
+            'tc': Qt.SizeVerCursor, 'bc': Qt.SizeVerCursor,
+            'ml': Qt.SizeHorCursor, 'mr': Qt.SizeHorCursor
+        }
+        self.setCursor(cursors.get(self.pos_type, Qt.ArrowCursor))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._start_pos = event.scenePos()
+            self._initial_states = []
+            for item in self.canvas.get_selected_items():
+                if isinstance(item, EditablePathItem):
+                    self._initial_states.append(('path', item, item.points()))
+                else:
+                    self._initial_states.append(('transform', item, item.transform()))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            cur_pos = event.scenePos()
+            
+            # 计算新的包围盒
+            rect = QRectF(self._initial_rect)
+            dx = cur_pos.x() - self._start_pos.x()
+            dy = cur_pos.y() - self._start_pos.y()
+
+            # 按住Shift进行等比缩放
+            keep_aspect = (event.modifiers() & Qt.ShiftModifier)
+
+            if self.pos_type == 'tl':
+                if keep_aspect:
+                    # 简单处理：取dx和dy中较大的变化，或者投影到对角线
+                    pass # 暂略，先实现自由缩放
+                rect.setTopLeft(rect.topLeft() + QPointF(dx, dy))
+            elif self.pos_type == 'tr':
+                rect.setTopRight(rect.topRight() + QPointF(dx, dy))
+            elif self.pos_type == 'bl':
+                rect.setBottomLeft(rect.bottomLeft() + QPointF(dx, dy))
+            elif self.pos_type == 'br':
+                rect.setBottomRight(rect.bottomRight() + QPointF(dx, dy))
+            elif self.pos_type == 'tc':
+                rect.setTop(rect.top() + dy)
+            elif self.pos_type == 'bc':
+                rect.setBottom(rect.bottom() + dy)
+            elif self.pos_type == 'ml':
+                rect.setLeft(rect.left() + dx)
+            elif self.pos_type == 'mr':
+                rect.setRight(rect.right() + dx)
+
+            # 避免翻转或零尺寸
+            if rect.width() < 1.0: rect.setWidth(1.0)
+            if rect.height() < 1.0: rect.setHeight(1.0)
+
+            # 计算缩放比例
+            sx = rect.width() / self._initial_rect.width() if self._initial_rect.width() > 0 else 1.0
+            sy = rect.height() / self._initial_rect.height() if self._initial_rect.height() > 0 else 1.0
+
+            # 如果是等比缩放，修正sx, sy
+            if keep_aspect:
+                if self.pos_type in ['tl', 'tr', 'bl', 'br']:
+                    s = max(abs(sx), abs(sy))
+                    sx = s if sx > 0 else -s
+                    sy = s if sy > 0 else -s
+                # 对于边上的点，通常Shift不强制等比，或者只影响另一边？
+                # 常见逻辑：角点按Shift等比，边点按Shift可能无效或对称缩放。这里只处理角点。
+
+            # 应用缩放
+            self._apply_scale(sx, sy, rect)
+            
+            # 更新所有手柄位置和包围盒显示
+            self.canvas.update_scale_handles(rect)
+
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            # 记录到撤销栈
+            # 构建最终状态
+            final_states = []
+            for item in self.canvas.get_selected_items():
+                if isinstance(item, EditablePathItem):
+                    final_states.append(('path', item, self._initial_states[0][2], item.points())) # 注意这里索引不对，需匹配
+                    # 修正：需要根据item找到对应的initial state
+                else:
+                    final_states.append(('transform', item, item.transform(), item.transform())) # 同样需修正
+            
+            # 重新构建匹配的 states list
+            states = []
+            for i, (typ, item, old_state) in enumerate(self._initial_states):
+                if typ == 'path':
+                    states.append(('path', item, old_state, item.points()))
+                else:
+                    states.append(('transform', item, old_state, item.transform()))
+            
+            if states:
+                from edit.commands import ScaleCommand
+                cmd = ScaleCommand(self.canvas, states)
+                self.canvas.edit_manager.push_undo(cmd)
+
+        super().mouseReleaseEvent(event)
+
+    def _apply_scale(self, sx, sy, new_rect):
+        # 计算相对于初始包围盒的变换
+        # 实际上，我们需要相对于某个不动点（Pivot）进行缩放
+        # Pivot 取决于拖动的手柄。
+        # 例如拖动 TL，Pivot 是 BR。
+        # 但是，更通用的方法是将原始矩形映射到新矩形。
+        # x' = new_x + (x - old_x) * sx
+        # y' = new_y + (y - old_y) * sy
+        
+        old_rect = self._initial_rect
+        
+        for typ, item, state in self._initial_states:
+            if typ == 'path':
+                old_pts = state
+                new_pts = []
+                for x, y in old_pts:
+                    nx = new_rect.left() + (x - old_rect.left()) * sx
+                    ny = new_rect.top() + (y - old_rect.top()) * sy
+                    new_pts.append((nx, ny))
+                item.set_points(new_pts)
+            elif typ == 'transform':
+                # 对于 transform，稍微复杂一点。
+                # 我们需要构建一个矩阵： Translate(-old_tl) -> Scale(sx, sy) -> Translate(new_tl)
+                # 但这假设 item 在 old_rect 内部的相对位置。
+                # 更准确的是： map point P from old_rect to new_rect.
+                # P_new = new_tl + (P_old - old_tl) * (size_new / size_old)
+                
+                # 我们可以对 item 的 transform 进行调整。
+                # item 的原点 (0,0) 在场景中的位置 P0 = item.mapToScene(0,0)
+                # P0_new = ...
+                # 并且 item 的基向量也要缩放。
+                
+                # 简单做法：应用一个变换矩阵 M 到 item 的当前 transform (如果是 identity) 或者 pre-multiply?
+                # M: Translate(-old_rect.center) -> Scale -> Translate(new_rect.center)
+                
+                cx_old = old_rect.center().x()
+                cy_old = old_rect.center().y()
+                cx_new = new_rect.center().x()
+                cy_new = new_rect.center().y()
+                
+                m = QTransform()
+                m.translate(cx_new, cy_new)
+                m.scale(sx, sy)
+                m.translate(-cx_old, -cy_old)
+                
+                new_t = state * m # 注意乘法顺序，state 是 item 的 local-to-scene。
+                # 应该是 M * state ? 
+                # Point_scene_new = M * Point_scene_old
+                # Point_scene_old = state * Point_local
+                # Point_scene_new = M * state * Point_local
+                # 所以 new_transform = M * state
+                
+                item.setTransform(m * state)
 
 
 class RotateHandle(QGraphicsEllipseItem):
@@ -419,6 +664,7 @@ class GridCanvas(QGraphicsView):
         ADD_FID_CIRCLE = 17
         DRAW_CIRCLE = 18  # 新增圆形绘制工具
         ROTATE = 19  # 旋转工具（鼠标拖拽或角度输入）
+        BOX_ZOOM = 20  # 框选缩放工具
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -462,17 +708,21 @@ class GridCanvas(QGraphicsView):
     def align_origin_top_left(self):
         """将场景坐标 (0,0) 对齐到视窗左上角（使工作区角为 (0,0)）。"""
         try:
-            from PyQt5.QtCore import QPoint
-            # 计算场景原点在视口坐标中的位置
-            # 由于已经是 Y 轴向下的屏幕坐标系，无需特殊处理
-            p = self.mapFromScene(QPointF(0, 0))
-            dx = int(p.x())
-            dy = int(p.y())
-            # 调整滚动条
-            h = self.horizontalScrollBar()
-            v = self.verticalScrollBar()
-            h.setValue(h.value() + dx)
-            v.setValue(v.value() + dy)
+            # 获取当前缩放
+            zoom = self.transform().m11()
+            if zoom == 0: zoom = 1.0
+            
+            # 获取视口矩形
+            vp = self.viewport().rect()
+            
+            # 计算视口中心对应的场景坐标
+            # 我们希望场景原点(0,0)位于视口左上角(0,0)
+            # 那么视口中心(w/2, h/2)对应的场景坐标应该是 (w/2/zoom, h/2/zoom)
+            cx = vp.width() / (2 * zoom)
+            cy = vp.height() / (2 * zoom)
+            
+            self.centerOn(cx, cy)
+            
             # 通知标尺更新
             self._emit_view_changed()
         except Exception:
@@ -483,6 +733,10 @@ class GridCanvas(QGraphicsView):
         """当画布选中项变化时，通知EditManager"""
         has_selection = len(self.get_selected_items()) > 0
         self.edit_manager.set_has_selection(has_selection)
+        
+        # 清除缩放手柄（如果存在）
+        self.clear_scale_handles()
+
         # 管理旋转把手的显示
         try:
             sel = self.get_selected_items()
@@ -591,6 +845,16 @@ class GridCanvas(QGraphicsView):
         factor = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
         # 发送视图变化信号（用于标尺联动）
+        self._emit_view_changed()
+
+    def scrollContentsBy(self, dx, dy):
+        """重写滚动事件，确保标尺同步更新"""
+        super().scrollContentsBy(dx, dy)
+        self._emit_view_changed()
+
+    def resizeEvent(self, event):
+        """重写调整大小事件，确保标尺同步更新"""
+        super().resizeEvent(event)
         self._emit_view_changed()
 
     def _emit_view_changed(self):
@@ -940,6 +1204,81 @@ class GridCanvas(QGraphicsView):
         self.fitInView(bounding_rect, Qt.KeepAspectRatio)
         self._emit_view_changed()  # 同步标尺
 
+    def show_path_preview(self, items: List[QGraphicsItem]):
+        """显示切割路径预览"""
+        self.hide_path_preview()
+        if not items:
+            return
+            
+        travels = []
+        markers = []
+        last_end_point = None
+        
+        for item in items:
+            # 获取项的路径
+            path = None
+            if hasattr(item, 'path'):
+                path = item.path()
+            else:
+                path = item.shape()
+            
+            if path is None or path.isEmpty():
+                continue
+                
+            # 获取起点和终点（局部坐标）
+            # pointAtPercent(0) 是起点, pointAtPercent(1) 是终点
+            start_local = path.pointAtPercent(0)
+            end_local = path.pointAtPercent(1)
+            
+            # 转换为场景坐标
+            start_scene = item.mapToScene(start_local)
+            end_scene = item.mapToScene(end_local)
+            
+            # 添加起点标记
+            markers.append(start_scene)
+            
+            # 如果有上一个项，添加空移路径
+            if last_end_point is not None:
+                travels.append(QLineF(last_end_point, start_scene))
+                
+            last_end_point = end_scene
+            
+        if travels or markers:
+            self._path_preview_item = PathPreviewItem(travels, markers)
+            self.scene.addItem(self._path_preview_item)
+            
+    def hide_path_preview(self):
+        """隐藏切割路径预览"""
+        if hasattr(self, '_path_preview_item') and self._path_preview_item:
+            try:
+                self.scene.removeItem(self._path_preview_item)
+            except Exception:
+                pass
+            self._path_preview_item = None
+
+    def refresh_scale_handles(self):
+        """重新计算并更新缩放手柄位置"""
+        if not hasattr(self, '_scale_handles') or not self._scale_handles:
+            return
+            
+        sel = self.get_selected_items()
+        if not sel:
+            self.clear_scale_handles()
+            return
+
+        br = None
+        for it in sel:
+            try:
+                r = it.sceneBoundingRect()
+                br = r if br is None else br.united(r)
+            except Exception:
+                continue
+        
+        if br is not None:
+            self.update_scale_handles(br)
+        else:
+            self.clear_scale_handles()
+
     def scale_selected_items(self, factor: float):
         """对当前选中的项执行缩放（相对于每个项的包围盒中心）。
 
@@ -1194,6 +1533,11 @@ class GridCanvas(QGraphicsView):
         pos = self.mapToScene(e.pos())
         # 发送信号，注意转换为 float
         self.headMoved.emit(float(pos.x()), float(pos.y()))
+
+        # 实时更新缩放手柄位置（如果存在且正在拖动选中项）
+        if self._tool == self.Tool.SELECT and hasattr(self, '_scale_handles') and self._scale_handles:
+             if e.buttons() & Qt.LeftButton:
+                 self.refresh_scale_handles()
         
         # 无需按键也显示预览：当处于绘图工具且尚未设置起点时，显示小光标预览
         try:
@@ -1230,8 +1574,8 @@ class GridCanvas(QGraphicsView):
                     self._cursor_preview = None
         except Exception:
             pass
-        # 支持绘制工具的实时预览（直线、多段线、曲线、矩形、椭圆）
-        if self._tool in (self.Tool.DRAW_LINE, self.Tool.DRAW_POLY, self.Tool.DRAW_RECT, self.Tool.DRAW_ELLIPSE, self.Tool.DRAW_CURVE) and self._drawing_pts:
+        # 支持绘制工具的实时预览（直线、多段线、曲线、矩形、椭圆、框选缩放）
+        if self._tool in (self.Tool.DRAW_LINE, self.Tool.DRAW_POLY, self.Tool.DRAW_RECT, self.Tool.DRAW_ELLIPSE, self.Tool.DRAW_CURVE, self.Tool.BOX_ZOOM) and self._drawing_pts:
             if self._drawing_tmp:
                 self.scene.removeItem(self._drawing_tmp)
                 self._drawing_tmp = None
@@ -1275,6 +1619,9 @@ class GridCanvas(QGraphicsView):
                         cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
                         path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
             elif self._tool == self.Tool.DRAW_RECT:
+                x0, y0 = self._drawing_pts[0]
+                path.addRect(min(x0, pos.x()), min(y0, pos.y()), abs(pos.x() - x0), abs(pos.y() - y0))
+            elif self._tool == self.Tool.BOX_ZOOM:
                 x0, y0 = self._drawing_pts[0]
                 path.addRect(min(x0, pos.x()), min(y0, pos.y()), abs(pos.x() - x0), abs(pos.y() - y0))
             elif self._tool == self.Tool.DRAW_ELLIPSE:
@@ -1366,6 +1713,94 @@ class GridCanvas(QGraphicsView):
         # 发送特殊值表示离开
         self.headMoved.emit(float('inf'), float('inf'))
         super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """双击事件：进入缩放模式"""
+        if self._tool == self.Tool.SELECT:
+            item = self.itemAt(event.pos())
+            if item and item.isSelected():
+                self.show_scale_handles()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def show_scale_handles(self):
+        """显示缩放手柄"""
+        self.clear_scale_handles()
+        
+        sel = self.get_selected_items()
+        if not sel: return
+
+        # 计算包围盒
+        br = None
+        for it in sel:
+            try:
+                r = it.sceneBoundingRect()
+                br = r if br is None else br.united(r)
+            except Exception:
+                continue
+        
+        if br is None: return
+        
+        self._scale_handles = []
+        
+        # 创建包围盒显示
+        self._scale_bbox_item = QGraphicsPathItem()
+        path = QPainterPath()
+        path.addRect(br)
+        self._scale_bbox_item.setPath(path)
+        pen = QPen(QColor(0, 120, 255))
+        pen.setStyle(Qt.DashLine)
+        pen.setCosmetic(True)
+        self._scale_bbox_item.setPen(pen)
+        self._scale_bbox_item.setZValue(1999)
+        self.scene.addItem(self._scale_bbox_item)
+        
+        # 创建8个手柄
+        rect = br
+        positions = {
+            'tl': rect.topLeft(), 'tc': QPointF(rect.center().x(), rect.top()), 'tr': rect.topRight(),
+            'ml': QPointF(rect.left(), rect.center().y()), 'mr': QPointF(rect.right(), rect.center().y()),
+            'bl': rect.bottomLeft(), 'bc': QPointF(rect.center().x(), rect.bottom()), 'br': rect.bottomRight()
+        }
+        
+        for pos_type, pos in positions.items():
+            handle = ScaleHandle(self, pos_type, rect)
+            handle.setPos(pos)
+            self.scene.addItem(handle)
+            self._scale_handles.append(handle)
+
+    def update_scale_handles(self, new_rect):
+        """更新缩放手柄位置"""
+        if not hasattr(self, '_scale_handles') or not self._scale_handles:
+            return
+            
+        # 更新包围盒显示
+        if hasattr(self, '_scale_bbox_item') and self._scale_bbox_item:
+            path = QPainterPath()
+            path.addRect(new_rect)
+            self._scale_bbox_item.setPath(path)
+            
+        # 更新手柄位置
+        positions = {
+            'tl': new_rect.topLeft(), 'tc': QPointF(new_rect.center().x(), new_rect.top()), 'tr': new_rect.topRight(),
+            'ml': QPointF(new_rect.left(), new_rect.center().y()), 'mr': QPointF(new_rect.right(), new_rect.center().y()),
+            'bl': new_rect.bottomLeft(), 'bc': QPointF(new_rect.center().x(), new_rect.bottom()), 'br': new_rect.bottomRight()
+        }
+        
+        for handle in self._scale_handles:
+            if handle.pos_type in positions:
+                handle.setPos(positions[handle.pos_type])
+
+    def clear_scale_handles(self):
+        """清除缩放手柄"""
+        if hasattr(self, '_scale_handles'):
+            for h in self._scale_handles:
+                self.scene.removeItem(h)
+            self._scale_handles = []
+        
+        if hasattr(self, '_scale_bbox_item') and self._scale_bbox_item:
+            self.scene.removeItem(self._scale_bbox_item)
+            self._scale_bbox_item = None
 
     # --- 鼠标事件处理 ---
     def mousePressEvent(self, e: QMouseEvent):
@@ -1524,6 +1959,9 @@ class GridCanvas(QGraphicsView):
             elif self._tool == self.Tool.DRAW_RECT:
                 self._drawing_pts = [(x, y)]
 
+            elif self._tool == self.Tool.BOX_ZOOM:
+                self._drawing_pts = [(x, y)]
+
             elif self._tool == self.Tool.DRAW_ELLIPSE:
                 self._drawing_pts = [(x, y)]
 
@@ -1669,6 +2107,15 @@ class GridCanvas(QGraphicsView):
                 w, h = x - x0, y - y0
                 if abs(w) > 1 and abs(h) > 1:
                     self.add_rect(min(x0, x), min(y0, y), abs(w), abs(h))
+                self._clear_drawing_state()
+
+            elif self._tool == self.Tool.BOX_ZOOM and self._drawing_pts:
+                x0, y0 = self._drawing_pts[0]
+                w, h = x - x0, y - y0
+                if abs(w) > 1 and abs(h) > 1:
+                    rect = QRectF(min(x0, x), min(y0, y), abs(w), abs(h))
+                    self.fitInView(rect, Qt.KeepAspectRatio)
+                    self._emit_view_changed()
                 self._clear_drawing_state()
 
             elif self._tool == self.Tool.DRAW_ELLIPSE and self._drawing_pts:
@@ -1817,6 +2264,82 @@ class GridCanvas(QGraphicsView):
         self.resetTransform()
         # self.scale(1, -1)  # 移除 Y轴翻转
         self._emit_view_changed()
+
+    def zoom_to_page(self):
+        """缩放到页面范围"""
+        rect = QRectF(0, 0, self._work_w, self._work_h)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+        self._emit_view_changed()
+
+    def zoom_to_data(self):
+        """缩放到数据范围"""
+        # 计算所有非辅助项的边界框
+        rect = QRectF()
+        first = True
+        for item in self.scene.items():
+            # 排除辅助项
+            if item is getattr(self, '_work_item', None):
+                continue
+            if item is getattr(self, '_cursor_preview', None):
+                continue
+            if isinstance(item, (ScaleHandle, _DragHandle)):
+                continue
+            # 排除网格线 (通常 zValue 较低或特定颜色，这里简单判断是否为 EditablePathItem, Pixmap, Text)
+            # 或者排除没有 flag ItemIsSelectable 的项
+            if not (item.flags() & QGraphicsItem.ItemIsSelectable):
+                continue
+
+            if first:
+                rect = item.sceneBoundingRect()
+                first = False
+            else:
+                rect = rect.united(item.sceneBoundingRect())
+        
+        if not rect.isNull():
+            # 增加一点边距 (5%)
+            w = rect.width()
+            h = rect.height()
+            rect.adjust(-w*0.05, -h*0.05, w*0.05, h*0.05)
+            self.fitInView(rect, Qt.KeepAspectRatio)
+            self._emit_view_changed()
+
+    def zoom_to_all(self):
+        """显示所有（页面 + 数据）"""
+        # 页面范围
+        page_rect = QRectF(0, 0, self._work_w, self._work_h)
+        
+        # 数据范围
+        data_rect = QRectF()
+        first = True
+        for item in self.scene.items():
+            if item is getattr(self, '_work_item', None):
+                continue
+            if item is getattr(self, '_cursor_preview', None):
+                continue
+            if isinstance(item, (ScaleHandle, _DragHandle)):
+                continue
+            if not (item.flags() & QGraphicsItem.ItemIsSelectable):
+                continue
+
+            if first:
+                data_rect = item.sceneBoundingRect()
+                first = False
+            else:
+                data_rect = data_rect.united(item.sceneBoundingRect())
+        
+        if not data_rect.isNull():
+            final_rect = page_rect.united(data_rect)
+        else:
+            final_rect = page_rect
+            
+        # 增加一点边距
+        w = final_rect.width()
+        h = final_rect.height()
+        final_rect.adjust(-w*0.05, -h*0.05, w*0.05, h*0.05)
+        
+        self.fitInView(final_rect, Qt.KeepAspectRatio)
+        self._emit_view_changed()
+
 
     def get_zoom_percent(self):
         """获取缩放百分比（适配原接口）"""

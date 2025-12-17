@@ -1,11 +1,13 @@
 import logging
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, pyqtSignal, QPointF
+from PyQt5.QtGui import QTransform
 from typing import List, Any
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
 
-from edit.commands import DeleteItemsCommand, AddItemCommand
+from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand
+from ui.graphics_items import EditablePathItem
 
 
 class EditManager(QObject):
@@ -203,3 +205,218 @@ class EditManager(QObject):
         # 全选逻辑：选中画布所有图形项
         self.canvas.select_all_items()
         self.set_has_selection(True)
+
+    def align_items(self, align_type):
+        """对齐选中项"""
+        items = self.canvas.get_selected_items()
+        if not items or len(items) < 2:
+            return
+        
+        cmd = AlignItemsCommand(self.canvas, items, align_type)
+        # 执行并推入历史
+        cmd.redo()
+        self.push_undo(cmd)
+
+    def align_to_page(self, align_type):
+        """将选中项对齐到页面"""
+        items = self.canvas.get_selected_items()
+        if not items:
+            return
+
+        # 计算整体包围盒
+        br = None
+        for it in items:
+            try:
+                r = it.sceneBoundingRect()
+                br = r if br is None else br.united(r)
+            except Exception:
+                continue
+        
+        if br is None:
+            return
+
+        # 获取页面尺寸
+        work_w = getattr(self.canvas, '_work_w', 600.0)
+        work_h = getattr(self.canvas, '_work_h', 400.0)
+
+        dx = 0.0
+        dy = 0.0
+
+        if align_type == 'top_left':
+            dx = -br.left()
+            dy = -br.top()
+        elif align_type == 'top_right':
+            dx = work_w - br.right()
+            dy = -br.top()
+        elif align_type == 'bottom_left':
+            dx = -br.left()
+            dy = work_h - br.bottom()
+        elif align_type == 'bottom_right':
+            dx = work_w - br.right()
+            dy = work_h - br.bottom()
+        elif align_type == 'center':
+            dx = (work_w / 2) - br.center().x()
+            dy = (work_h / 2) - br.center().y()
+        elif align_type == 'left':
+            dx = -br.left()
+        elif align_type == 'right':
+            dx = work_w - br.right()
+        elif align_type == 'top':
+            dy = -br.top()
+        elif align_type == 'bottom':
+            dy = work_h - br.bottom()
+
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return
+
+        # 构建 MoveItemsCommand 需要的状态列表
+        items_states = []
+        from ui.graphics_items import EditablePathItem
+        from PyQt5.QtCore import QPointF
+
+        for it in items:
+            try:
+                if isinstance(it, EditablePathItem):
+                    old_pts = it.points()
+                    new_pts = [(p[0] + dx, p[1] + dy) for p in old_pts]
+                    items_states.append(('path', it, old_pts, new_pts))
+                else:
+                    # 对于其他项（图片、文字等），修改 pos
+                    old_pos = it.pos()
+                    new_pos = QPointF(old_pos.x() + dx, old_pos.y() + dy)
+                    items_states.append(('pos', it, old_pos, new_pos))
+            except Exception:
+                continue
+
+        if items_states:
+            cmd = MoveItemsCommand(self.canvas, items_states)
+            cmd.redo()
+            self.push_undo(cmd)
+
+    def distribute_items(self, axis):
+        """等间距分布选中项"""
+        items = self.canvas.get_selected_items()
+        if len(items) < 3: return # 至少需要3个对象才能体现间距分布
+
+        states = []
+        
+        if axis == 'horizontal':
+            # 按左边缘排序
+            items.sort(key=lambda it: it.sceneBoundingRect().left())
+            # 计算总跨度
+            total_span = items[-1].sceneBoundingRect().right() - items[0].sceneBoundingRect().left()
+            # 计算所有对象的宽度之和
+            sum_width = sum(it.sceneBoundingRect().width() for it in items)
+            # 计算总间隙空间
+            total_gap = total_span - sum_width
+            # 计算单个间隙
+            gap = total_gap / (len(items) - 1)
+            
+            # 从第一个对象的右边缘开始放置
+            current_x = items[0].sceneBoundingRect().right() + gap
+            
+            # 调整中间对象的位置（首尾不动）
+            for it in items[1:-1]:
+                rect = it.sceneBoundingRect()
+                new_left = current_x
+                dx = new_left - rect.left()
+                
+                if abs(dx) > 1e-9:
+                    # 记录移动状态
+                    if isinstance(it, EditablePathItem):
+                        old_pts = it.points()
+                        new_pts = [(p[0] + dx, p[1]) for p in old_pts]
+                        states.append(('path', it, old_pts, new_pts))
+                    else:
+                        old_pos = it.pos()
+                        new_pos = QPointF(old_pos.x() + dx, old_pos.y())
+                        states.append(('pos', it, old_pos, new_pos))
+                
+                current_x += rect.width() + gap
+        
+        elif axis == 'vertical':
+            # 按顶边缘排序
+            items.sort(key=lambda it: it.sceneBoundingRect().top())
+            total_span = items[-1].sceneBoundingRect().bottom() - items[0].sceneBoundingRect().top()
+            sum_height = sum(it.sceneBoundingRect().height() for it in items)
+            total_gap = total_span - sum_height
+            gap = total_gap / (len(items) - 1)
+
+            current_y = items[0].sceneBoundingRect().bottom() + gap
+            
+            for it in items[1:-1]:
+                rect = it.sceneBoundingRect()
+                new_top = current_y
+                dy = new_top - rect.top()
+                
+                if abs(dy) > 1e-9:
+                    if isinstance(it, EditablePathItem):
+                        old_pts = it.points()
+                        new_pts = [(p[0], p[1] + dy) for p in old_pts]
+                        states.append(('path', it, old_pts, new_pts))
+                    else:
+                        old_pos = it.pos()
+                        new_pos = QPointF(old_pos.x(), old_pos.y() + dy)
+                        states.append(('pos', it, old_pos, new_pos))
+                
+                current_y += rect.height() + gap
+        
+        if states:
+            cmd = MoveItemsCommand(self.canvas, states)
+            cmd.redo()
+            self.push_undo(cmd)
+
+    def make_same_size(self, mode):
+        """使选中项等宽/等高/等大小"""
+        items = self.canvas.get_selected_items()
+        if len(items) < 2: return
+
+        # 确定目标尺寸（取最大值）
+        max_w = max(it.sceneBoundingRect().width() for it in items)
+        max_h = max(it.sceneBoundingRect().height() for it in items)
+
+        states = []
+        for it in items:
+            rect = it.sceneBoundingRect()
+            w = rect.width()
+            h = rect.height()
+            if w == 0 or h == 0: continue
+
+            sx = 1.0
+            sy = 1.0
+            
+            if mode == 'width' or mode == 'size':
+                sx = max_w / w
+            if mode == 'height' or mode == 'size':
+                sy = max_h / h
+            
+            if abs(sx - 1.0) < 1e-5 and abs(sy - 1.0) < 1e-5:
+                continue
+
+            # 以中心为基准进行缩放
+            cx = rect.center().x()
+            cy = rect.center().y()
+
+            if isinstance(it, EditablePathItem):
+                old_pts = it.points()
+                new_pts = []
+                for x, y in old_pts:
+                    nx = cx + (x - cx) * sx
+                    ny = cy + (y - cy) * sy
+                    new_pts.append((nx, ny))
+                states.append(('path', it, old_pts, new_pts))
+            else:
+                # 使用 transform
+                old_t = it.transform()
+                m = QTransform()
+                m.translate(cx, cy)
+                m.scale(sx, sy)
+                m.translate(-cx, -cy)
+                # 将新的缩放应用到原有变换之上
+                new_t = m * old_t
+                states.append(('transform', it, old_t, new_t))
+
+        if states:
+            cmd = MoveItemsCommand(self.canvas, states)
+            cmd.redo()
+            self.push_undo(cmd)

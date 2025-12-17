@@ -406,15 +406,24 @@ class MainWindow(QMainWindow):
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', self.undo))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', self.redo))
         toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围 ', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', self.set_pan_tool))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', self.view_zoom_in))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', self.view_zoom_out))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', self.zoom_to_page))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围 ', self.zoom_to_data))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', self.zoom_to_all))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', self.set_box_zoom_tool))
+        # 复用页面范围图标作为回到原点图标
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '回到原点', self.align_origin))
         toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', None))
+        self.show_path_action = self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', self.toggle_show_path, is_checkable=True)
+        toolbar1.addAction(self.show_path_action)
+        # 连接选择改变信号，以便在选中项改变时更新路径预览
+        try:
+            self.whiteboard.canvas.scene.selectionChanged.connect(self.toggle_show_path)
+        except Exception:
+            pass
+
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置导入导出', None))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', None))
         toolbar1.addSeparator()
@@ -502,11 +511,11 @@ class MainWindow(QMainWindow):
         properties_layout.addWidget(QLabel("mm"), 0, 5)
 
         # 百分比
-        percent_input = QLineEdit("0")
-        percent_input.setMaximumWidth(55)
-        percent_input.setMinimumHeight(24)  # 增加输入框高度
-        percent_input.setMaximumHeight(24)
-        properties_layout.addWidget(percent_input, 0, 6)
+        self.percent_input = QLineEdit("100")
+        self.percent_input.setMaximumWidth(55)
+        self.percent_input.setMinimumHeight(24)  # 增加输入框高度
+        self.percent_input.setMaximumHeight(24)
+        properties_layout.addWidget(self.percent_input, 0, 6)
         properties_layout.addWidget(QLabel("%"), 0, 7)
 
         # 第二行
@@ -534,11 +543,11 @@ class MainWindow(QMainWindow):
         properties_layout.addWidget(QLabel("mm"), 1, 5)
 
         # 百分比（第二行）
-        percent_input2 = QLineEdit("0")
-        percent_input2.setMaximumWidth(55)
-        percent_input2.setMinimumHeight(24)  # 增加输入框高度
-        percent_input2.setMaximumHeight(24)
-        properties_layout.addWidget(percent_input2, 1, 6)
+        self.percent_input2 = QLineEdit("100")
+        self.percent_input2.setMaximumWidth(55)
+        self.percent_input2.setMinimumHeight(24)  # 增加输入框高度
+        self.percent_input2.setMaximumHeight(24)
+        properties_layout.addWidget(self.percent_input2, 1, 6)
         properties_layout.addWidget(QLabel("%"), 1, 7)
 
         toolbar3.addWidget(properties_widget)
@@ -548,6 +557,8 @@ class MainWindow(QMainWindow):
         self.y_input.returnPressed.connect(lambda: self._apply_position_and_size_changes())
         self.width_input.returnPressed.connect(lambda: self._apply_position_and_size_changes())
         self.height_input.returnPressed.connect(lambda: self._apply_position_and_size_changes())
+        self.percent_input.returnPressed.connect(lambda: self._apply_percent_scale(True))
+        self.percent_input2.returnPressed.connect(lambda: self._apply_percent_scale(False))
 
         # 变换工具
         toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '锁住', None))
@@ -626,29 +637,29 @@ class MainWindow(QMainWindow):
 
         toolbar3.addWidget(angle_order_widget)
         toolbar3.addSeparator()  # 在第五个按钮后添加分隔符
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('left')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('right')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('top')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('bottom')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('hcenter')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('vcenter')))
         toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', lambda: self.whiteboard.canvas.edit_manager.distribute_items('horizontal')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', lambda: self.whiteboard.canvas.edit_manager.distribute_items('vertical')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', lambda: self.whiteboard.canvas.edit_manager.make_same_size('width')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', lambda: self.whiteboard.canvas.edit_manager.make_same_size('height')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', lambda: self.whiteboard.canvas.edit_manager.make_same_size('size')))
         toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', None))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_left')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_right')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_right')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_left')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', lambda: self.whiteboard.canvas.edit_manager.align_to_page('center')))
         toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '', None, False))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '', None, False))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '移至左边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('left')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '移至右边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('right')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '移至上边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top')))
+        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '移至下边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom')))
 
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().Expanding, spacer.sizePolicy().Preferred)
@@ -663,7 +674,7 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
         return action
 
-    def create_tool_action_with_icon(self, icon_path, tooltip, callback, show_tooltip=True):
+    def create_tool_action_with_icon(self, icon_path, tooltip, callback, show_tooltip=True, is_checkable=False):
         """创建工具栏动作（使用真实图标）"""
         action = QAction(self)
         if show_tooltip:
@@ -677,6 +688,9 @@ class MainWindow(QMainWindow):
         else:
             # 如果图标加载失败，使用文本作为备选
             action.setText('?')
+
+        if is_checkable:
+            action.setCheckable(True)
 
         if callback:
             action.triggered.connect(callback)
@@ -1686,6 +1700,121 @@ class MainWindow(QMainWindow):
         self.whiteboard.zoom_reset()
         self.show_status_message('缩放: 100%')
 
+    def set_pan_tool(self):
+        """平移工具"""
+        self.whiteboard.set_tool(self.whiteboard.canvas.Tool.PAN)
+        self.show_status_message('工具: 平移')
+
+    def zoom_to_page(self):
+        """页面范围"""
+        self.whiteboard.canvas.zoom_to_page()
+        self.show_status_message('视图: 页面范围')
+
+    def zoom_to_data(self):
+        """数据范围"""
+        self.whiteboard.canvas.zoom_to_data()
+        self.show_status_message('视图: 数据范围')
+
+    def zoom_to_all(self):
+        """显示所有"""
+        self.whiteboard.canvas.zoom_to_all()
+        self.show_status_message('视图: 显示所有')
+
+    def set_box_zoom_tool(self):
+        """框选查看工具"""
+        self.whiteboard.set_tool(self.whiteboard.canvas.Tool.BOX_ZOOM)
+        self.show_status_message('工具: 框选查看')
+
+    def align_origin(self):
+        """回到原点"""
+        self.whiteboard.canvas.align_origin_top_left()
+        self.show_status_message('视图: 回到原点')
+
+    def view_zoom_in(self):
+        """仅放大视图"""
+        self.whiteboard.zoom_in()
+        self.show_status_message(f'缩放: {self.whiteboard.get_zoom_percent()}%')
+
+    def view_zoom_out(self):
+        """仅缩小视图"""
+        self.whiteboard.zoom_out()
+        self.show_status_message(f'缩放: {self.whiteboard.get_zoom_percent()}%')
+
+    def toggle_show_path(self):
+        """切换显示切割路径"""
+        try:
+            is_checked = self.show_path_action.isChecked()
+            if is_checked:
+                # 仅显示选中对象的路径
+                items = self.whiteboard.canvas.scene.selectedItems()
+                
+                if not items:
+                    # 如果没有选中项，隐藏路径并提示
+                    self.whiteboard.canvas.hide_path_preview()
+                    self.show_status_message('请选择要查看路径的对象')
+                    return
+
+                # 确保顺序一致（按Z值降序，模拟 items() 的返回顺序）
+                items = sorted(items, key=lambda i: i.zValue(), reverse=True)
+                
+                # 过滤和排序
+                valid_items = []
+                
+                # 获取图层数据
+                layer_data = self.right_panel.layer_data
+                
+                # 辅助函数：获取项的颜色Hex
+                def get_item_color_hex(item):
+                    from ui.graphics_items import EditablePathItem
+                    from PyQt5.QtWidgets import QGraphicsTextItem
+                    color = None
+                    if isinstance(item, EditablePathItem):
+                        color = item.pen().color()
+                    elif isinstance(item, QGraphicsTextItem):
+                        color = item.defaultTextColor()
+                    
+                    if color:
+                        return color.name().upper()
+                    return None
+
+                # 收集有效项
+                for item in items:
+                    # 排除辅助项
+                    if item.zValue() >= 9999: continue # Preview items
+                    if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
+                    if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
+                    
+                    color_hex = get_item_color_hex(item)
+                    if color_hex:
+                        # 检查图层设置
+                        if color_hex in layer_data:
+                            params = layer_data[color_hex]
+                            if params.is_output:
+                                valid_items.append((item, params.priority))
+                        else:
+                            # 未知图层，默认输出，优先级最低
+                            valid_items.append((item, 9999))
+                    else:
+                        # 无颜色项（如图片），默认输出
+                        valid_items.append((item, 9999))
+                
+                # 排序：优先级越小越靠前
+                # scene.items() 返回的是 stacking order (top first). 
+                # 我们希望按照加工顺序，通常是先加工优先级高的
+                valid_items.sort(key=lambda x: x[1])
+                
+                sorted_items = [x[0] for x in valid_items]
+                
+                self.whiteboard.canvas.show_path_preview(sorted_items)
+                self.show_status_message('显示切割路径')
+            else:
+                self.whiteboard.canvas.hide_path_preview()
+                self.show_status_message('隐藏切割路径')
+        except Exception as e:
+            print(f"Error showing path: {e}")
+
+
+
     def _scale_or_zoom_selected(self, factor: float):
         """如果有选中项则缩放选中项，否则缩放视图。"""
         try:
@@ -1947,9 +2076,9 @@ class MainWindow(QMainWindow):
                     continue
             
             if bounding_rect is not None and bounding_rect.isValid():
-                # 使用包围矩形的左上角作为位置
-                x = bounding_rect.left()
-                y = bounding_rect.top()
+                # 使用包围矩形的中心作为位置
+                x = bounding_rect.center().x()
+                y = bounding_rect.center().y()
                 # 计算宽度和高度（横向和纵向间距）
                 width = bounding_rect.width()
                 height = bounding_rect.height()
@@ -1963,6 +2092,12 @@ class MainWindow(QMainWindow):
                     self.width_input.setText(f"{width:.2f}")
                 if not self.height_input.hasFocus():
                     self.height_input.setText(f"{height:.2f}")
+                
+                # 重置百分比显示为100
+                if not self.percent_input.hasFocus():
+                    self.percent_input.setText("100")
+                if not self.percent_input2.hasFocus():
+                    self.percent_input2.setText("100")
             else:
                 # 无法获取位置时，显示0
                 if not self.x_input.hasFocus():
@@ -1973,8 +2108,57 @@ class MainWindow(QMainWindow):
                     self.width_input.setText("0")
                 if not self.height_input.hasFocus():
                     self.height_input.setText("0")
+                if not self.percent_input.hasFocus():
+                    self.percent_input.setText("100")
+                if not self.percent_input2.hasFocus():
+                    self.percent_input2.setText("100")
         except Exception:
             # 出错时保持当前显示不变
+            pass
+
+    def _apply_percent_scale(self, is_width):
+        """应用百分比缩放"""
+        try:
+            # 获取输入值
+            if is_width:
+                text = self.percent_input.text()
+            else:
+                text = self.percent_input2.text()
+            
+            try:
+                percent = float(text)
+            except ValueError:
+                return
+            
+            # 转换为缩放因子
+            factor = percent / 100.0
+            
+            # 如果因子接近1或无效，忽略
+            if abs(factor - 1.0) < 0.001 or factor <= 0:
+                return
+            
+            # 获取当前宽高
+            try:
+                current_w = float(self.width_input.text())
+                current_h = float(self.height_input.text())
+            except ValueError:
+                return
+
+            # 计算新宽高 (比例缩放：宽高同时缩放)
+            new_w = current_w * factor
+            new_h = current_h * factor
+            
+            self.width_input.setText(f"{new_w:.2f}")
+            self.height_input.setText(f"{new_h:.2f}")
+            
+            # 应用更改
+            self._apply_position_and_size_changes()
+            
+            # 重置输入框为100
+            self.percent_input.setText("100")
+            self.percent_input2.setText("100")
+            
+        except Exception:
             pass
 
     def _apply_position_and_size_changes(self):
@@ -2034,8 +2218,8 @@ class MainWindow(QMainWindow):
                 return
             
             # 获取当前值
-            current_x = bounding_rect.left()
-            current_y = bounding_rect.top()
+            current_x = bounding_rect.center().x()
+            current_y = bounding_rect.center().y()
             current_width = bounding_rect.width()
             current_height = bounding_rect.height()
             
@@ -2055,9 +2239,9 @@ class MainWindow(QMainWindow):
             from edit.commands import MoveItemsCommand
             items_states = []
             
-            # 左上角基准点（用于缩放）
-            pivot_x = current_x if new_x is not None else bounding_rect.left()
-            pivot_y = current_y if new_y is not None else bounding_rect.top()
+            # 缩放基准点（使用中心点）
+            pivot_x = current_x
+            pivot_y = current_y
             
             # 应用变化到每个选中的图形项
             for item in selected_items:
@@ -2073,22 +2257,15 @@ class MainWindow(QMainWindow):
                         if not item_br.isValid():
                             continue
                         
-                        item_pivot_x = item_br.left()
-                        item_pivot_y = item_br.top()
-                        
                         # 应用位置偏移和缩放
-                        # 先计算新的左上角位置
-                        new_item_x = item_pivot_x + dx
-                        new_item_y = item_pivot_y + dy
-                        
                         new_points = []
                         for px, py in old_points:
-                            # 先相对于项的左上角进行缩放
-                            scaled_x = item_pivot_x + (px - item_pivot_x) * scale_x
-                            scaled_y = item_pivot_y + (py - item_pivot_y) * scale_y
-                            # 然后移动到新位置（保持相对位置）
-                            final_x = new_item_x + (scaled_x - item_pivot_x)
-                            final_y = new_item_y + (scaled_y - item_pivot_y)
+                            # 相对于整体中心点进行缩放
+                            scaled_x = pivot_x + (px - pivot_x) * scale_x
+                            scaled_y = pivot_y + (py - pivot_y) * scale_y
+                            # 应用位置偏移
+                            final_x = scaled_x + dx
+                            final_y = scaled_y + dy
                             new_points.append((final_x, final_y))
                         
                         items_states.append(('path', item, old_points, new_points))
@@ -2098,26 +2275,36 @@ class MainWindow(QMainWindow):
                         from PyQt5.QtGui import QTransform
                         from PyQt5.QtCore import QPointF
                         
-                        item_br = item.sceneBoundingRect()
-                        if not item_br.isValid():
-                            continue
-                        
                         old_transform = item.transform()
                         
                         # 计算新的transform
-                        # 先移动到原点，缩放，再移动回位置
-                        item_pivot_x = item_br.left()
-                        item_pivot_y = item_br.top()
+                        # 1. 移动到整体中心点
+                        # 2. 缩放
+                        # 3. 移动回原位 + 偏移
                         
-                        new_transform = QTransform()
-                        # 移动到原点
-                        new_transform.translate(-item_pivot_x, -item_pivot_y)
-                        # 缩放
-                        new_transform.scale(scale_x, scale_y)
-                        # 移动回新位置
-                        new_transform.translate(item_pivot_x + dx, item_pivot_y + dy)
-                        # 应用原有的transform
-                        new_transform = new_transform * old_transform
+                        # 注意：QTransform是右乘的，所以顺序是反的
+                        # 我们需要构建一个变换矩阵 M，使得 new_pos = M * old_pos
+                        # M = T(dx, dy) * T(pivot_x, pivot_y) * S(sx, sy) * T(-pivot_x, -pivot_y)
+                        
+                        transform_matrix = QTransform()
+                        transform_matrix.translate(pivot_x + dx, pivot_y + dy)
+                        transform_matrix.scale(scale_x, scale_y)
+                        transform_matrix.translate(-pivot_x, -pivot_y)
+                        
+                        # 应用到原有变换上： new_transform = transform_matrix * old_transform
+                        # 但这里是对item本身做变换，item的坐标系是局部的
+                        # 实际上我们需要修改item的transform，使得其在scene中的表现符合预期
+                        
+                        # 更简单的方法：直接对item应用变换
+                        # item.setTransform(transform_matrix, combine=True)
+                        # 但我们需要记录状态用于undo
+                        
+                        # 正确的矩阵乘法顺序：
+                        # 我们希望 item 在 scene 中的变换变为 M * item_in_scene
+                        # item_in_scene = old_transform
+                        # 所以 new_transform = transform_matrix * old_transform
+                        
+                        new_transform = transform_matrix * old_transform
                         
                         items_states.append(('transform', item, old_transform, new_transform))
                     else:
