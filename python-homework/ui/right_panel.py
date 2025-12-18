@@ -8,10 +8,14 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView)
+                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QPixmap
+from .device_config_dialog import DeviceConfigDialog
+from my_io.gcode.gcode_exporter import GCodeExporter
+from utils.device_manager import DeviceManager
+from my_io.communication.laser_communicator import LaserCommunicator
 
 
 class LayerParams:
@@ -37,6 +41,12 @@ class RightPanel(QWidget):
         super().__init__(parent)
         self.canvas = None # 持有 Canvas 引用
         self.layer_data = {} # Key: hex color string, Value: LayerParams
+        
+        self.communicator = LaserCommunicator()
+        self.communicator.log_message.connect(self.on_comm_log)
+        self.communicator.error_occurred.connect(self.on_comm_error)
+        self.communicator.sending_finished.connect(self.on_sending_finished)
+        
         self.init_ui()
 
     def set_canvas(self, canvas):
@@ -55,24 +65,24 @@ class RightPanel(QWidget):
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
 
-        # 创建标签页
+        # 创建标签页并为每页添加可滚动区域，避免放大/缩放时内部控件被异常拉伸
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.create_processing_tab(), "加工")
-        self.tabs.addTab(self.create_output_tab(), "输出")
-        self.tabs.addTab(self.create_file_tab(), "文档")
-        self.tabs.addTab(self.create_user_tab(), "用户")
-        self.tabs.addTab(self.create_test_tab(), "测试")
-        # 已移除：不再显示单独的“变换”选项卡（由顶部工具与右侧其它面板替代）
-        # 新增：历史面板（列出撤销/重做历史）
-        self.tabs.addTab(self.create_history_tab(), "历史")
+        self.tabs.addTab(self._wrap_tab(self.create_processing_tab()), "加工")
+        self.tabs.addTab(self._wrap_tab(self.create_output_tab()), "输出")
+        self.tabs.addTab(self._wrap_tab(self.create_file_tab()), "文档")
+        self.tabs.addTab(self._wrap_tab(self.create_user_tab()), "用户")
+        self.tabs.addTab(self._wrap_tab(self.create_test_tab()), "测试")
+        # 历史面板（列出撤销/重做历史）
+        self.tabs.addTab(self._wrap_tab(self.create_history_tab()), "历史")
 
         root_layout.addWidget(self.tabs, 1)
 
         self.create_fixed_bottom_area(root_layout)
 
-        # 设置最小宽度和最大宽度（允许用户调整）
-        self.setMinimumWidth(380)
-        self.setMaximumWidth(600)
+        # 设置最小宽度并限制最大宽度，防止全屏时右侧面板被过度拉伸导致内部控件变形
+        self.setMinimumWidth(320)
+        self.setMaximumWidth(520)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         # 样式
         self.setStyleSheet("""
@@ -131,80 +141,146 @@ class RightPanel(QWidget):
         """)
 
     def create_fixed_bottom_area(self, parent_layout):
-        """底部的区域（调整后：组件缩小、间距压缩，为上方腾位置）"""
+        """底部的区域"""
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(8, 8, 8, 8)
-        bottom_layout.setSpacing(6)  # 缩小布局间距
+        bottom_layout.setSpacing(6)
 
+        # 防止在高 DPI / 全屏时被过度拉伸：限制底部区域最大高度并固定其纵向策略
+        from PyQt5.QtWidgets import QSizePolicy as _QSizePolicy
+        bottom_widget.setSizePolicy(_QSizePolicy.Preferred, _QSizePolicy.Fixed)
+        # bottom_widget.setMaximumHeight(360)
+
+        # 1. 数据加工 GroupBox
         process_group = QGroupBox("数据加工")
         process_layout = QVBoxLayout()
         process_layout.setContentsMargins(5, 5, 5, 5)
-        process_layout.setSpacing(4)  # 缩小内部间距
+        process_layout.setSpacing(4)
 
-        # 控制按钮行：缩小按钮高度、调整样式
-        control_btn_layout = QHBoxLayout()
-        control_btn_layout.setSpacing(2)
-        start_btn = QPushButton("开始")
-        start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 15px;")
-        start_btn.setMinimumHeight(28)  # 缩小按钮高度
-        pause_btn = QPushButton("暂停/继续")
-        pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 15px;")
-        pause_btn.setMinimumHeight(28)
-        stop_btn = QPushButton("停止")
-        stop_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; font-size: 15px;")
-        stop_btn.setMinimumHeight(28)
-        control_btn_layout.addWidget(start_btn, 1)
-        control_btn_layout.addWidget(pause_btn, 1)
-        control_btn_layout.addWidget(stop_btn, 1)
-        process_layout.addLayout(control_btn_layout)
+        # Row 1: Start, Pause/Resume, Stop
+        row1_layout = QHBoxLayout()
+        row1_layout.setSpacing(2)
+        
+        btn_start = QPushButton("开始")
+        btn_pause = QPushButton("暂停/继续")
+        btn_stop = QPushButton("停止")
+        
+        btn_start.clicked.connect(self.on_btn_start_clicked)
+        btn_pause.clicked.connect(self.on_btn_pause_clicked)
+        btn_stop.clicked.connect(self.on_btn_stop_clicked)
+        
+        for btn in [btn_start, btn_pause, btn_stop]:
+             btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+             btn.setMinimumHeight(28)
+             row1_layout.addWidget(btn)
+        
+        process_layout.addLayout(row1_layout)
 
-        # 文件操作按钮：缩小高度、调整字体
-        file_btn1 = QPushButton("保存为版位文件")
-        file_btn1.setStyleSheet("font-size: 15px;")
-        file_btn1.setMinimumHeight(26)  # 缩小按钮高度
-        process_layout.addWidget(file_btn1)
+        # Row 2: Save Offline, Offline Output, Download
+        row2_layout = QHBoxLayout()
+        row2_layout.setSpacing(2)
 
-        file_btn2 = QPushButton("载机文件输出")
-        file_btn2.setStyleSheet("font-size: 15px;")
-        file_btn2.setMinimumHeight(26)
-        process_layout.addWidget(file_btn2)
+        btn_save_offline = QPushButton("保存为脱机文件")
+        btn_offline_output = QPushButton("脱机文件输出")
+        btn_download = QPushButton("下载")
 
-        file_btn3 = QPushButton("下载")
-        file_btn3.setStyleSheet("font-size: 15px;")
-        file_btn3.setMinimumHeight(26)
-        process_layout.addWidget(file_btn3)
+        btn_save_offline.clicked.connect(self.on_btn_save_offline_clicked)
+        btn_offline_output.clicked.connect(self.on_btn_offline_output_clicked)
+        btn_download.clicked.connect(self.on_btn_download_clicked)
 
-        # 图形定位行：缩小组件尺寸
-        pos_layout = QHBoxLayout()
-        pos_layout.setSpacing(3)
-        pos_layout.addWidget(QLabel("图形定位:"), 0)
-        pos_combo = QComboBox()
-        pos_combo.addItems(["当前位置", "左上角", "中心"])
-        pos_combo.setStyleSheet("font-size: 12px;")
-        pos_combo.setMinimumHeight(24)  # 缩小下拉框高度
-        pos_layout.addWidget(pos_combo, 1)
-        process_layout.addLayout(pos_layout)
+        for btn in [btn_save_offline, btn_offline_output, btn_download]:
+             btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+             btn.setMinimumHeight(28)
+             row2_layout.addWidget(btn)
 
-        # 确定优化复选框：缩小尺寸
-        optimize_check = QCheckBox("确定优化")
-        optimize_check.setStyleSheet("font-size: 15px;")
-        optimize_check.setMinimumHeight(22)
-        optimize_check.setChecked(True)
-        process_layout.addWidget(optimize_check)
+        process_layout.addLayout(row2_layout)
 
-        # 其他操作按钮：缩小高度、调整字体
-        other_layout = QHBoxLayout()
-        other_layout.setSpacing(2)
-        other_layout.addWidget(QPushButton("切换坐标"), 1)
-        other_layout.addWidget(QPushButton("走边"), 1)
-        for btn in other_layout.findChildren(QPushButton):
-            btn.setStyleSheet("font-size: 15px;")
-            btn.setMinimumHeight(26)
-        process_layout.addLayout(other_layout)
+        # Row 3: Graphic Positioning
+        row3_layout = QHBoxLayout()
+        row3_layout.setSpacing(2)
+        
+        lbl_pos = QLabel("图形定位位置:")
+        combo_pos = QComboBox()
+        combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
+        combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+        combo_pos.setMinimumHeight(24)
 
+        row3_layout.addWidget(lbl_pos)
+        row3_layout.addWidget(combo_pos)
+        process_layout.addLayout(row3_layout)
+
+        # Row 4: Checkboxes and Border buttons
+        row4_layout = QHBoxLayout()
+        
+        # Left side: Checkboxes
+        checks_layout = QVBoxLayout()
+        checks_layout.setSpacing(2)
+        
+        chk_optimize = QCheckBox("路径优化")
+        chk_optimize.setChecked(True)
+        chk_output_selected = QCheckBox("输出选中图形")
+        chk_selected_pos = QCheckBox("选中图形定位")
+        chk_selected_pos.setEnabled(False)
+        chk_selected_pos.setStyleSheet("color: gray;")
+
+        def on_output_selected_changed(checked):
+            chk_selected_pos.setEnabled(checked)
+            chk_selected_pos.setStyleSheet("color: black;" if checked else "color: gray;")
+        
+        chk_output_selected.toggled.connect(on_output_selected_changed)
+
+        checks_layout.addWidget(chk_optimize)
+        checks_layout.addWidget(chk_output_selected)
+        checks_layout.addWidget(chk_selected_pos)
+        
+        row4_layout.addLayout(checks_layout)
+
+        # Right side: Border buttons
+        border_btns_layout = QVBoxLayout()
+        border_btns_layout.setSpacing(2)
+        
+        btn_cut_border = QPushButton("切边框")
+        btn_walk_border = QPushButton("走边框")
+        
+        btn_cut_border.clicked.connect(self.on_btn_cut_border_clicked)
+        btn_walk_border.clicked.connect(self.on_btn_walk_border_clicked)
+
+        for btn in [btn_cut_border, btn_walk_border]:
+            btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+            btn.setMinimumHeight(28)
+            border_btns_layout.addWidget(btn)
+
+        row4_layout.addLayout(border_btns_layout)
+        
+        process_layout.addLayout(row4_layout)
         process_group.setLayout(process_layout)
         bottom_layout.addWidget(process_group)
+
+        # 2. 设备端口 GroupBox
+        device_group = QGroupBox("设备端口")
+        device_layout = QHBoxLayout()
+        device_layout.setContentsMargins(5, 5, 5, 5)
+        device_layout.setSpacing(5)
+
+        btn_config = QPushButton("配置")
+        btn_config.setMinimumHeight(28)
+        btn_config.clicked.connect(self.open_device_config_dialog)
+        self.combo_device = QComboBox()
+        self.combo_device.setMinimumHeight(28)
+        # 防止下拉框遮挡：设置为可编辑但只读
+        self.combo_device.setEditable(True)
+        self.combo_device.lineEdit().setReadOnly(True)
+        self.combo_device.setStyleSheet("QComboBox { background-color: #ffffff; }")
+        
+        self.refresh_device_list()
+        
+        device_layout.addWidget(btn_config)
+        device_layout.addWidget(self.combo_device, 1) # Stretch combo box
+
+        device_group.setLayout(device_layout)
+        bottom_layout.addWidget(device_group)
+
         parent_layout.addWidget(bottom_widget)
 
         bottom_widget.setStyleSheet("""
@@ -212,6 +288,134 @@ class RightPanel(QWidget):
                border-top: 1px solid #d0d0d0;
                padding-top: 6px;  /* 缩小顶部内边距 */
            """)
+
+    def refresh_device_list(self):
+        """刷新设备列表"""
+        self.combo_device.clear()
+        devices = DeviceManager().get_devices()
+        for dev in devices:
+            self.combo_device.addItem(f"{dev['name']}---({dev['address']})")
+
+    def open_device_config_dialog(self):
+        """打开设备配置对话框"""
+        dialog = DeviceConfigDialog(self)
+        dialog.exec_()
+        # 对话框关闭后刷新列表
+        self.refresh_device_list()
+
+    def show_comm_error(self):
+        """显示通讯错误弹窗"""
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Laser")
+        msg_box.setText("通讯错误!")
+        msg_box.setIcon(QMessageBox.Warning)
+        btn = msg_box.addButton("确定", QMessageBox.AcceptRole)
+        msg_box.exec_()
+
+    def check_connection_and_alert(self):
+        """检查连接状态，未连接则弹窗"""
+        if not self.communicator.is_connected:
+            self.show_comm_error()
+            return False
+        return True
+
+    def on_btn_start_clicked(self):
+        """开始加工 - 打开高级控制界面"""
+        try:
+            # 尝试导入 laser 模块
+            # 注意：laser.py 位于项目根目录，确保 sys.path 包含根目录
+            import sys
+            import os
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            root_dir = os.path.dirname(current_dir)
+            if root_dir not in sys.path:
+                sys.path.append(root_dir)
+                
+            from laser import LaserImageGcodeSender
+            
+            # 实例化并显示窗口
+            # 必须保存为成员变量，否则会被垃圾回收导致窗口闪退
+            self.laser_window = LaserImageGcodeSender()
+            self.laser_window.show()
+            
+        except ImportError as e:
+            QMessageBox.critical(self, "错误", f"无法加载 laser 模块: {str(e)}\n请确保已安装 opencv-python 等依赖。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开界面失败: {str(e)}")
+
+    def on_btn_pause_clicked(self):
+        """暂停/继续"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "暂停功能暂未实现")
+
+    def on_btn_stop_clicked(self):
+        """停止加工"""
+        if not self.check_connection_and_alert():
+            return
+        self.communicator.stop_sending()
+
+    def on_btn_download_clicked(self):
+        """下载"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "下载功能暂未实现")
+
+    def on_btn_cut_border_clicked(self):
+        """切边框"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "切边框功能暂未实现")
+
+    def on_btn_walk_border_clicked(self):
+        """走边框"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "走边框功能暂未实现")
+
+    def on_comm_log(self, msg):
+        print(f"[Comm] {msg}")
+        # 可以显示在状态栏或者其他地方
+
+    def on_comm_error(self, msg):
+        # 屏蔽默认的详细错误弹窗，或者根据需要显示
+        # 如果是连接失败，on_btn_start_clicked 已经处理了
+        # 如果是运行时错误，可能需要显示
+        if "连接失败" in msg or "串口打开失败" in msg:
+             # 已经在 on_btn_start_clicked 中处理了弹窗，这里忽略
+             pass
+        else:
+             QMessageBox.critical(self, "通信错误", msg)
+
+    def on_sending_finished(self):
+        QMessageBox.information(self, "提示", "加工完成！")
+
+    def on_btn_save_offline_clicked(self):
+        """保存为脱机文件"""
+        if not self.canvas:
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存为脱机文件", "", "NC Files (*.nc);;All Files (*)")
+        if file_path:
+            try:
+                exporter = GCodeExporter()
+                # 这里可以根据界面设置更新 exporter.config
+                # 例如: exporter.set_config({'feed_rate': self.speed_spin.value() * 60}) 
+                
+                lines = exporter.export_canvas(self.canvas)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(lines))
+                QMessageBox.information(self, "成功", "脱机文件保存成功！")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def on_btn_offline_output_clicked(self):
+        """脱机文件输出"""
+        # 模拟输出功能，实际可能需要连接设备或保存到特定位置
+        if not self.canvas:
+            return
+            
+        QMessageBox.information(self, "提示", "脱机文件输出功能已就绪。\n(此处应连接设备或执行输出逻辑)")
 
     def create_processing_tab(self):
         """创建加工标签页（图层列表与参数设置）"""
@@ -348,6 +552,23 @@ class RightPanel(QWidget):
         main_layout.addWidget(grid_group)
 
         return widget
+
+    def _wrap_tab(self, widget: QWidget) -> QWidget:
+        """Wrap a tab page in a QScrollArea so content scrolls instead of stretching."""
+        from PyQt5.QtWidgets import QScrollArea, QWidget, QVBoxLayout
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.NoFrame)
+        scroll.setWidget(widget)
+
+        layout.addWidget(scroll)
+        return container
 
     def update_layer_list(self):
         """扫描画布，更新图层列表"""
@@ -791,76 +1012,37 @@ class RightPanel(QWidget):
         layout.setContentsMargins(8,8,8,8)
         layout.setSpacing(8)
 
-        table_widget=QWidget()
-        table_layout=QVBoxLayout(table_widget)
-        table_layout.setSpacing(0)
-
-        header_widget=QWidget()
-        header_widget.setStyleSheet("background-color:transparent;")
-        header_layout=QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0,0,0,0)
-        header_layout.setSpacing(1)
-
-        header_btns=[
-            ("编号",self.on_number_header_btn_click),
-            ("文件名",self.on_filename_header_btn_click),
-            ("工时(时:分:秒:毫秒)",self.on_worktime_header_btn_click),
-            ("件数",self.on_quantity_header_btn_click)
-        ]
-        for btn_text,btn_callback in header_btns:
-            btn=QPushButton(btn_text)
-            btn.setStyleSheet("""
-                                QPushButton {
-                                    border:1px solid #d0d0d0;
-                                    border-radius:4px;
-                                    background-color:#f0f0f0;
-                                    font-weight:bold;
-                                    font-size:12px;
-                                    text-align:center;
-                                    padding:8px 0;
-                                    margin:0;
-                                }
-                                QPushButton:hover {
-                                    background-color:#e0e0e0;
-                                    border-color:#b0b0b0;
-                                }
-                                QPushButton:pressed {
-                                    background-color:#d0d0d0;
-                                    border-color:#909090;
-                                }
-                            """)
-            btn.clicked.connect(btn_callback)
-            header_layout.addWidget(btn,1)
-
-        layer_table=QTableWidget()
+        # 用正式表头替代自定义 header 按钮，保证列与表头对齐且可自适应宽度
+        layer_table = QTableWidget()
         layer_table.setColumnCount(4)
         layer_table.setRowCount(19)
-        layer_table.setMinimumHeight(240)
+        layer_table.setMinimumHeight(200)
+        layer_table.setHorizontalHeaderLabels(["编号", "文件名", "工时(时:分:秒:毫秒)", "件数"])
         layer_table.verticalHeader().setVisible(False)
-        layer_table.verticalHeader().setDefaultSectionSize(12)
-        layer_table.horizontalHeader().setDefaultSectionSize(135)
-        layer_table.horizontalHeader().setVisible(False)
-        layer_table.horizontalHeader().setStretchLastSection(True)
+        layer_table.horizontalHeader().setStretchLastSection(False)
+        from PyQt5.QtWidgets import QHeaderView
+        layer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        layer_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         layer_table.setStyleSheet("""
-                            QTableWidget {
-                                border:1px solid #d0d0d0;
-                                border-radius:4px;
-                                background-color:#ffffff;
-                                gridline-color:#d0d0d0;
-                            }
-                            QTableWidget::item {
-                                padding:4px;
-                                border:none;
-                            }
-                            QTableWidget::item:selected {
-                                background-color:#e8f0fe;
-                                color:#000;
-                            }
-                        """)
+            QTableWidget {
+                border:1px solid #d0d0d0;
+                border-radius:4px;
+                background-color:#ffffff;
+                gridline-color:#d0d0d0;
+            }
+            QTableWidget::item {
+                padding:4px;
+                border:none;
+            }
+            QTableWidget::item:selected {
+                background-color:#e8f0fe;
+                color:#000;
+            }
+        """)
 
-        table_layout.addWidget(header_widget)
-        table_layout.addWidget(layer_table)
-        layout.addWidget(table_widget)
+        layout.addWidget(layer_table)
 
         btn_group=QWidget()
         btn_layout=QVBoxLayout(btn_group)
