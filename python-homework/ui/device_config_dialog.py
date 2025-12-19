@@ -1,7 +1,8 @@
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-                             QLabel, QLineEdit, QRadioButton, QComboBox, QGroupBox, QMessageBox, QWidget)
+                             QLabel, QLineEdit, QRadioButton, QComboBox, QGroupBox, QMessageBox, QWidget, QApplication)
 from PyQt5.QtCore import Qt
+from pymodbus.client import ModbusTcpClient, ModbusSerialClient
 from utils.device_manager import DeviceManager
 
 class PortSettingDialog(QDialog):
@@ -44,6 +45,7 @@ class PortSettingDialog(QDialog):
         usb_settings_layout.addSpacing(40) # Indent
         usb_settings_layout.addWidget(QLabel("端口号:"))
         self.port_combo = QComboBox()
+        self.port_combo.setView(QListView()) # 解决遮挡问题
         self.port_combo.setEditable(True)
         self.port_combo.lineEdit().setReadOnly(True)
         self.port_combo.setStyleSheet("QComboBox { background-color: #ffffff; }")
@@ -51,6 +53,7 @@ class PortSettingDialog(QDialog):
         self.port_combo.setCurrentText(self.port)
         usb_settings_layout.addWidget(self.port_combo, 1)
         self.btn_test_usb = QPushButton("测试")
+        self.btn_test_usb.clicked.connect(self.on_btn_test_usb_clicked)
         usb_settings_layout.addWidget(self.btn_test_usb)
         
         layout.addLayout(usb_layout)
@@ -71,6 +74,7 @@ class PortSettingDialog(QDialog):
         self.ip_edit.setInputMask("000.000.000.000;_") 
         net_settings_layout.addWidget(self.ip_edit, 1)
         self.btn_test_net = QPushButton("测试")
+        self.btn_test_net.clicked.connect(self.on_btn_test_net_clicked)
         net_settings_layout.addWidget(self.btn_test_net)
 
         layout.addLayout(net_layout)
@@ -105,6 +109,49 @@ class PortSettingDialog(QDialog):
         self.ip_edit.setEnabled(not is_usb)
         self.btn_test_net.setEnabled(not is_usb)
 
+    def on_btn_test_usb_clicked(self):
+        port = self.port_combo.currentText()
+        if port == "自动" or not port:
+             QMessageBox.information(self, "提示", "请选择具体的端口号进行测试")
+             return
+             
+        self.status_label.setText(f"正在测试串口 {port}...")
+        QApplication.processEvents()
+        
+        try:
+            # 尝试连接串口，使用默认波特率 115200
+            client = ModbusSerialClient(method='rtu', port=port, baudrate=115200, timeout=1)
+            if client.connect():
+                self.status_label.setText("测试成功")
+                QMessageBox.information(self, "成功", f"串口 {port} 连接成功！")
+                client.close()
+            else:
+                self.status_label.setText("测试失败")
+                QMessageBox.warning(self, "失败", f"串口 {port} 连接失败！\n请检查端口是否被占用或设备是否连接。")
+        except Exception as e:
+            self.status_label.setText("测试出错")
+            QMessageBox.critical(self, "错误", f"连接出错: {str(e)}")
+
+    def on_btn_test_net_clicked(self):
+        ip = self.ip_edit.text()
+        port = 502 # 默认 Modbus TCP 端口
+        
+        self.status_label.setText(f"正在测试 {ip}:{port}...")
+        QApplication.processEvents()
+        
+        try:
+            client = ModbusTcpClient(ip, port=port, timeout=2)
+            if client.connect():
+                self.status_label.setText("测试成功")
+                QMessageBox.information(self, "成功", f"Modbus-TCP {ip} 连接成功！")
+                client.close()
+            else:
+                self.status_label.setText("测试失败")
+                QMessageBox.warning(self, "失败", f"Modbus-TCP {ip} 连接失败！\n请检查IP地址是否正确或设备是否在线。")
+        except Exception as e:
+            self.status_label.setText("测试出错")
+            QMessageBox.critical(self, "错误", f"连接出错: {str(e)}")
+
     def get_data(self):
         mode = "USB" if self.usb_radio.isChecked() else "Network"
         return {
@@ -116,10 +163,11 @@ class PortSettingDialog(QDialog):
 
 
 class DeviceConfigDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_index=0):
         super().__init__(parent)
         self.setWindowTitle("设备管理") 
         self.resize(400, 300)
+        self.current_index = current_index
         self.init_ui()
 
     def init_ui(self):
@@ -137,6 +185,9 @@ class DeviceConfigDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        
+        # 连接点击信号以实现单选
+        self.table.itemClicked.connect(self.on_table_item_clicked)
         
         # 样式
         self.table.setStyleSheet("""
@@ -188,7 +239,9 @@ class DeviceConfigDialog(QDialog):
         self.table.setRowCount(0)
         devices = self.device_manager.get_devices()
         for i, dev in enumerate(devices):
-            self.add_device_row(dev['name'], dev['address'], checked=(i==0)) # 默认选中第一个，实际逻辑可优化
+            # 使用传入的 current_index 来决定默认选中项
+            is_checked = (i == self.current_index)
+            self.add_device_row(dev['name'], dev['address'], checked=is_checked)
 
     def add_device_row(self, name, address, checked=False):
         row = self.table.rowCount()
@@ -204,6 +257,30 @@ class DeviceConfigDialog(QDialog):
         item_addr = QTableWidgetItem(address)
         item_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         self.table.setItem(row, 1, item_addr)
+
+    def on_table_item_clicked(self, item):
+        """处理表格点击，实现单选互斥"""
+        row = item.row()
+        self.set_selected_row(row)
+
+    def set_selected_row(self, target_row):
+        """设置选中行，并取消其他行的选中状态"""
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            it = self.table.item(row, 0)
+            state = Qt.Checked if row == target_row else Qt.Unchecked
+            it.setCheckState(state)
+        self.table.blockSignals(False)
+        
+        # 更新当前索引
+        self.current_index = target_row
+
+    def get_selected_index(self):
+        """获取当前选中的设备索引"""
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).checkState() == Qt.Checked:
+                return row
+        return -1
 
     def on_add_clicked(self):
         dialog = PortSettingDialog(self, name="Device", mode="USB", port="自动")

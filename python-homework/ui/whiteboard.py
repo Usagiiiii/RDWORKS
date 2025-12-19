@@ -37,6 +37,8 @@ class PathPreviewItem(QGraphicsItem):
         self.travels = travels
         self.markers = markers
         self.setZValue(9999) # 确保在最上层
+        self.setEnabled(False) # 不接收鼠标事件，避免遮挡底层操作
+        self.setAcceptHoverEvents(False)
         
     def boundingRect(self):
         rect = QRectF()
@@ -343,7 +345,7 @@ class RotateHandle(QGraphicsEllipseItem):
         self.setPen(pen)
         self.setBrush(QBrush(QColor(200, 200, 200)))
         self.setZValue(1000)
-        self.setFlags(QGraphicsEllipseItem.ItemIsMovable | QGraphicsEllipseItem.ItemIsSelectable)
+        self.setFlags(QGraphicsEllipseItem.ItemIsMovable)
         self.setCursor(Qt.OpenHandCursor)
         self._dragging = False
         self._orig_tracking = None
@@ -1717,10 +1719,13 @@ class GridCanvas(QGraphicsView):
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击事件：进入缩放模式"""
         if self._tool == self.Tool.SELECT:
-            item = self.itemAt(event.pos())
-            if item and item.isSelected():
-                self.show_scale_handles()
-                return
+            # 遍历点击位置的所有项，查找是否有被选中的项
+            # 这样可以忽略覆盖在上层的非选中项（如路径预览）
+            items = self.items(event.pos())
+            for item in items:
+                if item.isSelected():
+                    self.show_scale_handles()
+                    return
         super().mouseDoubleClickEvent(event)
 
     def show_scale_handles(self):

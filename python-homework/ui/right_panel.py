@@ -8,9 +8,9 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox)
-from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView
-from PyQt5.QtCore import Qt, QSize
+                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox, QDialog)
+from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView, QListView
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 from .device_config_dialog import DeviceConfigDialog
 from my_io.gcode.gcode_exporter import GCodeExporter
@@ -33,9 +33,21 @@ class LayerParams:
         self.scan_interval = 0.1
         self.priority = 1
         self.name = "" # 预留
+        
+        # 新增参数
+        self.repeat_count = 1
+        self.is_blowing = True
+        self.seal_gap = 0.0
+        self.laser_on_delay = 0
+        self.laser_off_delay = 0
+        self.is_pierce_mode = False
+        self.pierce_power = 50.0  # 简化：统一打穿功率
 
 class RightPanel(QWidget):
     """右侧属性面板"""
+    
+    # 信号：当图层参数发生变化时发出（用于通知主窗口更新路径预览等）
+    layerParamsChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,7 +69,7 @@ class RightPanel(QWidget):
         # 监听选择变化以更新参数显示
         self.canvas.scene.selectionChanged.connect(self.on_selection_changed)
         # 初始化图层列表
-        self.update_layer_list()
+        self.update_layer_list(force=True)
 
     def init_ui(self):
         """初始化界面"""
@@ -202,6 +214,7 @@ class RightPanel(QWidget):
         
         lbl_pos = QLabel("图形定位位置:")
         combo_pos = QComboBox()
+        combo_pos.setView(QListView())
         combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
         combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         combo_pos.setMinimumHeight(24)
@@ -267,6 +280,7 @@ class RightPanel(QWidget):
         btn_config.setMinimumHeight(28)
         btn_config.clicked.connect(self.open_device_config_dialog)
         self.combo_device = QComboBox()
+        self.combo_device.setView(QListView())
         self.combo_device.setMinimumHeight(28)
         # 防止下拉框遮挡：设置为可编辑但只读
         self.combo_device.setEditable(True)
@@ -298,50 +312,90 @@ class RightPanel(QWidget):
 
     def open_device_config_dialog(self):
         """打开设备配置对话框"""
-        dialog = DeviceConfigDialog(self)
+        # 获取当前选中的索引
+        current_index = self.combo_device.currentIndex()
+        
+        dialog = DeviceConfigDialog(self, current_index=current_index)
         dialog.exec_()
+        
         # 对话框关闭后刷新列表
         self.refresh_device_list()
+        
+        # 获取用户在对话框中选中的设备索引
+        selected_index = dialog.get_selected_index()
+        if selected_index >= 0 and selected_index < self.combo_device.count():
+            self.combo_device.setCurrentIndex(selected_index)
+            # 自动尝试连接
+            self.connect_current_device()
 
-    def show_comm_error(self):
-        """显示通讯错误弹窗"""
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Laser")
-        msg_box.setText("通讯错误!")
-        msg_box.setIcon(QMessageBox.Warning)
-        btn = msg_box.addButton("确定", QMessageBox.AcceptRole)
-        msg_box.exec_()
+    def connect_current_device(self):
+        """尝试连接当前选中的设备"""
+        text = self.combo_device.currentText()
+        if not text:
+            QMessageBox.warning(self, "提示", "请先选择设备")
+            return False
+            
+        try:
+            # 解析格式: "Name---(Address)"
+            start = text.rfind("(")
+            end = text.rfind(")")
+            if start == -1 or end == -1:
+                # 尝试直接解析
+                address = text
+            else:
+                address = text[start+1:end]
+            
+            if address.startswith("Web:"):
+                ip = address.split(":", 1)[1]
+                return self.communicator.connect_tcp(ip, 502)
+            elif address.startswith("USB:"):
+                port = address.split(":", 1)[1]
+                return self.communicator.connect_rtu(port, 115200)
+            else:
+                # 默认尝试作为串口处理
+                return self.communicator.connect_rtu(address, 115200)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "连接失败", f"无法解析设备地址: {text}\n错误: {str(e)}")
+            return False
 
     def check_connection_and_alert(self):
-        """检查连接状态，未连接则弹窗"""
+        """检查连接状态，未连接则尝试连接"""
         if not self.communicator.is_connected:
-            self.show_comm_error()
+            # 尝试自动连接
+            if self.connect_current_device():
+                return True
             return False
         return True
 
     def on_btn_start_clicked(self):
-        """开始加工 - 打开高级控制界面"""
+        """开始加工"""
+        # 1. 检查连接
+        if not self.check_connection_and_alert():
+            return
+        
+        # 2. 生成 GCode
+        if not self.canvas:
+            return
+            
         try:
-            # 尝试导入 laser 模块
-            # 注意：laser.py 位于项目根目录，确保 sys.path 包含根目录
-            import sys
-            import os
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            root_dir = os.path.dirname(current_dir)
-            if root_dir not in sys.path:
-                sys.path.append(root_dir)
+            exporter = GCodeExporter()
+            # 更新配置
+            exporter.set_config({
+                'feed_rate': self.speed_spin.value() * 60, # mm/s -> mm/min
+                'max_laser_power': self.max_power_spin.value() * 2.55 # % -> 0-255
+            })
+            
+            lines = exporter.export_canvas(self.canvas)
+            if not lines:
+                QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
+                return
                 
-            from laser import LaserImageGcodeSender
+            # 3. 发送
+            self.communicator.start_sending(lines)
             
-            # 实例化并显示窗口
-            # 必须保存为成员变量，否则会被垃圾回收导致窗口闪退
-            self.laser_window = LaserImageGcodeSender()
-            self.laser_window.show()
-            
-        except ImportError as e:
-            QMessageBox.critical(self, "错误", f"无法加载 laser 模块: {str(e)}\n请确保已安装 opencv-python 等依赖。")
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"打开界面失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"启动失败: {str(e)}")
 
     def on_btn_pause_clicked(self):
         """暂停/继续"""
@@ -378,14 +432,7 @@ class RightPanel(QWidget):
         # 可以显示在状态栏或者其他地方
 
     def on_comm_error(self, msg):
-        # 屏蔽默认的详细错误弹窗，或者根据需要显示
-        # 如果是连接失败，on_btn_start_clicked 已经处理了
-        # 如果是运行时错误，可能需要显示
-        if "连接失败" in msg or "串口打开失败" in msg:
-             # 已经在 on_btn_start_clicked 中处理了弹窗，这里忽略
-             pass
-        else:
-             QMessageBox.critical(self, "通信错误", msg)
+        QMessageBox.critical(self, "通信错误", msg)
 
     def on_sending_finished(self):
         QMessageBox.information(self, "提示", "加工完成！")
@@ -570,7 +617,7 @@ class RightPanel(QWidget):
         layout.addWidget(scroll)
         return container
 
-    def update_layer_list(self):
+    def update_layer_list(self, changes=None, force=False):
         """扫描画布，更新图层列表"""
         if not self.canvas:
             return
@@ -590,14 +637,23 @@ class RightPanel(QWidget):
             if color and color.isValid():
                 used_colors.add(color.name().upper())
 
-        # 2. 同步数据：新增的颜色初始化参数，未使用的颜色保留（或标记为未使用，这里简化为只显示使用的或全部预设的）
-        # 需求说“支持>=20个图层”，通常意味着所有20个预设颜色都应该能被管理，或者动态管理。
-        # 为了符合截图“只显示已使用”的惯例，我们这里只显示 used_colors。
-        
-        # 确保 layer_data 中有这些颜色的数据
+        # 2. 同步数据
         for hex_color in used_colors:
             if hex_color not in self.layer_data:
                 self.layer_data[hex_color] = LayerParams(QColor(hex_color))
+
+        # --- 优化：检查是否需要重建表格 ---
+        if not force:
+            current_colors = set()
+            for row in range(self.layer_table.rowCount()):
+                item = self.layer_table.item(row, 0)
+                if item:
+                    current_colors.add(item.data(Qt.UserRole))
+            
+            # 如果颜色集合没有变化，则不重建表格，避免打断用户操作或造成卡顿
+            if used_colors == current_colors:
+                return
+        # --------------------------------
 
         # 3. 更新表格显示
         # 获取当前选中的颜色，以便恢复选中状态
@@ -685,12 +741,15 @@ class RightPanel(QWidget):
         # 根据列号更新参数
         if col == 2: # 输出
             params.is_output = (item.checkState() == Qt.Checked)
+            self.layerParamsChanged.emit()
         elif col == 3: # 显示
             params.is_visible = (item.checkState() == Qt.Checked)
             self.apply_layer_state(params)
+            self.layerParamsChanged.emit()
         elif col == 4: # 锁定
             params.is_locked = (item.checkState() == Qt.Checked)
             self.apply_layer_state(params)
+            self.layerParamsChanged.emit()
 
     def on_layer_selected(self):
         """当图层列表选中项变化时，更新下方参数显示"""
@@ -735,14 +794,42 @@ class RightPanel(QWidget):
         """双击图层行，弹出属性设置对话框"""
         row = item.row()
         hex_color = self.layer_table.item(row, 0).data(Qt.UserRole)
-        params = self.layer_data.get(hex_color)
         
-        if params:
-            self.show_layer_properties_dialog(params)
-            # 更新表格显示（模式等可能改变）
-            self.update_layer_list()
+        # 延迟打开对话框，避免在事件处理中阻塞导致崩溃
+        # 增加延迟到 50ms 确保事件循环完全处理完双击
+        QTimer.singleShot(50, lambda: self._open_layer_settings(hex_color))
+
+    def _open_layer_settings(self, hex_color):
+        """打开图层设置对话框"""
+        try:
+            # 使用新的对话框
+            from ui.layer_settings_dialog import LayerSettingsDialog
+            # 使用 window() 作为父对象，确保对话框在主窗口之上且模态行为正确
+            parent = self.window() if self.window() else self
+            dlg = LayerSettingsDialog(self.layer_data, hex_color, parent)
+            
+            if dlg.exec_() == QDialog.Accepted:
+                # 应用状态到画布
+                params = self.layer_data.get(hex_color)
+                if params:
+                    self.apply_layer_state(params)
+                
+                # 刷新列表显示（更新名称、锁定状态等）
+                self.update_layer_list(force=True)
+                self.layerParamsChanged.emit()
+            
+            # 显式销毁对话框
+            dlg.deleteLater()
+        except Exception as e:
+            print(f"Error opening layer settings: {e}")
+
+    def _post_layer_edit_update(self):
+        """(已废弃) 图层编辑后的延迟更新"""
+        pass
 
     def show_layer_properties_dialog(self, params):
+        """(已废弃) 显示图层属性对话框"""
+        pass
         """显示图层属性对话框"""
         from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox
         
@@ -807,7 +894,8 @@ class RightPanel(QWidget):
             # 应用状态到画布
             self.apply_layer_state(params)
             # 刷新列表显示（更新名称、锁定状态等）
-            self.update_layer_list()
+            self.update_layer_list(force=True)
+            self.layerParamsChanged.emit()
 
     def apply_layer_state(self, params):
         """应用图层状态（可见性、锁定等）"""
@@ -910,6 +998,7 @@ class RightPanel(QWidget):
         cycle_row1.addWidget(cycle_count,1)
         cycle_row1.addWidget(QLabel("先切割后送料"),0)
         cycle_order=QComboBox()
+        cycle_order.setView(QListView()) # 解决遮挡问题
         cycle_order.addItems(["先切割后送料","先送料后切割","往返送料"])
         cycle_row1.addWidget(cycle_order,1)
         cycle_layout.addLayout(cycle_row1)
@@ -924,6 +1013,7 @@ class RightPanel(QWidget):
         cycle_row2.addWidget(feed_length,1)
         cycle_row2.addWidget(QLabel("手动输入"),0)
         feed_input=QComboBox()
+        feed_input.setView(QListView()) # 解决遮挡问题
         feed_input.addItems(["手动输入","Y向幅面","图形高度","最小送料长度"])
         cycle_row2.addWidget(feed_input,1)
         cycle_layout.addLayout(cycle_row2)

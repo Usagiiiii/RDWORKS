@@ -69,6 +69,7 @@ class LeftToolbar(QWidget):
         # 修改这里：解包所有4个元素
         for icon_text, tooltip, icon_path, tool_id in tools:  # 解包4个变量
             btn = self.create_tool_button(icon_text, tooltip, icon_path, tool_id)  # 传递tool_id
+            
             layout.addWidget(btn)
             self.button_group.addButton(btn)
         
