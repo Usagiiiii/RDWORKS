@@ -1452,12 +1452,12 @@ class GridCanvas(QGraphicsView):
             if self._tool == self.Tool.DRAW_LINE:
                 if not self._drawing_pts:
                     self._drawing_pts = [(x, y)]
-                else:
-                    # 完成直线绘制
-                    self._drawing_pts.append((x, y))
-                    self.add_line(self._drawing_pts[0][0], self._drawing_pts[0][1],
-                                  self._drawing_pts[1][0], self._drawing_pts[1][1])
-                    self._clear_drawing_state()
+                # else:
+                #     # 完成直线绘制
+                #     self._drawing_pts.append((x, y))
+                #     self.add_line(self._drawing_pts[0][0], self._drawing_pts[0][1],
+                #                   self._drawing_pts[1][0], self._drawing_pts[1][1])
+                #     self._clear_drawing_state()
 
             elif self._tool == self.Tool.DRAW_POLY:
                 if not self._drawing_pts:
@@ -1562,7 +1562,12 @@ class GridCanvas(QGraphicsView):
 
         elif e.button() == Qt.RightButton:
             # 右键结束绘制
-            if self._tool == self.Tool.DRAW_POLY and len(self._drawing_pts) >= 2:
+            if self._tool == self.Tool.DRAW_LINE and self._drawing_pts:
+                self._drawing_pts.append((x, y))
+                self.add_line(self._drawing_pts[0][0], self._drawing_pts[0][1],
+                              self._drawing_pts[1][0], self._drawing_pts[1][1])
+                self._clear_drawing_state()
+            elif self._tool == self.Tool.DRAW_POLY and len(self._drawing_pts) >= 2:
                 self.add_polyline(self._drawing_pts)
                 self._clear_drawing_state()
             elif self._tool == self.Tool.DRAW_CURVE and len(self._drawing_pts) >= 2:
