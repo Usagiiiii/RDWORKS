@@ -6,5 +6,9 @@
     {
         "name": "Device",
         "address": "USB:COM2"
+    },
+    {
+        "name": "Device",
+        "address": "USB:COM2"
     }
 ]

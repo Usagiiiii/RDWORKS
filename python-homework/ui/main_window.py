@@ -8,7 +8,7 @@ from typing import List
 
 from PIL import Image
 from PyQt5 import QtWidgets, QtGui
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence, QColor, QPalette
 from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidget, QLabel, QFileDialog, QMessageBox,
                              QLineEdit, QGraphicsPixmapItem)
@@ -22,6 +22,8 @@ from utils.logging_utils import setup_logging
 from utils.tool_utils import check_required_tools
 from ui.whiteboard import Path
 from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
+from ui.lead_line_dialog import LeadLineDialog
+from ui.preview_dialog import PreviewDialog
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -36,6 +38,7 @@ class MainWindow(QMainWindow):
         self.paste_action = None
         self.delete_action = None
         self.select_all_action = None
+        self._updating_path = False
 
         self.logger = setup_logging()
         self.logger.info("MainWindow初始化开始")
@@ -86,6 +89,9 @@ class MainWindow(QMainWindow):
         
         # 连接信号
         self.whiteboard.canvas.headMoved.connect(self.update_mouse_coordinates)
+        self.whiteboard.canvas.scene.changed.connect(self.on_scene_changed)
+        # 连接右侧面板的图层参数变化信号，以便更新路径预览
+        self.right_panel.layerParamsChanged.connect(self.on_scene_changed)
 
         # -------------------------- 关键：连接编辑管理器信号 --------------------------
         em = self.whiteboard.canvas.edit_manager
@@ -120,6 +126,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def open_laser_window(self):
+        """打开激光控制界面"""
+        try:
+            import sys
+            import os
+            # Ensure root dir is in path
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            root_dir = os.path.dirname(current_dir)
+            if root_dir not in sys.path:
+                sys.path.append(root_dir)
+                
+            from laser import LaserImageGcodeSender
+            
+            # Keep reference to prevent garbage collection
+            self.laser_window = LaserImageGcodeSender()
+            self.laser_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"无法打开激光控制界面: {str(e)}")
+
     def show_status_message(self, message, timeout=0):
         """
         显示状态信息。
@@ -141,6 +167,11 @@ class MainWindow(QMainWindow):
             self.coord_label.setText("")
         else:
             self.coord_label.setText(f"X: {x:.3f}  Y: {y:.3f} mm")
+
+    def on_scene_changed(self, region):
+        """场景变化时更新路径预览"""
+        if self.show_path_action.isChecked() and not self._updating_path:
+            self.toggle_show_path()
 
     def _on_history_item_activated(self, item):
         try:
@@ -424,10 +455,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置导入导出', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置引入引出', self.set_lead_line))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', None))
         toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', None))
+        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', self.show_preview_dialog))
         toolbar1.addSeparator()
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column19.png', '自动群组', None))
         toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column20.png', '群组', None))
@@ -465,6 +496,10 @@ class MainWindow(QMainWindow):
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column17.png', '放置图形', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column18.png', '底图显示', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column19.png', '画布参数设置', None))
+        
+        # 新增：激光连接按钮
+        toolbar2.addSeparator()
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/lianjie.png', '图片处理', self.open_laser_window))
 
         # 第三行工具栏
         toolbar3 = QToolBar('工具栏3')
@@ -1057,6 +1092,7 @@ class MainWindow(QMainWindow):
                                 default_h_mm = pixmap.height() * mm_per_px
 
                                 self.unit_combo = QtWidgets.QComboBox(self)
+                                self.unit_combo.setView(QtWidgets.QListView()) # 解决遮挡问题
                                 self.unit_combo.addItems(['mm', 'px'])
 
                                 self.x_spin = QtWidgets.QDoubleSpinBox(self)
@@ -1742,76 +1778,99 @@ class MainWindow(QMainWindow):
 
     def toggle_show_path(self):
         """切换显示切割路径"""
+        if self._updating_path:
+            return
+            
+        self._updating_path = True
         try:
-            is_checked = self.show_path_action.isChecked()
-            if is_checked:
-                # 仅显示选中对象的路径
-                items = self.whiteboard.canvas.scene.selectedItems()
-                
-                if not items:
-                    # 如果没有选中项，隐藏路径并提示
-                    self.whiteboard.canvas.hide_path_preview()
-                    self.show_status_message('请选择要查看路径的对象')
-                    return
-
-                # 确保顺序一致（按Z值降序，模拟 items() 的返回顺序）
-                items = sorted(items, key=lambda i: i.zValue(), reverse=True)
-                
-                # 过滤和排序
-                valid_items = []
-                
-                # 获取图层数据
-                layer_data = self.right_panel.layer_data
-                
-                # 辅助函数：获取项的颜色Hex
-                def get_item_color_hex(item):
+            try:
+                is_checked = self.show_path_action.isChecked()
+                if is_checked:
+                    # 显示所有对象的路径（不仅仅是选中对象）
+                    # 使用 Qt.AscendingOrder 获取按堆叠顺序（从底到顶，即创建顺序）排列的项
+                    items = self.whiteboard.canvas.scene.items(order=Qt.AscendingOrder)
+                    
+                    # 过滤和排序
+                    valid_items = []
+                    
+                    # 获取图层数据
+                    layer_data = self.right_panel.layer_data
+                    
                     from ui.graphics_items import EditablePathItem
-                    from PyQt5.QtWidgets import QGraphicsTextItem
-                    color = None
-                    if isinstance(item, EditablePathItem):
-                        color = item.pen().color()
-                    elif isinstance(item, QGraphicsTextItem):
-                        color = item.defaultTextColor()
-                    
-                    if color:
-                        return color.name().upper()
-                    return None
+                    from ui.whiteboard import RotateHandle
+                    from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem
 
-                # 收集有效项
-                for item in items:
-                    # 排除辅助项
-                    if item.zValue() >= 9999: continue # Preview items
-                    if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
-                    if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
-                    
-                    color_hex = get_item_color_hex(item)
-                    if color_hex:
-                        # 检查图层设置
-                        if color_hex in layer_data:
-                            params = layer_data[color_hex]
-                            if params.is_output:
-                                valid_items.append((item, params.priority))
+                    # 辅助函数：获取项的颜色Hex
+                    def get_item_color_hex(item):
+                        color = None
+                        if isinstance(item, EditablePathItem):
+                            color = item.pen().color()
+                        elif isinstance(item, QGraphicsTextItem):
+                            color = item.defaultTextColor()
+                        
+                        if color:
+                            return color.name().upper()
+                        return None
+
+                    # 收集有效项
+                    for item in items:
+                        # 排除不可见项
+                        if not item.isVisible(): continue
+
+                        # 排除非顶层项（如子项、手柄图标等）
+                        if item.parentItem() is not None: continue
+
+                        # 排除辅助项
+                        if item.zValue() >= 9999: continue # Preview items
+                        if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
+                        if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
+                        
+                        # 排除旋转手柄及其相关项
+                        rotate_handle = getattr(self.whiteboard.canvas, '_rotate_handle', None)
+                        if item is rotate_handle: continue
+                        if rotate_handle and item is getattr(rotate_handle, '_angle_text', None): continue
+                        if isinstance(item, RotateHandle): continue
+
+                        # 仅包含用户内容类型
+                        if not isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                            continue
+
+                        color_hex = get_item_color_hex(item)
+                        if color_hex:
+                            # 检查图层设置
+                            if color_hex in layer_data:
+                                params = layer_data[color_hex]
+                                if params.is_output:
+                                    valid_items.append((item, params.priority))
+                            else:
+                                # 未知图层，默认输出，优先级最低
+                                valid_items.append((item, 9999))
                         else:
-                            # 未知图层，默认输出，优先级最低
+                            # 无颜色项（如图片），默认输出
                             valid_items.append((item, 9999))
-                    else:
-                        # 无颜色项（如图片），默认输出
-                        valid_items.append((item, 9999))
-                
-                # 排序：优先级越小越靠前
-                # scene.items() 返回的是 stacking order (top first). 
-                # 我们希望按照加工顺序，通常是先加工优先级高的
-                valid_items.sort(key=lambda x: x[1])
-                
-                sorted_items = [x[0] for x in valid_items]
-                
-                self.whiteboard.canvas.show_path_preview(sorted_items)
-                self.show_status_message('显示切割路径')
-            else:
-                self.whiteboard.canvas.hide_path_preview()
-                self.show_status_message('隐藏切割路径')
-        except Exception as e:
-            print(f"Error showing path: {e}")
+                    
+                    # 排序：优先级越小越靠前
+                    # scene.items() 返回的是 stacking order (top first). 
+                    # 我们希望按照加工顺序，通常是先加工优先级高的
+                    valid_items.sort(key=lambda x: x[1])
+                    
+                    sorted_items = [x[0] for x in valid_items]
+                    
+                    self.whiteboard.canvas.show_path_preview(sorted_items)
+                    self.show_status_message('显示切割路径')
+                else:
+                    self.whiteboard.canvas.hide_path_preview()
+                    self.show_status_message('隐藏切割路径')
+            except Exception as e:
+                print(f"Error showing path: {e}")
+        finally:
+            self._updating_path = False
+
+    def on_scene_changed(self, changes=None):
+        """场景变化处理"""
+        # 如果路径预览开启，则更新路径
+        if self.show_path_action.isChecked():
+            self.toggle_show_path()
 
 
 
@@ -1838,6 +1897,86 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showFullScreen()
+
+    def set_lead_line(self):
+        """设置引入引出线"""
+        # 检查是否有选中对象
+        selected_items = self.whiteboard.canvas.get_selected_items()
+        if not selected_items:
+            # 未选取对象点击工具无用
+            return
+
+        # 使用 QTimer.singleShot 延迟弹出对话框，避免可能的事件冲突导致闪退
+        QTimer.singleShot(0, self._show_lead_line_dialog)
+
+    def _show_lead_line_dialog(self):
+        """显示引入引出线设置对话框"""
+        try:
+            # 弹出对话框
+            dialog = LeadLineDialog(self)
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                data = dialog.get_data()
+                # TODO: 将设置应用到选中对象
+                # 目前仅打印设置，后续可根据需求实现具体的几何修改或属性存储
+                print("Lead Line Settings:", data)
+                self.show_status_message("引入引出线设置已应用")
+        except Exception as e:
+            print(f"Error in lead line dialog: {e}")
+            self.show_status_message(f"设置出错: {e}")
+
+    def show_preview_dialog(self):
+        """显示加工预览对话框"""
+        try:
+            # 获取所有图形项，使用 Qt.AscendingOrder 确保按创建顺序（底层优先）
+            all_items = self.whiteboard.canvas.scene.items(order=Qt.AscendingOrder)
+            
+            # 获取选中项
+            selected_items_set = set(self.whiteboard.canvas.scene.selectedItems())
+            
+            # 如果没有选中任何对象，则预览列表为空（显示黑屏）
+            # 如果有选中对象，则只预览选中的对象
+            target_items = []
+            if selected_items_set:
+                for item in all_items:
+                    if item in selected_items_set:
+                        target_items.append(item)
+            else:
+                # 没有选中对象，列表为空
+                target_items = []
+            
+            # 过滤掉非图形项（如辅助线、手柄等）
+            valid_items = []
+            from ui.graphics_items import EditablePathItem
+            from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
+            
+            for item in target_items:
+                if not item.isVisible(): continue
+                if item.parentItem() is not None: continue
+                if item.zValue() >= 9999: continue # Preview items
+                if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
+                if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
+                
+                if isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                    valid_items.append(item)
+            
+            # 获取工作区尺寸
+            work_w = self.whiteboard.canvas._work_w
+            work_h = self.whiteboard.canvas._work_h
+            
+            # 获取图层数据
+            layer_data = self.right_panel.layer_data
+            
+            # 延迟弹出，避免事件冲突
+            def open_dlg():
+                dlg = PreviewDialog(valid_items, (work_w, work_h), layer_data, self)
+                # dlg.showFullScreen() # 移除全屏
+                dlg.exec_()
+                
+            QTimer.singleShot(0, open_dlg)
+            
+        except Exception as e:
+            print(f"Error showing preview: {e}")
+            self.show_status_message(f"预览出错: {e}")
 
     # 工具选择方法
     def select_pen(self):
