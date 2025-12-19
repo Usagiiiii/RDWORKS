@@ -1,0 +1,10 @@
+[
+    {
+        "name": "Device",
+        "address": "USB:自动"
+    },
+    {
+        "name": "Device",
+        "address": "USB:COM2"
+    }
+]

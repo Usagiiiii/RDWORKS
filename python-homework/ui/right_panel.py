@@ -8,10 +8,14 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QAbstractSpinBox)
+                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QPixmap
+from .device_config_dialog import DeviceConfigDialog
+from my_io.gcode.gcode_exporter import GCodeExporter
+from utils.device_manager import DeviceManager
+from my_io.communication.laser_communicator import LaserCommunicator
 
 
 class LayerParams:
@@ -29,30 +33,6 @@ class LayerParams:
         self.scan_interval = 0.1
         self.priority = 1
         self.name = "" # 预留
-        
-        # 新增参数
-        self.is_blowing = True  # 是否吹气
-        self.repeat_count = 1   # 重复加工次数
-        self.seal_length = 0.0  # 封口
-        self.laser_on_delay = 0 # 激光开延时
-        self.laser_off_delay = 0 # 激光关延时
-        
-        # 默认参数标记
-        self.is_speed_default = False
-        self.is_power_default = False
-        self.is_repeat_default = False
-        
-        # 多路激光功率 (1-6)
-        # 列表索引0对应激光1
-        self.powers = [{'min': 30.0, 'max': 30.0, 'enabled': False} for _ in range(6)]
-        self.powers[0]['enabled'] = True # 默认启用激光1
-        self.powers[1]['enabled'] = True # 默认启用激光2 (保持原逻辑兼容)
-        
-        # 打穿模式
-        self.is_through_mode = False
-        # 打穿功率 (1-6)
-        self.through_powers = [50.0] * 6
-
 
 class RightPanel(QWidget):
     """右侧属性面板"""
@@ -61,6 +41,12 @@ class RightPanel(QWidget):
         super().__init__(parent)
         self.canvas = None # 持有 Canvas 引用
         self.layer_data = {} # Key: hex color string, Value: LayerParams
+        
+        self.communicator = LaserCommunicator()
+        self.communicator.log_message.connect(self.on_comm_log)
+        self.communicator.error_occurred.connect(self.on_comm_error)
+        self.communicator.sending_finished.connect(self.on_sending_finished)
+        
         self.init_ui()
 
     def set_canvas(self, canvas):
@@ -79,24 +65,24 @@ class RightPanel(QWidget):
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
 
-        # 创建标签页
+        # 创建标签页并为每页添加可滚动区域，避免放大/缩放时内部控件被异常拉伸
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.create_processing_tab(), "加工")
-        self.tabs.addTab(self.create_output_tab(), "输出")
-        self.tabs.addTab(self.create_file_tab(), "文档")
-        self.tabs.addTab(self.create_user_tab(), "用户")
-        self.tabs.addTab(self.create_test_tab(), "测试")
-        # 已移除：不再显示单独的“变换”选项卡（由顶部工具与右侧其它面板替代）
-        # 新增：历史面板（列出撤销/重做历史）
-        self.tabs.addTab(self.create_history_tab(), "历史")
+        self.tabs.addTab(self._wrap_tab(self.create_processing_tab()), "加工")
+        self.tabs.addTab(self._wrap_tab(self.create_output_tab()), "输出")
+        self.tabs.addTab(self._wrap_tab(self.create_file_tab()), "文档")
+        self.tabs.addTab(self._wrap_tab(self.create_user_tab()), "用户")
+        self.tabs.addTab(self._wrap_tab(self.create_test_tab()), "测试")
+        # 历史面板（列出撤销/重做历史）
+        self.tabs.addTab(self._wrap_tab(self.create_history_tab()), "历史")
 
         root_layout.addWidget(self.tabs, 1)
 
         self.create_fixed_bottom_area(root_layout)
 
-        # 设置最小宽度和最大宽度（允许用户调整）
-        self.setMinimumWidth(380)
-        self.setMaximumWidth(600)
+        # 设置最小宽度并限制最大宽度，防止全屏时右侧面板被过度拉伸导致内部控件变形
+        self.setMinimumWidth(320)
+        self.setMaximumWidth(520)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         # 样式
         self.setStyleSheet("""
@@ -155,80 +141,146 @@ class RightPanel(QWidget):
         """)
 
     def create_fixed_bottom_area(self, parent_layout):
-        """底部的区域（调整后：组件缩小、间距压缩，为上方腾位置）"""
+        """底部的区域"""
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(8, 8, 8, 8)
-        bottom_layout.setSpacing(6)  # 缩小布局间距
+        bottom_layout.setSpacing(6)
 
+        # 防止在高 DPI / 全屏时被过度拉伸：限制底部区域最大高度并固定其纵向策略
+        from PyQt5.QtWidgets import QSizePolicy as _QSizePolicy
+        bottom_widget.setSizePolicy(_QSizePolicy.Preferred, _QSizePolicy.Fixed)
+        # bottom_widget.setMaximumHeight(360)
+
+        # 1. 数据加工 GroupBox
         process_group = QGroupBox("数据加工")
         process_layout = QVBoxLayout()
         process_layout.setContentsMargins(5, 5, 5, 5)
-        process_layout.setSpacing(4)  # 缩小内部间距
+        process_layout.setSpacing(4)
 
-        # 控制按钮行：缩小按钮高度、调整样式
-        control_btn_layout = QHBoxLayout()
-        control_btn_layout.setSpacing(2)
-        start_btn = QPushButton("开始")
-        start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 15px;")
-        start_btn.setMinimumHeight(28)  # 缩小按钮高度
-        pause_btn = QPushButton("暂停/继续")
-        pause_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 15px;")
-        pause_btn.setMinimumHeight(28)
-        stop_btn = QPushButton("停止")
-        stop_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; font-size: 15px;")
-        stop_btn.setMinimumHeight(28)
-        control_btn_layout.addWidget(start_btn, 1)
-        control_btn_layout.addWidget(pause_btn, 1)
-        control_btn_layout.addWidget(stop_btn, 1)
-        process_layout.addLayout(control_btn_layout)
+        # Row 1: Start, Pause/Resume, Stop
+        row1_layout = QHBoxLayout()
+        row1_layout.setSpacing(2)
+        
+        btn_start = QPushButton("开始")
+        btn_pause = QPushButton("暂停/继续")
+        btn_stop = QPushButton("停止")
+        
+        btn_start.clicked.connect(self.on_btn_start_clicked)
+        btn_pause.clicked.connect(self.on_btn_pause_clicked)
+        btn_stop.clicked.connect(self.on_btn_stop_clicked)
+        
+        for btn in [btn_start, btn_pause, btn_stop]:
+             btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+             btn.setMinimumHeight(28)
+             row1_layout.addWidget(btn)
+        
+        process_layout.addLayout(row1_layout)
 
-        # 文件操作按钮：缩小高度、调整字体
-        file_btn1 = QPushButton("保存为版位文件")
-        file_btn1.setStyleSheet("font-size: 15px;")
-        file_btn1.setMinimumHeight(26)  # 缩小按钮高度
-        process_layout.addWidget(file_btn1)
+        # Row 2: Save Offline, Offline Output, Download
+        row2_layout = QHBoxLayout()
+        row2_layout.setSpacing(2)
 
-        file_btn2 = QPushButton("载机文件输出")
-        file_btn2.setStyleSheet("font-size: 15px;")
-        file_btn2.setMinimumHeight(26)
-        process_layout.addWidget(file_btn2)
+        btn_save_offline = QPushButton("保存为脱机文件")
+        btn_offline_output = QPushButton("脱机文件输出")
+        btn_download = QPushButton("下载")
 
-        file_btn3 = QPushButton("下载")
-        file_btn3.setStyleSheet("font-size: 15px;")
-        file_btn3.setMinimumHeight(26)
-        process_layout.addWidget(file_btn3)
+        btn_save_offline.clicked.connect(self.on_btn_save_offline_clicked)
+        btn_offline_output.clicked.connect(self.on_btn_offline_output_clicked)
+        btn_download.clicked.connect(self.on_btn_download_clicked)
 
-        # 图形定位行：缩小组件尺寸
-        pos_layout = QHBoxLayout()
-        pos_layout.setSpacing(3)
-        pos_layout.addWidget(QLabel("图形定位:"), 0)
-        pos_combo = QComboBox()
-        pos_combo.addItems(["当前位置", "左上角", "中心"])
-        pos_combo.setStyleSheet("font-size: 12px;")
-        pos_combo.setMinimumHeight(24)  # 缩小下拉框高度
-        pos_layout.addWidget(pos_combo, 1)
-        process_layout.addLayout(pos_layout)
+        for btn in [btn_save_offline, btn_offline_output, btn_download]:
+             btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+             btn.setMinimumHeight(28)
+             row2_layout.addWidget(btn)
 
-        # 确定优化复选框：缩小尺寸
-        optimize_check = QCheckBox("确定优化")
-        optimize_check.setStyleSheet("font-size: 15px;")
-        optimize_check.setMinimumHeight(22)
-        optimize_check.setChecked(True)
-        process_layout.addWidget(optimize_check)
+        process_layout.addLayout(row2_layout)
 
-        # 其他操作按钮：缩小高度、调整字体
-        other_layout = QHBoxLayout()
-        other_layout.setSpacing(2)
-        other_layout.addWidget(QPushButton("切换坐标"), 1)
-        other_layout.addWidget(QPushButton("走边"), 1)
-        for btn in other_layout.findChildren(QPushButton):
-            btn.setStyleSheet("font-size: 15px;")
-            btn.setMinimumHeight(26)
-        process_layout.addLayout(other_layout)
+        # Row 3: Graphic Positioning
+        row3_layout = QHBoxLayout()
+        row3_layout.setSpacing(2)
+        
+        lbl_pos = QLabel("图形定位位置:")
+        combo_pos = QComboBox()
+        combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
+        combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+        combo_pos.setMinimumHeight(24)
 
+        row3_layout.addWidget(lbl_pos)
+        row3_layout.addWidget(combo_pos)
+        process_layout.addLayout(row3_layout)
+
+        # Row 4: Checkboxes and Border buttons
+        row4_layout = QHBoxLayout()
+        
+        # Left side: Checkboxes
+        checks_layout = QVBoxLayout()
+        checks_layout.setSpacing(2)
+        
+        chk_optimize = QCheckBox("路径优化")
+        chk_optimize.setChecked(True)
+        chk_output_selected = QCheckBox("输出选中图形")
+        chk_selected_pos = QCheckBox("选中图形定位")
+        chk_selected_pos.setEnabled(False)
+        chk_selected_pos.setStyleSheet("color: gray;")
+
+        def on_output_selected_changed(checked):
+            chk_selected_pos.setEnabled(checked)
+            chk_selected_pos.setStyleSheet("color: black;" if checked else "color: gray;")
+        
+        chk_output_selected.toggled.connect(on_output_selected_changed)
+
+        checks_layout.addWidget(chk_optimize)
+        checks_layout.addWidget(chk_output_selected)
+        checks_layout.addWidget(chk_selected_pos)
+        
+        row4_layout.addLayout(checks_layout)
+
+        # Right side: Border buttons
+        border_btns_layout = QVBoxLayout()
+        border_btns_layout.setSpacing(2)
+        
+        btn_cut_border = QPushButton("切边框")
+        btn_walk_border = QPushButton("走边框")
+        
+        btn_cut_border.clicked.connect(self.on_btn_cut_border_clicked)
+        btn_walk_border.clicked.connect(self.on_btn_walk_border_clicked)
+
+        for btn in [btn_cut_border, btn_walk_border]:
+            btn.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+            btn.setMinimumHeight(28)
+            border_btns_layout.addWidget(btn)
+
+        row4_layout.addLayout(border_btns_layout)
+        
+        process_layout.addLayout(row4_layout)
         process_group.setLayout(process_layout)
         bottom_layout.addWidget(process_group)
+
+        # 2. 设备端口 GroupBox
+        device_group = QGroupBox("设备端口")
+        device_layout = QHBoxLayout()
+        device_layout.setContentsMargins(5, 5, 5, 5)
+        device_layout.setSpacing(5)
+
+        btn_config = QPushButton("配置")
+        btn_config.setMinimumHeight(28)
+        btn_config.clicked.connect(self.open_device_config_dialog)
+        self.combo_device = QComboBox()
+        self.combo_device.setMinimumHeight(28)
+        # 防止下拉框遮挡：设置为可编辑但只读
+        self.combo_device.setEditable(True)
+        self.combo_device.lineEdit().setReadOnly(True)
+        self.combo_device.setStyleSheet("QComboBox { background-color: #ffffff; }")
+        
+        self.refresh_device_list()
+        
+        device_layout.addWidget(btn_config)
+        device_layout.addWidget(self.combo_device, 1) # Stretch combo box
+
+        device_group.setLayout(device_layout)
+        bottom_layout.addWidget(device_group)
+
         parent_layout.addWidget(bottom_widget)
 
         bottom_widget.setStyleSheet("""
@@ -236,6 +288,134 @@ class RightPanel(QWidget):
                border-top: 1px solid #d0d0d0;
                padding-top: 6px;  /* 缩小顶部内边距 */
            """)
+
+    def refresh_device_list(self):
+        """刷新设备列表"""
+        self.combo_device.clear()
+        devices = DeviceManager().get_devices()
+        for dev in devices:
+            self.combo_device.addItem(f"{dev['name']}---({dev['address']})")
+
+    def open_device_config_dialog(self):
+        """打开设备配置对话框"""
+        dialog = DeviceConfigDialog(self)
+        dialog.exec_()
+        # 对话框关闭后刷新列表
+        self.refresh_device_list()
+
+    def show_comm_error(self):
+        """显示通讯错误弹窗"""
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Laser")
+        msg_box.setText("通讯错误!")
+        msg_box.setIcon(QMessageBox.Warning)
+        btn = msg_box.addButton("确定", QMessageBox.AcceptRole)
+        msg_box.exec_()
+
+    def check_connection_and_alert(self):
+        """检查连接状态，未连接则弹窗"""
+        if not self.communicator.is_connected:
+            self.show_comm_error()
+            return False
+        return True
+
+    def on_btn_start_clicked(self):
+        """开始加工 - 打开高级控制界面"""
+        try:
+            # 尝试导入 laser 模块
+            # 注意：laser.py 位于项目根目录，确保 sys.path 包含根目录
+            import sys
+            import os
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            root_dir = os.path.dirname(current_dir)
+            if root_dir not in sys.path:
+                sys.path.append(root_dir)
+                
+            from laser import LaserImageGcodeSender
+            
+            # 实例化并显示窗口
+            # 必须保存为成员变量，否则会被垃圾回收导致窗口闪退
+            self.laser_window = LaserImageGcodeSender()
+            self.laser_window.show()
+            
+        except ImportError as e:
+            QMessageBox.critical(self, "错误", f"无法加载 laser 模块: {str(e)}\n请确保已安装 opencv-python 等依赖。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开界面失败: {str(e)}")
+
+    def on_btn_pause_clicked(self):
+        """暂停/继续"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "暂停功能暂未实现")
+
+    def on_btn_stop_clicked(self):
+        """停止加工"""
+        if not self.check_connection_and_alert():
+            return
+        self.communicator.stop_sending()
+
+    def on_btn_download_clicked(self):
+        """下载"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "下载功能暂未实现")
+
+    def on_btn_cut_border_clicked(self):
+        """切边框"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "切边框功能暂未实现")
+
+    def on_btn_walk_border_clicked(self):
+        """走边框"""
+        if not self.check_connection_and_alert():
+            return
+        QMessageBox.information(self, "提示", "走边框功能暂未实现")
+
+    def on_comm_log(self, msg):
+        print(f"[Comm] {msg}")
+        # 可以显示在状态栏或者其他地方
+
+    def on_comm_error(self, msg):
+        # 屏蔽默认的详细错误弹窗，或者根据需要显示
+        # 如果是连接失败，on_btn_start_clicked 已经处理了
+        # 如果是运行时错误，可能需要显示
+        if "连接失败" in msg or "串口打开失败" in msg:
+             # 已经在 on_btn_start_clicked 中处理了弹窗，这里忽略
+             pass
+        else:
+             QMessageBox.critical(self, "通信错误", msg)
+
+    def on_sending_finished(self):
+        QMessageBox.information(self, "提示", "加工完成！")
+
+    def on_btn_save_offline_clicked(self):
+        """保存为脱机文件"""
+        if not self.canvas:
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存为脱机文件", "", "NC Files (*.nc);;All Files (*)")
+        if file_path:
+            try:
+                exporter = GCodeExporter()
+                # 这里可以根据界面设置更新 exporter.config
+                # 例如: exporter.set_config({'feed_rate': self.speed_spin.value() * 60}) 
+                
+                lines = exporter.export_canvas(self.canvas)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(lines))
+                QMessageBox.information(self, "成功", "脱机文件保存成功！")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def on_btn_offline_output_clicked(self):
+        """脱机文件输出"""
+        # 模拟输出功能，实际可能需要连接设备或保存到特定位置
+        if not self.canvas:
+            return
+            
+        QMessageBox.information(self, "提示", "脱机文件输出功能已就绪。\n(此处应连接设备或执行输出逻辑)")
 
     def create_processing_tab(self):
         """创建加工标签页（图层列表与参数设置）"""
@@ -373,6 +553,23 @@ class RightPanel(QWidget):
 
         return widget
 
+    def _wrap_tab(self, widget: QWidget) -> QWidget:
+        """Wrap a tab page in a QScrollArea so content scrolls instead of stretching."""
+        from PyQt5.QtWidgets import QScrollArea, QWidget, QVBoxLayout
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.NoFrame)
+        scroll.setWidget(widget)
+
+        layout.addWidget(scroll)
+        return container
+
     def update_layer_list(self):
         """扫描画布，更新图层列表"""
         if not self.canvas:
@@ -394,8 +591,8 @@ class RightPanel(QWidget):
                 used_colors.add(color.name().upper())
 
         # 2. 同步数据：新增的颜色初始化参数，未使用的颜色保留（或标记为未使用，这里简化为只显示使用的或全部预设的）
-        # “支持>=20个图层”，通常意味着所有20个预设颜色都应该能被管理，或者动态管理。
-        # 只显示 used_colors。
+        # 需求说“支持>=20个图层”，通常意味着所有20个预设颜色都应该能被管理，或者动态管理。
+        # 为了符合截图“只显示已使用”的惯例，我们这里只显示 used_colors。
         
         # 确保 layer_data 中有这些颜色的数据
         for hex_color in used_colors:
@@ -425,18 +622,16 @@ class RightPanel(QWidget):
             # 如果有自定义名称显示名称，否则显示颜色代码
             display_name = params.name if params.name else hex_color
             color_item = QTableWidgetItem(display_name)
-            
-            # 使用图标显示颜色，而不是背景，以避免选中时背景色被覆盖
-            pixmap = QPixmap(16, 16)
-            pixmap.fill(QColor(hex_color))
-            color_item.setIcon(QIcon(pixmap))
-            
-            # 移除自定义前景色设置，让其跟随系统或样式表（选中时反色）
-            # c = QColor(hex_color)
-            # if c.lightness() < 128:
-            #     color_item.setForeground(QColor(255, 255, 255))
-            # else:
-            #     color_item.setForeground(QColor(0, 0, 0))
+            # 设置颜色块作为图标或背景
+            # 这里用背景色表示颜色直观
+            color_item.setBackground(QColor(hex_color))
+            # 字体颜色根据背景深浅调整，或者加个描边？这里简单处理：
+            # 如果背景太深，字变白
+            c = QColor(hex_color)
+            if c.lightness() < 128:
+                color_item.setForeground(QColor(255, 255, 255))
+            else:
+                color_item.setForeground(QColor(0, 0, 0))
                 
             color_item.setData(Qt.UserRole, hex_color) # 存储颜色key
             self.layer_table.setItem(row, 0, color_item)
@@ -548,497 +743,71 @@ class RightPanel(QWidget):
             self.update_layer_list()
 
     def show_layer_properties_dialog(self, params):
-        """显示图层属性对话框 (完全重写以匹配截图)"""
-        from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QGridLayout, QListWidget, QListWidgetItem, QFrame
+        """显示图层属性对话框"""
+        from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox
         
         dlg = QDialog(self)
-        dlg.setWindowTitle("图层参数")
-        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)  # 移除问号按钮
-        dlg.resize(650, 480)
+        dlg.setWindowTitle("图层参数设置")
+        layout = QVBoxLayout(dlg)
         
-        dlg.setStyleSheet("""
-            QDialog { background-color: #f5f5f5; color: black; }
-            QLabel { color: black; background-color: transparent; }
-            QCheckBox { color: black; background-color: transparent; }
-            QGroupBox { color: black; background-color: transparent; font-weight: bold; }
-            QComboBox { 
-                background-color: white; 
-                color: black; 
-                border: 1px solid #ccc;
-                padding: 2px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: white;
-                color: black;
-                selection-background-color: #0078d7;
-                selection-color: white;
-                outline: 0px;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox {
-                background-color: white;
-                color: black;
-                border: 1px solid #ccc;
-            }
-            QPushButton {
-                color: black;
-                background-color: #e0e0e0;
-                border: 1px solid #ccc;
-            }
-            QPushButton:hover {
-                background-color: #d0d0d0;
-            }
-            QPushButton:pressed {
-                background-color: #c0c0c0;
-            }
-            
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #999;
-                border-radius: 2px;
-                background-color: white;
-            }
-            QCheckBox::indicator:checked {
-                image: url(none); /* Remove default check image if needed, or keep it */
-                background-color: white;
-                border: 1px solid #000;
-            }
-            /* Custom check mark */
-            QCheckBox::indicator:checked::image {
-                /* Can't easily draw a checkmark with pure CSS without image, use primitive text or image file.
-                   Let's assume default indicator behavior is fine but just style the box. 
-                   Wait, user asked for 'enclosed in a small square'. 
-                   Default is already a square. Maybe they want a distinct look.
-                */
-            }
-            
-            QLineEdit[readOnly="true"], QSpinBox[readOnly="true"], QDoubleSpinBox[readOnly="true"] {
-                background-color: #A0A0A0; /* Dark gray for disabled */
-                color: #555;
-            }
-            /* When using setEnabled(False), Qt sets disabled state automatically. */
-            QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
-                background-color: #A0A0A0;
-                color: #333;
-                border: 1px solid #888;
-            }
-            /* Ensure the indicator is visible */
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #555;
-                background-color: white;
-            }
-            QCheckBox::indicator:checked {
-                background-color: white;
-                border: 1px solid #000;
-                image: url(:/qt-project.org/styles/commonstyle/images/standardbutton-apply-16.png); /* Fallback or rely on standard check */
-            }
-            
-            QListWidget {
-                background-color: white;
-                border: 1px solid #ccc;
-            }
-        """)
+        form = QFormLayout()
         
-        # 主布局：水平 (左侧列表 + 右侧内容)
-        main_h_layout = QHBoxLayout(dlg)
-        main_h_layout.setContentsMargins(5, 5, 5, 5)
-        main_h_layout.setSpacing(5)
+        # 模式
+        mode_combo = QComboBox()
+        mode_combo.addItems(["激光切割", "激光扫描", "笔式绘图"])
+        mode_combo.setCurrentText(params.mode)
+        form.addRow("处理模式:", mode_combo)
         
-        # 1. 左侧颜色列表 (Visual only for now, populated with current layer colors)
-        color_list = QListWidget()
-        color_list.setFixedWidth(50) # 稍微加宽以容纳滚动条
-        # 允许垂直滚动条自动出现
-        color_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        color_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # 确保列表项可见
-        color_list.setStyleSheet("""
-            QListWidget::item {
-                border: 1px solid #ccc;
-                margin: 1px;
-            }
-            QListWidget::item:selected {
-                border: 2px solid #000;
-            }
-        """)
+        # 输出/显示
+        output_check = QCheckBox("输出")
+        output_check.setChecked(params.is_output)
+        form.addRow("", output_check)
         
-        # 填充颜色列表（模拟截图左侧）
-        # 这里简单列出所有图层颜色
-        sorted_colors = sorted(list(self.layer_data.keys()))
-        for hex_color in sorted_colors:
-            item = QListWidgetItem()
-            # 使用图标显示颜色
-            pixmap = QPixmap(20, 20)
-            pixmap.fill(QColor(hex_color))
-            item.setIcon(QIcon(pixmap))
-            
-            # 设置尺寸提示，确保列表项有足够高度
-            item.setSizeHint(QSize(40, 30))
-            
-            # 允许选中
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            
-            # 存储颜色数据
-            item.setData(Qt.UserRole, hex_color)
-            
-            color_list.addItem(item)
-            # 如果是当前 params 的颜色，选中
-            if hex_color == params.color.name().upper():
-                item.setSelected(True)
-                
-        main_h_layout.addWidget(color_list)
+        visible_check = QCheckBox("显示")
+        visible_check.setChecked(params.is_visible)
+        form.addRow("", visible_check)
         
-        # 2. 右侧主要内容区域 (垂直布局：上部内容 + 底部按钮)
-        right_content_widget = QWidget()
-        right_content_layout = QVBoxLayout(right_content_widget)
-        right_content_layout.setContentsMargins(0, 0, 0, 0)
-        right_content_layout.setSpacing(10)
+        # 扫描设置
+        scan_mode_combo = QComboBox()
+        scan_mode_combo.addItems(["水平单向", "水平双向", "垂直单向", "垂直双向"])
+        scan_mode_combo.setCurrentText(params.scan_mode)
+        form.addRow("扫描方式:", scan_mode_combo)
         
-        # --- 顶部：从参数库取参数按钮 ---
-        top_btn_layout = QHBoxLayout()
-        # 使用 QGroupBox 模拟统一的边框风格
-        param_lib_frame = QGroupBox()
-        param_lib_frame.setStyleSheet("QGroupBox { border: 1px solid #d0d0d0; border-radius: 4px; margin-top: 0px; }")
-        param_lib_layout = QVBoxLayout(param_lib_frame)
-        param_lib_layout.setContentsMargins(0, 10, 0, 10) # 上下留白
+        scan_interval_spin = QDoubleSpinBox()
+        scan_interval_spin.setRange(0.001, 100.0)
+        scan_interval_spin.setDecimals(3)
+        scan_interval_spin.setSingleStep(0.01)
+        scan_interval_spin.setValue(params.scan_interval)
+        form.addRow("扫描间隔(mm):", scan_interval_spin)
         
-        lib_btn = QPushButton("从参数库取参数")
-        lib_btn.setFixedWidth(150)
-        lib_btn.setMinimumHeight(30)
-        lib_btn.clicked.connect(lambda: self.show_parameter_library(dlg, params))
+        # 锁定与重命名
+        locked_check = QCheckBox("锁定图层")
+        locked_check.setChecked(params.is_locked)
+        form.addRow("", locked_check)
         
-        # 居中放置按钮
-        btn_center_layout = QHBoxLayout()
-        btn_center_layout.addStretch()
-        btn_center_layout.addWidget(lib_btn)
-        btn_center_layout.addStretch()
-        
-        param_lib_layout.addLayout(btn_center_layout)
-        right_content_layout.addWidget(param_lib_frame)
-        
-        # --- 中间两列布局 ---
-        middle_layout = QHBoxLayout()
-        
-        # === 左栏 (基本参数 + 功率) ===
-        left_col = QWidget()
-        left_col_layout = QVBoxLayout(left_col)
-        left_col_layout.setContentsMargins(0, 0, 0, 0)
-        left_col_layout.setSpacing(5)
-        
-        # 表单区域
-        form_layout = QGridLayout()
-        form_layout.setSpacing(6)
-        
-        # 图层
-        form_layout.addWidget(QLabel("图层:"), 0, 0, Qt.AlignRight)
-        color_label = QLabel()
-        color_label.setFixedSize(80, 20)
-        color_label.setStyleSheet(f"background-color: {params.color.name()}; border: 1px solid #888;")
-        form_layout.addWidget(color_label, 0, 1)
-        
-        # 是否输出
-        form_layout.addWidget(QLabel("是否输出:"), 1, 0, Qt.AlignRight)
-        self.output_combo = QComboBox()
-        self.output_combo.addItems(["是", "否"])
-        self.output_combo.setCurrentText("是" if params.is_output else "否")
-        form_layout.addWidget(self.output_combo, 1, 1)
-        
-        # 速度
-        form_layout.addWidget(QLabel("速度(mm/s):"), 2, 0, Qt.AlignRight)
-        self.speed_spin = QDoubleSpinBox()
-        self.speed_spin.setRange(0, 10000)
-        self.speed_spin.setValue(params.speed)
-        form_layout.addWidget(self.speed_spin, 2, 1)
-        self.speed_default_check = QCheckBox("默认")
-        self.speed_default_check.setChecked(params.is_speed_default)
-        form_layout.addWidget(self.speed_default_check, 2, 2)
-        
-        # 重复加工次数
-        form_layout.addWidget(QLabel("重复加工次数:"), 3, 0, Qt.AlignRight)
-        self.repeat_spin = QSpinBox()
-        self.repeat_spin.setRange(1, 100)
-        self.repeat_spin.setValue(params.repeat_count)
-        form_layout.addWidget(self.repeat_spin, 3, 1)
-        self.repeat_default_check = QCheckBox() # 只有checkbox没有文字？截图看起来像
-        self.repeat_default_check.setChecked(params.is_repeat_default)
-        form_layout.addWidget(self.repeat_default_check, 3, 2)
-        
-        # 加工方式
-        form_layout.addWidget(QLabel("加工方式:"), 4, 0, Qt.AlignRight)
-        self.mode_combo = QComboBox()
-        modes = ["激光切割", "激光扫描", "激光打孔", "画笔功能"]
-        self.mode_combo.addItems(modes)
-        if params.mode in modes:
-            self.mode_combo.setCurrentText(params.mode)
-        else:
-            if params.mode == "笔式绘图":
-                 self.mode_combo.setCurrentText("画笔功能")
-            else:
-                 self.mode_combo.setCurrentText("激光切割")
-        form_layout.addWidget(self.mode_combo, 4, 1)
-        adv_btn1 = QPushButton("高级...")
-        adv_btn1.setMaximumWidth(60) # 限制宽度
-        adv_btn1.clicked.connect(lambda: self.show_advanced_layer_settings(dlg, params))
-        form_layout.addWidget(adv_btn1, 4, 2)
-        
-        # 是否吹气
-        form_layout.addWidget(QLabel("是否吹气:"), 5, 0, Qt.AlignRight)
-        self.blow_combo = QComboBox()
-        self.blow_combo.addItems(["是", "否"])
-        self.blow_combo.setCurrentText("是" if params.is_blowing else "否")
-        form_layout.addWidget(self.blow_combo, 5, 1)
-        
-        left_col_layout.addLayout(form_layout)
-        
-        # 功率组 (6行)
-        power_group = QGroupBox() # 无标题，或者内部画线
-        power_group_layout = QGridLayout(power_group)
-        power_group_layout.setContentsMargins(5, 5, 5, 5)
-        power_group_layout.setVerticalSpacing(2)
-        
-        # 标题行
-        power_group_layout.addWidget(QLabel("最小功率(%)"), 0, 1)
-        power_group_layout.addWidget(QLabel("最大功率(%)"), 0, 2)
-        
-        self.power_widgets = [] # 存储控件引用 [(check, min, max), ...]
-        
-        for i in range(6):
-            check = QCheckBox(f"{i+1}:")
-            min_spin = QDoubleSpinBox()
-            min_spin.setRange(0, 100)
-            max_spin = QDoubleSpinBox()
-            max_spin.setRange(0, 100)
-            
-            # 读取数据
-            p_data = params.powers[i]
-            check.setChecked(p_data['enabled'])
-            min_spin.setValue(p_data['min'])
-            max_spin.setValue(p_data['max'])
-            
-            # 兼容旧数据：如果是激光1或2，使用旧字段初始化（如果尚未正确初始化）
-            if i == 0 and params.min_power != 30.0: # 假设被修改过
-                 min_spin.setValue(params.min_power)
-                 max_spin.setValue(params.max_power)
-            
-            power_group_layout.addWidget(check, i+1, 0)
-            power_group_layout.addWidget(min_spin, i+1, 1)
-            power_group_layout.addWidget(max_spin, i+1, 2)
-            
-            self.power_widgets.append((check, min_spin, max_spin))
-            
-        # 默认复选框 (在右下角)
-        self.power_default_check = QCheckBox("默认")
-        self.power_default_check.setChecked(params.is_power_default)
-        power_group_layout.addWidget(self.power_default_check, 7, 2, Qt.AlignRight)
-        
-        left_col_layout.addWidget(power_group)
-        left_col_layout.addStretch() # 顶上去
-        
-        middle_layout.addWidget(left_col)
-        
-        # === 右栏 (高级 + 打穿) ===
-        right_col = QWidget()
-        right_col_layout = QVBoxLayout(right_col)
-        right_col_layout.setContentsMargins(0, 0, 0, 0)
-        right_col_layout.setSpacing(5)
-        
-        # 顶部高级设置框
-        adv_frame = QGroupBox()
-        adv_layout = QGridLayout(adv_frame)
-        
-        # 封口
-        adv_layout.addWidget(QLabel("封口:"), 0, 0, Qt.AlignRight)
-        self.seal_spin = QDoubleSpinBox()
-        self.seal_spin.setRange(0, 10.0)
-        self.seal_spin.setDecimals(3)
-        self.seal_spin.setValue(params.seal_length)
-        adv_layout.addWidget(self.seal_spin, 0, 1)
-        adv_layout.addWidget(QLabel("mm"), 0, 2)
-        adv_btn2 = QPushButton("高级...")
-        adv_btn2.clicked.connect(lambda: self.show_seal_advanced_settings(dlg, params))
-        adv_layout.addWidget(adv_btn2, 0, 3)
-        
-        # 延时
-        adv_layout.addWidget(QLabel("激光开延时:"), 1, 0, Qt.AlignRight)
-        self.on_delay_spin = QSpinBox()
-        self.on_delay_spin.setRange(0, 10000)
-        self.on_delay_spin.setValue(params.laser_on_delay)
-        adv_layout.addWidget(self.on_delay_spin, 1, 1)
-        adv_layout.addWidget(QLabel("ms"), 1, 2)
-        
-        adv_layout.addWidget(QLabel("激光关延时:"), 2, 0, Qt.AlignRight)
-        self.off_delay_spin = QSpinBox()
-        self.off_delay_spin.setRange(0, 10000)
-        self.off_delay_spin.setValue(params.laser_off_delay)
-        adv_layout.addWidget(self.off_delay_spin, 2, 1)
-        adv_layout.addWidget(QLabel("ms"), 2, 2)
-        
-        right_col_layout.addWidget(adv_frame)
-        
-        # 激光打穿模式组
-        through_group = QGroupBox("激光打穿模式")
-        through_group.setCheckable(True)
-        through_group.setChecked(params.is_through_mode)
-        # 样式微调，确保标题和checkbox对齐
-        through_group.setStyleSheet("QGroupBox::title { subcontrol-origin: margin; left: 20px; padding: 0 3px; }")
-        
-        through_layout = QGridLayout(through_group)
-        through_layout.setContentsMargins(5, 10, 5, 5) # 顶部留出标题空间
-        
-        self.through_widgets = [] # 存储控件引用
-        for i in range(6):
-            through_layout.addWidget(QLabel(f"打穿功率{i+1}:"), i, 0, Qt.AlignRight)
-            spin = QDoubleSpinBox()
-            spin.setRange(0, 100)
-            spin.setValue(params.through_powers[i])
-            through_layout.addWidget(spin, i, 1)
-            through_layout.addWidget(QLabel("%"), i, 2)
-            self.through_widgets.append(spin)
-            
-        right_col_layout.addWidget(through_group)
-        right_col_layout.addStretch()
-        
-        middle_layout.addWidget(right_col)
-        
-        right_content_layout.addLayout(middle_layout)
-        
-        # --- 底部 ---
-        bottom_row = QHBoxLayout()
-        bottom_sync_check = QCheckBox("修改激光参数自动同步到各路激光")
-        bottom_sync_check.setChecked(True) # 默认勾选
-        bottom_row.addWidget(bottom_sync_check)
-        bottom_row.addStretch()
-        
-        btn_apply = QPushButton("应用到同类图层")
-        btn_ok = QPushButton("确定")
-        btn_cancel = QPushButton("取消")
-        
-        bottom_row.addWidget(btn_apply)
-        bottom_row.addWidget(btn_ok)
-        bottom_row.addWidget(btn_cancel)
-        
-        right_content_layout.addLayout(bottom_row)
-        
-        main_h_layout.addWidget(right_content_widget, 1)
-        
-        # 联动逻辑：状态控制 (Checked = Disabled/Locked)
-        def update_input_state(checkbox, widgets):
-            is_locked = checkbox.isChecked()
-            # If Checked (Locked) -> Disable inputs
-            # If Unchecked (Unlocked) -> Enable inputs
-            for w in widgets:
-                w.setEnabled(not is_locked)
-        
-        # 1. Speed Default
-        self.speed_default_check.stateChanged.connect(
-            lambda: update_input_state(self.speed_default_check, [self.speed_spin]))
-        # Initialize state
-        update_input_state(self.speed_default_check, [self.speed_spin])
-            
-        # 2. Repeat Default
-        self.repeat_default_check.stateChanged.connect(
-            lambda: update_input_state(self.repeat_default_check, [self.repeat_spin]))
-        update_input_state(self.repeat_default_check, [self.repeat_spin])
-        
-        # 3. Power Default -> Lock ALL power inputs? Or just imply global default? 
-        # Usually default implies "don't edit here".
-        # Let's link it to all power spins? No, that conflicts with individual laser checks.
-        # Maybe it disables the checkboxes themselves?
-        # User said "All checkboxes".
-        # Let's apply it to the Power Default checkbox itself first (maybe it locks everything?)
-        # For now, let's leave Power Default as just a flag, unless it has specific targets.
-        
-        # 4. Laser 1..6 Checkboxes -> Lock individual rows
-        for i in range(6):
-            check, min_sp, max_sp = self.power_widgets[i]
-            # Use closure default arg to capture current variables
-            check.stateChanged.connect(
-                lambda state, c=check, w1=min_sp, w2=max_sp: update_input_state(c, [w1, w2]))
-            # Initialize
-            update_input_state(check, [min_sp, max_sp])
+        name_edit = QLineEdit(params.name)
+        form.addRow("图层名称:", name_edit)
 
-        # 信号连接
-        btn_ok.clicked.connect(dlg.accept)
-        btn_cancel.clicked.connect(dlg.reject)
+        layout.addLayout(form)
         
-        def apply_to_similar_layers():
-            # 获取当前模式
-            current_mode = self.mode_combo.currentText()
-            count = 0
-            for p in self.layer_data.values():
-                if p.mode == current_mode:
-                    # 复制参数 (这里简单处理，实际可能需要深拷贝或字段逐一复制)
-                    # 为避免引用问题，只复制数值
-                    p.is_output = (self.output_combo.currentText() == "是")
-                    p.speed = self.speed_spin.value()
-                    # ... 其他参数复制 ...
-                    # 由于参数较多，这里仅作为演示提示
-                    count += 1
-            self.show_info_message(dlg, f"已应用到 {count} 个同类图层 (模拟)")
-            
-        btn_apply.clicked.connect(apply_to_similar_layers)
-        
-        # 联动逻辑：同步参数
-        def sync_laser_params(source_idx, is_min):
-            if not bottom_sync_check.isChecked():
-                return
-            src_spin = self.power_widgets[source_idx][1] if is_min else self.power_widgets[source_idx][2]
-            val = src_spin.value()
-            
-            for i in range(6):
-                if i == source_idx: continue
-                target_spin = self.power_widgets[i][1] if is_min else self.power_widgets[i][2]
-                target_spin.blockSignals(True)
-                target_spin.setValue(val)
-                target_spin.blockSignals(False)
-                
-        # 绑定同步信号
-        for i in range(6):
-            _, min_sp, max_sp = self.power_widgets[i]
-            # lambda capture fix
-            min_sp.valueChanged.connect(lambda v, idx=i: sync_laser_params(idx, True))
-            max_sp.valueChanged.connect(lambda v, idx=i: sync_laser_params(idx, False))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
         
         if dlg.exec_() == QDialog.Accepted:
-            # 保存基础参数
-            params.mode = self.mode_combo.currentText()
-            params.is_output = (self.output_combo.currentText() == "是")
-            params.speed = self.speed_spin.value()
-            params.is_speed_default = self.speed_default_check.isChecked()
-            params.repeat_count = self.repeat_spin.value()
-            params.is_repeat_default = self.repeat_default_check.isChecked()
-            params.is_blowing = (self.blow_combo.currentText() == "是")
-            
-            params.is_power_default = self.power_default_check.isChecked()
-            
-            # 保存多路激光参数
-            for i in range(6):
-                check, min_sp, max_sp = self.power_widgets[i]
-                params.powers[i]['enabled'] = check.isChecked()
-                params.powers[i]['min'] = min_sp.value()
-                params.powers[i]['max'] = max_sp.value()
-            
-            # 兼容旧字段 (使用第1路的数值作为主显示)
-            if params.powers[0]['enabled']:
-                params.min_power = params.powers[0]['min']
-                params.max_power = params.powers[0]['max']
-            
-            # 保存高级参数
-            params.seal_length = self.seal_spin.value()
-            params.laser_on_delay = self.on_delay_spin.value()
-            params.laser_off_delay = self.off_delay_spin.value()
-            
-            # 保存打穿模式
-            params.is_through_mode = through_group.isChecked()
-            for i in range(6):
-                params.through_powers[i] = self.through_widgets[i].value()
+            params.mode = mode_combo.currentText()
+            params.is_output = output_check.isChecked()
+            params.is_visible = visible_check.isChecked()
+            params.scan_mode = scan_mode_combo.currentText()
+            params.scan_interval = scan_interval_spin.value()
+            params.is_locked = locked_check.isChecked()
+            params.name = name_edit.text()
             
             # 应用状态到画布
             self.apply_layer_state(params)
-            # 刷新列表显示
+            # 刷新列表显示（更新名称、锁定状态等）
             self.update_layer_list()
-
 
     def apply_layer_state(self, params):
         """应用图层状态（可见性、锁定等）"""
@@ -1099,568 +868,7 @@ class RightPanel(QWidget):
     def on_laser_btn_click(self, laser_num):
         print(f"切换到激光{laser_num}")
 
-    def show_info_message(self, parent, text):
-        from PyQt5.QtWidgets import QMessageBox
-        QMessageBox.information(parent, "提示", text)
 
-    def show_parameter_library(self, parent, params):
-        """显示从参数库取参数对话框"""
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                     QLabel, QComboBox, QListWidget, QTextEdit)
-        
-        dlg = QDialog(parent)
-        dlg.setWindowTitle("从参数库取参数")
-        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)  # 移除问号按钮
-        dlg.resize(480, 500)
-        
-        dlg.setStyleSheet("""
-            QDialog { background-color: #e8e8e8; color: black; }
-            QLabel { color: black; font-size: 9pt; }
-            QComboBox, QListWidget, QTextEdit {
-                background-color: white;
-                color: black;
-                border: 1px solid #7f7f7f;
-            }
-            QPushButton {
-                color: black;
-                background-color: #d4d4d4;
-                border: 1px solid #7f7f7f;
-                padding: 5px 15px;
-            }
-            QPushButton:hover {
-                background-color: #c0c0c0;
-            }
-        """)
-        
-        main_layout = QVBoxLayout(dlg)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
-        
-        # 上部：左右分栏
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(8)
-        
-        # === 左侧列 ===
-        left_layout = QVBoxLayout()
-        
-        # 参数库下拉框
-        lib_label_layout = QHBoxLayout()
-        lib_label_layout.addWidget(QLabel("参数库:"))
-        lib_label_layout.addStretch()
-        left_layout.addLayout(lib_label_layout)
-        
-        lib_combo = QComboBox()
-        lib_combo.setMinimumHeight(25)
-        left_layout.addWidget(lib_combo)
-        
-        # 参数库列表
-        lib_list = QListWidget()
-        lib_list.setMinimumHeight(300)
-        left_layout.addWidget(lib_list)
-        
-        top_layout.addLayout(left_layout, 1)
-        
-        # === 右侧列 ===
-        right_layout = QVBoxLayout()
-        
-        # 参数详情显示区域
-        detail_area = QTextEdit()
-        detail_area.setReadOnly(True)
-        detail_area.setMinimumHeight(300)
-        right_layout.addWidget(detail_area)
-        
-        # 右侧按钮
-        save_btn = QPushButton("另存当前参数")
-        save_btn.setMinimumHeight(30)
-        right_layout.addWidget(save_btn)
-        
-        delete_btn = QPushButton("删除选定参数")
-        delete_btn.setMinimumHeight(30)
-        right_layout.addWidget(delete_btn)
-        
-        top_layout.addLayout(right_layout, 1)
-        
-        main_layout.addLayout(top_layout)
-        
-        # === 底部按钮 ===
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addStretch()
-        
-        load_btn = QPushButton("载入参数")
-        load_btn.setMinimumWidth(80)
-        load_btn.setMinimumHeight(30)
-        bottom_layout.addWidget(load_btn)
-        
-        exit_btn = QPushButton("退出")
-        exit_btn.setMinimumWidth(80)
-        exit_btn.setMinimumHeight(30)
-        bottom_layout.addWidget(exit_btn)
-        
-        main_layout.addLayout(bottom_layout)
-        
-        # 信号连接
-        exit_btn.clicked.connect(dlg.reject)
-        load_btn.clicked.connect(dlg.accept)
-        
-        # 显示对话框
-        if dlg.exec_() == QDialog.Accepted:
-            # 载入选定的参数
-            pass
-    
-    def show_seal_advanced_settings(self, parent, params):
-        """显示其他切割参数对话框（封口高级设置）"""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QCheckBox, QPushButton, QDoubleSpinBox, QLabel
-        
-        dlg = QDialog(parent)
-        dlg.setWindowTitle("其他切割参数")
-        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)  # 移除问号按钮
-        dlg.resize(320, 180)
-        
-        dlg.setStyleSheet("""
-            QDialog { background-color: #e8e8e8; color: black; }
-            QLabel { color: black; font-size: 9pt; }
-            QCheckBox { color: black; font-size: 9pt; }
-            QDoubleSpinBox {
-                background-color: white;
-                color: black;
-                border: 1px solid #7f7f7f;
-                padding: 2px;
-            }
-            QPushButton {
-                color: black;
-                background-color: #d4d4d4;
-                border: 1px solid #7f7f7f;
-                padding: 5px 15px;
-                min-width: 60px;
-            }
-            QPushButton:hover {
-                background-color: #c0c0c0;
-            }
-            QGroupBox {
-                background-color: #f0f0f0;
-                border: 1px solid #a0a0a0;
-                border-radius: 0px;
-                margin-top: 10px;
-                padding: 15px;
-            }
-        """)
-        
-        main_layout = QVBoxLayout(dlg)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(15)
-        
-        # 使能缝宽补偿
-        buffer_check = QCheckBox("使能缝宽补偿")
-        main_layout.addWidget(buffer_check)
-        
-        # 补偿宽度
-        from PyQt5.QtWidgets import QGroupBox
-        content_group = QGroupBox()
-        content_layout = QVBoxLayout(content_group)
-        content_layout.setContentsMargins(10, 10, 10, 10)
-        
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("补偿宽度"))
-        width_spin = QDoubleSpinBox()
-        width_spin.setRange(0, 100)
-        width_spin.setValue(0.1)
-        width_spin.setDecimals(1)
-        width_spin.setFixedWidth(100)
-        width_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        width_layout.addWidget(width_spin)
-        width_layout.addWidget(QLabel("mm"))
-        width_layout.addStretch()
-        
-        content_layout.addLayout(width_layout)
-        main_layout.addWidget(content_group)
-        
-        main_layout.addStretch()
-        
-        # 底部按钮
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        confirm_btn = QPushButton("确定")
-        cancel_btn = QPushButton("取消")
-        button_layout.addWidget(confirm_btn)
-        button_layout.addWidget(cancel_btn)
-        
-        main_layout.addLayout(button_layout)
-        
-        # 信号连接
-        confirm_btn.clicked.connect(dlg.accept)
-        cancel_btn.clicked.connect(dlg.reject)
-        
-        # 显示对话框
-        if dlg.exec_() == QDialog.Accepted:
-            # 保存参数
-            pass
-    
-    def show_advanced_layer_settings(self, parent, params):
-        """显示其他图层参数对话框（高级设置）- 完全按照原始UI"""
-        from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QGridLayout, QListWidget, QListWidgetItem, QFrame, QButtonGroup
-        
-        dlg = QDialog(parent)
-        dlg.setWindowTitle("其他图层参数")
-        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)  # 移除问号按钮
-        dlg.resize(620, 660)
-        
-        dlg.setStyleSheet("""
-            QDialog { background-color: #e8e8e8; color: black; }
-            QLabel { color: black; background-color: transparent; font-size: 9pt; }
-            QCheckBox { 
-                color: black; 
-                font-size: 9pt;
-                spacing: 5px;
-            }
-            QRadioButton { 
-                color: black; 
-                font-size: 9pt;
-                spacing: 5px;
-            }
-            QGroupBox { 
-                color: black; 
-                background-color: #f0f0f0; 
-                font-weight: normal;
-                border: 1px solid #a0a0a0;
-                border-radius: 0px;
-                margin-top: 0px;
-                padding: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 3px;
-                font-weight: bold;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox {
-                background-color: white;
-                color: black;
-                border: 1px solid #7f7f7f;
-                padding: 2px;
-            }
-            QPushButton {
-                color: black;
-                background-color: #d4d4d4;
-                border: 1px solid #7f7f7f;
-                padding: 5px 15px;
-            }
-            QPushButton:hover {
-                background-color: #c0c0c0;
-            }
-            QFrame[frameShape="4"] {
-                color: #a0a0a0;
-                max-height: 1px;
-            }
-        """)
-        
-        # 主布局
-        main_layout = QVBoxLayout(dlg)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
-        
-        # === 上部：左右两列（GroupBox） ===
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(8)
-        
-        # === 左侧 GroupBox ===
-        left_group = QGroupBox()
-        left_vlayout = QVBoxLayout(left_group)
-        left_vlayout.setContentsMargins(10, 10, 10, 10)
-        left_vlayout.setSpacing(5)
-        
-        # 单选按钮组
-        radio_group = QButtonGroup(dlg)
-        
-        # 按图层抬笔落 (单选)
-        layer_radio = QRadioButton("按图层抬笔落")
-        layer_radio.setChecked(True)
-        radio_group.addButton(layer_radio)
-        left_vlayout.addWidget(layer_radio)
-        
-        # 图层整体抬落 (缩进的复选框，默认浅灰色)
-        indent1 = QHBoxLayout()
-        indent1.addSpacing(25)
-        layer_overall_check = QCheckBox("图层整体抬落")
-        layer_overall_check.setStyleSheet("color: #999;")  # 浅灰色
-        indent1.addWidget(layer_overall_check)
-        indent1.addStretch()
-        left_vlayout.addLayout(indent1)
-        
-        # 按整笔抬笔落 (单选，与上面对齐)
-        overall_radio = QRadioButton("按整笔抬笔落")
-        radio_group.addButton(overall_radio)
-        left_vlayout.addWidget(overall_radio)
-        
-        # 分隔线1
-        line1 = QFrame()
-        line1.setFrameShape(QFrame.HLine)
-        line1.setFrameShadow(QFrame.Sunken)
-        left_vlayout.addWidget(line1)
-        
-        # 抬落笔使能(U轴)
-        offset_check = QCheckBox("抬落笔使能(U轴)")
-        left_vlayout.addWidget(offset_check)
-        
-        # 落笔位置 (缩进，带复选框，默认浅灰色)
-        first_layout = QHBoxLayout()
-        first_layout.addSpacing(25)
-        first_check = QCheckBox("落笔位置")
-        first_check.setStyleSheet("color: #999;")  # 浅灰色
-        first_layout.addWidget(first_check)
-        first_spin = QDoubleSpinBox()
-        first_spin.setRange(-10000, 10000)
-        first_spin.setValue(0.0)
-        first_spin.setDecimals(3)
-        first_spin.setFixedWidth(100)
-        first_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        first_layout.addWidget(first_spin)
-        first_layout.addWidget(QLabel("mm"))
-        first_layout.addStretch()
-        left_vlayout.addLayout(first_layout)
-        
-        # 抬笔位置 (缩进，带复选框，与速度上下对齐，默认浅灰色)
-        after_layout = QHBoxLayout()
-        after_layout.addSpacing(25)
-        after_check = QCheckBox("抬笔位置")
-        after_check.setStyleSheet("color: #999;")  # 浅灰色
-        after_layout.addWidget(after_check)
-        after_spin = QDoubleSpinBox()
-        after_spin.setRange(-10000, 10000)
-        after_spin.setValue(0.0)
-        after_spin.setDecimals(3)
-        after_spin.setFixedWidth(100)
-        after_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        after_layout.addWidget(after_spin)
-        after_layout.addWidget(QLabel("mm"))
-        after_layout.addStretch()
-        left_vlayout.addLayout(after_layout)
-        
-        # 分隔线2
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.HLine)
-        line2.setFrameShadow(QFrame.Sunken)
-        left_vlayout.addWidget(line2)
-        
-        # 速度 (与抬笔位置上下对齐)
-        speed_layout = QHBoxLayout()
-        speed_layout.addSpacing(25)
-        speed_layout.addWidget(QLabel("速度(mm/s)"))
-        speed_spin = QDoubleSpinBox()
-        speed_spin.setRange(0, 10000)
-        speed_spin.setValue(100.0)
-        speed_spin.setFixedWidth(100)
-        speed_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        speed_layout.addWidget(speed_spin)
-        speed_layout.addStretch()
-        left_vlayout.addLayout(speed_layout)
-        
-        # 分隔线3
-        line3 = QFrame()
-        line3.setFrameShape(QFrame.HLine)
-        line3.setFrameShadow(QFrame.Sunken)
-        left_vlayout.addWidget(line3)
-        
-        # XY偏移
-        xy_check = QCheckBox("XY偏移:")
-        left_vlayout.addWidget(xy_check)
-        
-        # XY偏移值 (缩进)
-        xy_layout = QHBoxLayout()
-        xy_layout.addSpacing(25)
-        xy_spin1 = QDoubleSpinBox()
-        xy_spin1.setRange(-10000, 10000)
-        xy_spin1.setValue(0.0)
-        xy_spin1.setDecimals(3)
-        xy_spin1.setFixedWidth(100)
-        xy_spin1.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        xy_layout.addWidget(xy_spin1)
-        xy_spin2 = QDoubleSpinBox()
-        xy_spin2.setRange(-10000, 10000)
-        xy_spin2.setValue(0.0)
-        xy_spin2.setDecimals(3)
-        xy_spin2.setFixedWidth(100)
-        xy_spin2.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        xy_layout.addWidget(xy_spin2)
-        xy_layout.addStretch()
-        left_vlayout.addLayout(xy_layout)
-        
-        # 分隔线4
-        line4 = QFrame()
-        line4.setFrameShape(QFrame.HLine)
-        line4.setFrameShadow(QFrame.Sunken)
-        left_vlayout.addWidget(line4)
-        
-        # U轴位置 (复选框和输入框在同一行，不缩进)
-        u_pos_layout = QHBoxLayout()
-        u_pos_check = QCheckBox("U轴位置:")
-        u_pos_layout.addWidget(u_pos_check)
-        u_pos_spin = QDoubleSpinBox()
-        u_pos_spin.setRange(-10000, 10000)
-        u_pos_spin.setValue(0.0)
-        u_pos_spin.setDecimals(3)
-        u_pos_spin.setFixedWidth(100)
-        u_pos_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        u_pos_layout.addWidget(u_pos_spin)
-        u_pos_read_btn = QPushButton("读取")
-        u_pos_read_btn.setFixedWidth(60)
-        u_pos_read_btn.setMinimumHeight(25)
-        u_pos_read_btn.setVisible(False)  # 默认隐藏
-        u_pos_layout.addWidget(u_pos_read_btn)
-        u_pos_layout.addStretch()
-        left_vlayout.addLayout(u_pos_layout)
-        
-        # U轴相对移动 (复选框缩进一层，默认浅灰色)
-        u_check_layout = QHBoxLayout()
-        u_check_layout.addSpacing(25)
-        u_check = QCheckBox("U轴相对移动")
-        u_check.setStyleSheet("color: #999;")  # 浅灰色
-        u_check_layout.addWidget(u_check)
-        u_check_layout.addStretch()
-        left_vlayout.addLayout(u_check_layout)
-        
-        # U轴相对移动值 (再缩进一层)
-        u_layout = QHBoxLayout()
-        u_layout.addSpacing(50)
-        u_spin = QDoubleSpinBox()
-        u_spin.setRange(-10000, 10000)
-        u_spin.setValue(0.0)
-        u_spin.setDecimals(3)
-        u_spin.setFixedWidth(100)
-        u_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)  # 去掉滚轮
-        u_layout.addWidget(u_spin)
-        u_layout.addWidget(QLabel("mm"))
-        u_btn1 = QPushButton("1")
-        u_btn1.setFixedWidth(40)  # 增加宽度以显示完整数字
-        u_btn1.setMinimumHeight(25)
-        u_layout.addWidget(u_btn1)
-        u_btn2 = QPushButton("2")
-        u_btn2.setFixedWidth(40)  # 增加宽度以显示完整数字
-        u_btn2.setMinimumHeight(25)
-        u_layout.addWidget(u_btn2)
-        u_layout.addStretch()
-        left_vlayout.addLayout(u_layout)
-        
-        left_vlayout.addStretch()
-        top_layout.addWidget(left_group)
-        
-        # === 右侧 GroupBox (激光频率) ===
-        right_group = QGroupBox()
-        right_vlayout = QVBoxLayout(right_group)
-        right_vlayout.setContentsMargins(10, 10, 10, 10)
-        right_vlayout.setSpacing(3)
-        
-        # 6个激光频率设置 (注意：全部显示"激光1频率(KHz)"，但2-6变灰)
-        self.freq_checks = []
-        for i in range(6):
-            freq_layout = QHBoxLayout()
-            freq_check = QCheckBox("激光1频率(KHz)")  # 全部显示"激光1"
-            if i >= 2:
-                freq_check.setEnabled(False)  # 3-6变灰
-            freq_layout.addWidget(freq_check)
-            freq_spin = QSpinBox()
-            freq_spin.setRange(0, 100)
-            freq_spin.setValue(4)
-            freq_spin.setFixedWidth(80)
-            freq_spin.setButtonSymbols(QSpinBox.NoButtons)  # 去掉滚轮
-            if i >= 2:
-                freq_spin.setEnabled(False)  # 3-6变灰
-            freq_layout.addWidget(freq_spin)
-            freq_layout.addStretch()
-            right_vlayout.addLayout(freq_layout)
-            self.freq_checks.append((freq_check, freq_spin))
-        
-        right_vlayout.addStretch()
-        top_layout.addWidget(right_group)
-        
-        main_layout.addLayout(top_layout)
-        
-        # === 中部：联动IO输出 ===
-        io_group = QGroupBox("联动IO输出")
-        io_hlayout = QHBoxLayout(io_group)
-        io_hlayout.setContentsMargins(10, 8, 10, 8)
-        io_hlayout.setSpacing(15)
-        
-        io_check1 = QCheckBox("IO1")
-        io_check2 = QCheckBox("IO2")
-        io_check3 = QCheckBox("IO3")
-        io_check4 = QCheckBox("IO4")
-        
-        io_hlayout.addWidget(io_check1)
-        io_hlayout.addWidget(io_check2)
-        io_hlayout.addWidget(io_check3)
-        io_hlayout.addWidget(io_check4)
-        io_hlayout.addStretch()
-        
-        main_layout.addWidget(io_group)
-        
-        # === 下部：点 ===
-        point_group = QGroupBox("点")
-        point_vlayout = QVBoxLayout(point_group)
-        point_vlayout.setContentsMargins(10, 8, 10, 8)
-        
-        point_layout = QHBoxLayout()
-        point_layout.addWidget(QLabel("打点时间(s)"))
-        point_spin = QSpinBox()
-        point_spin.setRange(0, 1000)
-        point_spin.setValue(0)
-        point_spin.setFixedWidth(150)
-        point_spin.setButtonSymbols(QSpinBox.NoButtons)  # 去掉滚轮
-        point_layout.addWidget(point_spin)
-        point_layout.addStretch()
-        point_vlayout.addLayout(point_layout)
-        
-        main_layout.addWidget(point_group)
-        
-        # === 底部：按钮 ===
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        confirm_btn = QPushButton("确定")
-        cancel_btn = QPushButton("取消")
-        button_layout.addWidget(confirm_btn)
-        button_layout.addWidget(cancel_btn)
-        
-        main_layout.addLayout(button_layout)
-        
-        # 信号连接
-        confirm_btn.clicked.connect(dlg.accept)
-        cancel_btn.clicked.connect(dlg.reject)
-        
-        # 联动逻辑1：按图层抬笔落 -> 图层整体抬落颜色
-        def update_layer_overall_color():
-            if layer_radio.isChecked():
-                layer_overall_check.setStyleSheet("color: black;")
-            else:
-                layer_overall_check.setStyleSheet("color: #999;")
-        
-        layer_radio.toggled.connect(update_layer_overall_color)
-        overall_radio.toggled.connect(update_layer_overall_color)
-        
-        # 联动逻辑2：抬落笔使能(U轴) -> 落笔位置和抬笔位置颜色
-        def update_pen_position_color():
-            if offset_check.isChecked():
-                first_check.setStyleSheet("color: black;")
-                after_check.setStyleSheet("color: black;")
-            else:
-                first_check.setStyleSheet("color: #999;")
-                after_check.setStyleSheet("color: #999;")
-        
-        offset_check.stateChanged.connect(update_pen_position_color)
-        
-        # 联动逻辑3：U轴位置 -> U轴相对移动颜色 + 读取按钮显示
-        def update_u_relative_color():
-            if u_pos_check.isChecked():
-                u_check.setStyleSheet("color: black;")
-                u_pos_read_btn.setVisible(True)  # 显示读取按钮
-            else:
-                u_check.setStyleSheet("color: #999;")
-                u_pos_read_btn.setVisible(False)  # 隐藏读取按钮
-        
-        u_pos_check.stateChanged.connect(update_u_relative_color)
-        
-        # 显示对话框
-        if dlg.exec_() == QDialog.Accepted:
-            # 保存高级参数
-            pass
 
     def on_layer_header_btn_click(self):
         """图层"""
@@ -1804,76 +1012,37 @@ class RightPanel(QWidget):
         layout.setContentsMargins(8,8,8,8)
         layout.setSpacing(8)
 
-        table_widget=QWidget()
-        table_layout=QVBoxLayout(table_widget)
-        table_layout.setSpacing(0)
-
-        header_widget=QWidget()
-        header_widget.setStyleSheet("background-color:transparent;")
-        header_layout=QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0,0,0,0)
-        header_layout.setSpacing(1)
-
-        header_btns=[
-            ("编号",self.on_number_header_btn_click),
-            ("文件名",self.on_filename_header_btn_click),
-            ("工时(时:分:秒:毫秒)",self.on_worktime_header_btn_click),
-            ("件数",self.on_quantity_header_btn_click)
-        ]
-        for btn_text,btn_callback in header_btns:
-            btn=QPushButton(btn_text)
-            btn.setStyleSheet("""
-                                QPushButton {
-                                    border:1px solid #d0d0d0;
-                                    border-radius:4px;
-                                    background-color:#f0f0f0;
-                                    font-weight:bold;
-                                    font-size:12px;
-                                    text-align:center;
-                                    padding:8px 0;
-                                    margin:0;
-                                }
-                                QPushButton:hover {
-                                    background-color:#e0e0e0;
-                                    border-color:#b0b0b0;
-                                }
-                                QPushButton:pressed {
-                                    background-color:#d0d0d0;
-                                    border-color:#909090;
-                                }
-                            """)
-            btn.clicked.connect(btn_callback)
-            header_layout.addWidget(btn,1)
-
-        layer_table=QTableWidget()
+        # 用正式表头替代自定义 header 按钮，保证列与表头对齐且可自适应宽度
+        layer_table = QTableWidget()
         layer_table.setColumnCount(4)
         layer_table.setRowCount(19)
-        layer_table.setMinimumHeight(240)
+        layer_table.setMinimumHeight(200)
+        layer_table.setHorizontalHeaderLabels(["编号", "文件名", "工时(时:分:秒:毫秒)", "件数"])
         layer_table.verticalHeader().setVisible(False)
-        layer_table.verticalHeader().setDefaultSectionSize(12)
-        layer_table.horizontalHeader().setDefaultSectionSize(135)
-        layer_table.horizontalHeader().setVisible(False)
-        layer_table.horizontalHeader().setStretchLastSection(True)
+        layer_table.horizontalHeader().setStretchLastSection(False)
+        from PyQt5.QtWidgets import QHeaderView
+        layer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        layer_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layer_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         layer_table.setStyleSheet("""
-                            QTableWidget {
-                                border:1px solid #d0d0d0;
-                                border-radius:4px;
-                                background-color:#ffffff;
-                                gridline-color:#d0d0d0;
-                            }
-                            QTableWidget::item {
-                                padding:4px;
-                                border:none;
-                            }
-                            QTableWidget::item:selected {
-                                background-color:#e8f0fe;
-                                color:#000;
-                            }
-                        """)
+            QTableWidget {
+                border:1px solid #d0d0d0;
+                border-radius:4px;
+                background-color:#ffffff;
+                gridline-color:#d0d0d0;
+            }
+            QTableWidget::item {
+                padding:4px;
+                border:none;
+            }
+            QTableWidget::item:selected {
+                background-color:#e8f0fe;
+                color:#000;
+            }
+        """)
 
-        table_layout.addWidget(header_widget)
-        table_layout.addWidget(layer_table)
-        layout.addWidget(table_widget)
+        layout.addWidget(layer_table)
 
         btn_group=QWidget()
         btn_layout=QVBoxLayout(btn_group)

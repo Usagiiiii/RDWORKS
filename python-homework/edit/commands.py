@@ -127,6 +127,89 @@ class SetFiducialSizeCommand(Command):
             pass
 
 
+class AlignItemsCommand(Command):
+    """对齐选中项的命令"""
+    def __init__(self, canvas, items, align_type):
+        self.canvas = canvas
+        self.items = items
+        self.align_type = align_type
+        self.desc = f'对齐: {align_type}'
+        self.items_states = []
+
+        # 计算对齐参考线
+        if not items:
+            return
+
+        # 获取所有项的包围盒
+        rects = []
+        valid_items = []
+        for it in items:
+            try:
+                rects.append(it.sceneBoundingRect())
+                valid_items.append(it)
+            except Exception:
+                pass
+        
+        if not rects:
+            return
+
+        min_x = min(r.left() for r in rects)
+        max_x = max(r.right() for r in rects)
+        min_y = min(r.top() for r in rects)
+        max_y = max(r.bottom() for r in rects)
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+
+        from PyQt5.QtCore import QPointF
+
+        # 计算每个项的新位置
+        for it in valid_items:
+            try:
+                br = it.sceneBoundingRect()
+                dx = 0
+                dy = 0
+                
+                if align_type == 'left':
+                    dx = min_x - br.left()
+                elif align_type == 'right':
+                    dx = max_x - br.right()
+                elif align_type == 'top':
+                    dy = min_y - br.top()
+                elif align_type == 'bottom':
+                    dy = max_y - br.bottom()
+                elif align_type == 'hcenter':
+                    # 水平居中对齐：让所有对象在水平方向上居中（即 Y 轴对齐，变成水平一行）
+                    # 注意：这与某些软件的定义可能相反，但符合中文语境下的“水平对齐”直觉
+                    dy = center_y - br.center().y()
+                elif align_type == 'vcenter':
+                    # 垂直居中对齐：让所有对象在垂直方向上居中（即 X 轴对齐，变成垂直一列）
+                    dx = center_x - br.center().x()
+                
+                if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                    continue
+
+                old_pos = it.pos()
+                new_pos = QPointF(old_pos.x() + dx, old_pos.y() + dy)
+                self.items_states.append((it, old_pos, new_pos))
+
+            except Exception:
+                continue
+
+    def redo(self):
+        for it, old, new in self.items_states:
+            try:
+                it.setPos(new)
+            except Exception:
+                continue
+
+    def undo(self):
+        for it, old, new in self.items_states:
+            try:
+                it.setPos(old)
+            except Exception:
+                continue
+
+
 # 在 edit/commands.py 中添加图形命令
 
 class AddPathCommand(QUndoCommand):
@@ -226,19 +309,40 @@ class MirrorCommand(Command):
             elif typ == 'transform' and state is not None:
                 # 关于项的外接矩形中心进行镜像变换
                 try:
+                    # 获取当前场景变换（包含 pos）
+                    pos = it.pos()
+                    m_pos = QTransform()
+                    m_pos.translate(pos.x(), pos.y())
+                    
+                    m_transform = state # it.transform()
+                    
+                    # 完整的场景变换矩阵
+                    m_scene = m_transform * m_pos
+                    
+                    # 计算镜像中心
                     br = it.sceneBoundingRect()
                     cx = br.center().x()
                     cy = br.center().y()
-                    m = QTransform()
-                    m.translate(cx, cy)
+                    
+                    m_mirror = QTransform()
+                    m_mirror.translate(cx, cy)
                     if self.horizontal:
-                        m.scale(-1, 1)
+                        m_mirror.scale(-1, 1)
                     else:
-                        m.scale(1, -1)
-                    m.translate(-cx, -cy)
-                    # 将新的 transform 应用在原 transform 之前
-                    newt = m * state
-                    it.setTransform(newt)
+                        m_mirror.scale(1, -1)
+                    m_mirror.translate(-cx, -cy)
+                    
+                    # 新的场景变换：先应用旧的场景变换，再应用镜像
+                    m_scene_new = m_scene * m_mirror
+                    
+                    # 还原回 transform (保持 pos 不变)
+                    # M_transform_new = M_scene_new * M_pos^(-1)
+                    m_pos_inv = QTransform()
+                    m_pos_inv.translate(-pos.x(), -pos.y())
+                    
+                    new_transform = m_scene_new * m_pos_inv
+                    
+                    it.setTransform(new_transform)
                 except Exception:
                     continue
             else:
