@@ -624,12 +624,12 @@ class RightPanel(QWidget):
 
         # 1. 扫描画布上的颜色
         used_colors = set()
-        from ui.graphics_items import EditablePathItem
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem
         from PyQt5.QtWidgets import QGraphicsTextItem
         
         for item in self.canvas.scene.items():
             color = None
-            if isinstance(item, EditablePathItem):
+            if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                 color = item.pen().color()
             elif isinstance(item, QGraphicsTextItem):
                 color = item.defaultTextColor()
@@ -903,12 +903,12 @@ class RightPanel(QWidget):
             return
             
         target_color_name = params.color.name().upper()
-        from ui.graphics_items import EditablePathItem
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem
         from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsItem
         
         for item in self.canvas.scene.items():
             color = None
-            if isinstance(item, EditablePathItem):
+            if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                 color = item.pen().color()
             elif isinstance(item, QGraphicsTextItem):
                 color = item.defaultTextColor()
@@ -937,9 +937,9 @@ class RightPanel(QWidget):
         if len(selected) == 1:
             item = selected[0]
             color = None
-            from ui.graphics_items import EditablePathItem
+            from ui.graphics_items import EditablePathItem, EditableEllipseItem
             from PyQt5.QtWidgets import QGraphicsTextItem
-            if isinstance(item, EditablePathItem):
+            if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                 color = item.pen().color()
             elif isinstance(item, QGraphicsTextItem):
                 color = item.defaultTextColor()

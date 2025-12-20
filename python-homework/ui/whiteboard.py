@@ -20,7 +20,7 @@ from typing import List, Tuple, Optional
 from edit.commands import AddItemCommand
 from edit.edit_manager import EditManager
 from my_io.gcode.gcode_exporter import Point
-from ui.graphics_items import EditablePathItem
+from ui.graphics_items import EditablePathItem, EditableEllipseItem
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -790,7 +790,7 @@ class GridCanvas(QGraphicsView):
         return [
             item for item in self.scene.selectedItems()
             if item not in exclude_items  # 不处理网格和定位点
-               and isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem))  # 处理路径、图片和文字
+               and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem))  # 处理路径、图片和文字
         ]
 
     def select_all_items(self):
@@ -805,7 +805,7 @@ class GridCanvas(QGraphicsView):
 
         for item in self.scene.items():
             # 选中路径、图片和文字项
-            if item not in exclude_items and isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+            if item not in exclude_items and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
                 item.setSelected(True)
 
     # --- 定位点相关方法（更新为使用命令模式）---
@@ -956,14 +956,16 @@ class GridCanvas(QGraphicsView):
 
     def add_ellipse(self, cx: float, cy: float, rx: float, ry: float, color=None):
         """添加椭圆"""
-        steps = 64
-        pts = []
-        for i in range(steps + 1):
-            angle = 2 * math.pi * i / steps
-            x = cx + rx * math.cos(angle)
-            y = cy + ry * math.sin(angle)
-            pts.append((x, y))
-        return self.add_polyline(pts, color)
+        if color is None:
+            color = self._current_color
+        
+        item = EditableEllipseItem(cx, cy, rx, ry, color)
+        self.scene.addItem(item)
+        
+        # 添加到场景
+        cmd = AddItemCommand(self, item)
+        self.edit_manager.push_undo(cmd)
+        return item
 
     def add_circle(self, cx: float, cy: float, r: float, color=None):
         """添加圆形"""
@@ -2664,7 +2666,7 @@ class WhiteboardWidget(QWidget):
             
             for item in selected_items:
                 try:
-                    if isinstance(item, EditablePathItem):
+                    if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                         old_pen = item.pen()
                         new_pen = QPen(old_pen)
                         new_pen.setColor(color)

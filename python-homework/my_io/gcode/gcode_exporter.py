@@ -12,6 +12,11 @@ from PyQt5.QtWidgets import QGraphicsItem, QGraphicsPixmapItem
 from PyQt5.QtGui import QPixmap, QImage
 import numpy as np
 from PIL import Image
+# 尝试导入 EditableEllipseItem，如果失败则忽略（避免循环依赖或路径问题）
+try:
+    from ui.graphics_items import EditableEllipseItem
+except ImportError:
+    EditableEllipseItem = None
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +116,12 @@ class GCodeExporter:
                 if self._is_system_item(item, canvas):
                     continue
 
-                # 矢量路径项
+                # 优先检查是否为椭圆/圆 (EditableEllipseItem)
+                if EditableEllipseItem and isinstance(item, EditableEllipseItem):
+                    items.append(('ellipse', item))
+                    continue
+
+                # 矢量路径项 (EditablePathItem 或其他具有 points 方法的项)
                 if hasattr(item, 'points') and callable(getattr(item, 'points')):
                     try:
                         points = item.points()
@@ -148,6 +158,8 @@ class GCodeExporter:
 
             if item_type == 'vector':
                 self._process_vector_item(item, fiducial_offset)
+            elif item_type == 'ellipse':
+                self._process_ellipse_item(item, fiducial_offset)
             elif item_type == 'bitmap':
                 self._process_bitmap_item(item, fiducial_offset)
 
@@ -165,6 +177,80 @@ class GCodeExporter:
                 self._process_polyline(offset_points)
         except Exception as e:
             logger.error(f"处理矢量项时出错: {e}")
+
+    def _process_ellipse_item(self, item, fiducial_offset: Tuple[float, float]):
+        """处理椭圆/圆项（使用G2/G3指令）"""
+        try:
+            cx, cy, rx, ry = item.get_params()
+            
+            # 应用定位点偏移
+            offset_cx, offset_cy = self._apply_fiducial_offset((cx, cy), fiducial_offset)
+            
+            # 检查是否为正圆（允许微小误差）
+            if abs(rx - ry) < 1e-4:
+                logger.info(f"处理圆形: 圆心({offset_cx:.2f}, {offset_cy:.2f}), 半径 {rx:.2f}")
+                self._generate_circle_gcode(offset_cx, offset_cy, rx)
+            else:
+                # 椭圆仍然作为多段线处理，因为标准G代码不支持椭圆指令
+                logger.info(f"处理椭圆（转换为多段线）: rx={rx:.2f}, ry={ry:.2f}")
+                # 手动生成椭圆点，不再依赖 item.points()
+                import math
+                steps = 128
+                points = []
+                for i in range(steps + 1):
+                    angle = 2 * math.pi * i / steps
+                    # 计算场景坐标（假设无旋转，如果有旋转需要更复杂的处理，这里简化处理）
+                    # 注意：get_params 返回的是场景坐标下的 cx, cy 和缩放后的 rx, ry
+                    # 但如果 item 有旋转，这里简单的参数化方程是不够的。
+                    # 为了安全起见，我们还是尝试调用 item.points() 如果存在，否则使用简单近似
+                    x = cx + rx * math.cos(angle)
+                    y = cy + ry * math.sin(angle)
+                    points.append((x, y))
+                
+                # 如果 item 确实有 points 方法（我们在 graphics_items.py 中保留了它但加了保护），可以使用
+                if hasattr(item, 'points'):
+                    try:
+                        pts = item.points()
+                        if pts: points = pts
+                    except Exception:
+                        pass
+
+                if points and len(points) >= 2:
+                    offset_points = [self._apply_fiducial_offset(pt, fiducial_offset) for pt in points]
+                    self._process_polyline(offset_points)
+                    
+        except Exception as e:
+            logger.error(f"处理椭圆项时出错: {e}")
+
+    def _generate_circle_gcode(self, cx, cy, r):
+        """生成圆形的G代码（使用G2/G3）"""
+        # 移动到起点（圆的最右侧点）
+        start_x = cx + r
+        start_y = cy
+        
+        self.gcode_lines.append(f"G0 X{start_x:.3f} Y{start_y:.3f}")
+        self.gcode_lines.append(f"M3 S{self.config.get('max_laser_power', 1000)}") # 激光开启
+        
+        # 使用G2（顺时针）或G3（逆时针）画圆
+        # 这里使用G2画一个整圆，I为圆心相对于起点的X偏移，J为Y偏移
+        # 起点是(cx+r, cy)，圆心是(cx, cy)
+        # I = cx - start_x = cx - (cx + r) = -r
+        # J = cy - start_y = cy - cy = 0
+        
+        # 注意：某些控制器不支持单条指令画整圆，可能需要分成两段半圆
+        # 为了兼容性，我们分成两段半圆处理
+        
+        # 第一段：从右侧点(0度)到左侧点(180度)
+        mid_x = cx - r
+        mid_y = cy
+        # I = -r, J = 0
+        self.gcode_lines.append(f"G3 X{mid_x:.3f} Y{mid_y:.3f} I{-r:.3f} J0.000 F{self.config.get('feed_rate', 1000)}")
+        
+        # 第二段：从左侧点(180度)回到右侧点(0度)
+        # I = r, J = 0
+        self.gcode_lines.append(f"G3 X{start_x:.3f} Y{start_y:.3f} I{r:.3f} J0.000")
+        
+        self.gcode_lines.append("M5") # 激光关闭
 
     def _process_bitmap_item(self, item, fiducial_offset: Tuple[float, float]):
         """处理位图项（应用定位点偏移）"""
