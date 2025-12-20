@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-                             QLabel, QLineEdit, QRadioButton, QComboBox, QGroupBox, QMessageBox, QWidget, QApplication)
+                             QLabel, QLineEdit, QRadioButton, QComboBox, QGroupBox, QMessageBox, QWidget, QApplication, QListView)
 from PyQt5.QtCore import Qt
 from pymodbus.client import ModbusTcpClient, ModbusSerialClient
 from utils.device_manager import DeviceManager

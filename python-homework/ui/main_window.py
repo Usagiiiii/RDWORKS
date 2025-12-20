@@ -1796,14 +1796,14 @@ class MainWindow(QMainWindow):
                     # 获取图层数据
                     layer_data = self.right_panel.layer_data
                     
-                    from ui.graphics_items import EditablePathItem
+                    from ui.graphics_items import EditablePathItem, EditableEllipseItem
                     from ui.whiteboard import RotateHandle
                     from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem
 
                     # 辅助函数：获取项的颜色Hex
                     def get_item_color_hex(item):
                         color = None
-                        if isinstance(item, EditablePathItem):
+                        if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                             color = item.pen().color()
                         elif isinstance(item, QGraphicsTextItem):
                             color = item.defaultTextColor()
@@ -1832,7 +1832,7 @@ class MainWindow(QMainWindow):
                         if isinstance(item, RotateHandle): continue
 
                         # 仅包含用户内容类型
-                        if not isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                        if not isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
                             continue
 
                         color_hex = get_item_color_hex(item)
@@ -1946,7 +1946,7 @@ class MainWindow(QMainWindow):
             
             # 过滤掉非图形项（如辅助线、手柄等）
             valid_items = []
-            from ui.graphics_items import EditablePathItem
+            from ui.graphics_items import EditablePathItem, EditableEllipseItem
             from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
             
             for item in target_items:
@@ -1956,7 +1956,7 @@ class MainWindow(QMainWindow):
                 if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
                 if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
                 
-                if isinstance(item, (EditablePathItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                if isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
                     valid_items.append(item)
             
             # 获取工作区尺寸
