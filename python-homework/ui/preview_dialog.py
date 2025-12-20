@@ -357,6 +357,9 @@ class PreviewDialog(QDialog):
         min_x, min_y = float('inf'), float('inf')
         max_x, max_y = float('-inf'), float('-inf')
         
+        # 用于检测重复项 (位置和形状完全相同的项)
+        processed_signatures = set()
+        
         for item in self.items:
             # 获取路径
             path = None
@@ -373,10 +376,32 @@ class PreviewDialog(QDialog):
             # 这里我们直接在PreviewCanvas中添加新的PathItem
             
             # 复制路径并应用变换
-            scene_path = self.preview_view.mapFromScene(item.sceneBoundingRect()) # No, this is view mapping
+            # scene_path = self.preview_view.mapFromScene(item.sceneBoundingRect()) # No, this is view mapping
             # Correct way: map path to scene
             item_transform = item.sceneTransform()
             scene_path = item_transform.map(path)
+            
+            # 生成唯一签名以检测重复项
+            # 签名包含：类型、包围盒(x,y,w,h)、颜色
+            br_sig = scene_path.boundingRect()
+            rect_sig = (round(br_sig.x(), 3), round(br_sig.y(), 3), round(br_sig.width(), 3), round(br_sig.height(), 3))
+            color_sig = "NONE"
+            if hasattr(item, 'color'):
+                c = item.color()
+                if c.isValid():
+                    color_sig = c.name()
+            
+            # 简单的路径特征签名 (点数量, 长度)
+            path_sig = (scene_path.elementCount(), round(scene_path.length(), 3))
+            
+            # 移除 type(item) 以便检测不同类型但几何相同的项
+            signature = (rect_sig, color_sig, path_sig)
+            
+            if signature in processed_signatures:
+                # 跳过重复项
+                print(f"Skipping duplicate item: {signature}")
+                continue
+            processed_signatures.add(signature)
             
             # 更新包围盒
             br = scene_path.boundingRect()
@@ -389,6 +414,7 @@ class PreviewDialog(QDialog):
             mode = "激光切割"
             scan_interval = 0.1
             scan_mode = "水平单向"
+            repeat_count = 1
             
             if hasattr(item, 'color'):
                 c = item.color()
@@ -400,6 +426,7 @@ class PreviewDialog(QDialog):
                         mode = params.mode
                         scan_interval = params.scan_interval
                         scan_mode = params.scan_mode
+                        repeat_count = getattr(params, 'repeat_count', 1)
                     else:
                         # 尝试模糊匹配 (忽略Alpha通道，或者长度不一致)
                         # layer_data keys are usually #RRGGBB
@@ -413,6 +440,7 @@ class PreviewDialog(QDialog):
                                     mode = params.mode
                                     scan_interval = params.scan_interval
                                     scan_mode = params.scan_mode
+                                    repeat_count = getattr(params, 'repeat_count', 1)
                                     found = True
                                     break
                         
@@ -436,141 +464,77 @@ class PreviewDialog(QDialog):
             self.preview_view.scene.addItem(preview_item)
             
             # 生成仿真段
-            # 1. 空走到起点
-            if final_path.elementCount() > 0:
-                start_pt = final_path.pointAtPercent(0)
-                travel_line = QLineF(last_pos, start_pt)
-                travel_len = travel_line.length()
-                if travel_len > 0.001:
-                    self.sim_paths.append({
-                        'type': 'travel',
-                        'path': travel_line,
-                        'length': travel_len,
-                        'speed': self.default_speed # 用户要求空走速度与切割速度一致
-                    })
-                    total_travel_len += travel_len
-                    
-                    # 绘制空走路径（虚线）
-                    travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
-                    travel_item.setZValue(-1)
-            
-            # 2. 切割/扫描路径
-            # 对于扫描路径，它可能包含很多 MoveTo，我们需要将其拆分为多个段
-            # 或者，如果 generate_scan_path 返回的是一个连续的路径（包含 MoveTo），
-            # 我们可以遍历它的元素来生成 sim_paths
-            
-            if mode == "激光扫描":
-                # 扫描路径由多条线段组成，中间有 MoveTo
-                # 我们需要将其拆解，因为仿真逻辑是基于连续路径的
-                # 实际上，generate_scan_path 返回的 path 包含 MoveTo
-                # 我们可以遍历 path 的元素
-                
-                # 简单处理：将整个 path 作为一个 cut 段？
-                # 不行，因为中间的 MoveTo 应该是 travel（不发光）
-                # 但是扫描通常是快速开关光，中间的连接线（如果是双向）是发光的
-                # 如果是单向，回程是不发光的
-                
-                # 让我们解析 final_path
-                # QPainterPath 迭代比较麻烦，我们重新生成 sim_paths
-                # 或者在 generate_scan_path 里直接生成 sim_paths?
-                # 为了保持结构清晰，我们在这里解析 final_path
-                
-                # 更好的方法：generate_scan_path 返回线段列表
-                scan_segments = self.get_scan_segments(scene_path, scan_interval, scan_mode)
-                
-                for i, seg_line in enumerate(scan_segments):
-                    # 空走到线段起点 (如果是第一段，已经在上面处理了空走到起点)
-                    # 但上面的逻辑是基于 final_path.pointAtPercent(0)
-                    # 如果我们在这里处理，上面的逻辑可能重复或者不对
-                    
-                    # 让我们调整一下：
-                    # 如果是扫描模式，上面的 final_path 只是为了显示
-                    # 仿真路径我们在这里重新生成
-                    
-                    p1 = seg_line.p1()
-                    p2 = seg_line.p2()
-                    
-                    # 从当前位置(last_pos) 移动到 p1
-                    # 注意：如果是第一段，last_pos 是 (0,0) 或者上一图层的结束点
-                    # 上面的代码已经处理了 "空走到起点"，但是是基于 final_path 的起点
-                    # 如果 final_path 的起点就是 scan_segments[0].p1()，那就没问题
-                    
-                    # 但是，上面的代码已经添加了一个 travel 到 final_path 的起点
-                    # 如果我们在这里再添加 travel，就会重复
-                    # 所以，如果是扫描模式，我们跳过上面的 "空走到起点" 逻辑？
-                    # 或者让 final_path 就是扫描路径，但是我们需要正确处理其中的 MoveTo
-                    
-                    pass # 逻辑在下面统一处理
-            
-            # 重新组织逻辑：
             
             if mode == "激光扫描":
                 scan_segments = self.get_scan_segments(scene_path, scan_interval, scan_mode)
                 if not scan_segments: continue
                 
-                # 第一段的起点
-                first_pt = scan_segments[0].p1()
-                
-                # 空走到第一段起点
-                travel_line = QLineF(last_pos, first_pt)
-                travel_len = travel_line.length()
-                if travel_len > 0.001:
-                    self.sim_paths.append({
-                        'type': 'travel',
-                        'path': travel_line,
-                        'length': travel_len,
-                        'speed': self.default_speed
-                    })
-                    total_travel_len += travel_len
-                    travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
-                    travel_item.setZValue(-1)
-                
-                last_pos = first_pt
-                
-                for i, line in enumerate(scan_segments):
-                    # 如果不是第一段，需要从上一段终点移动到这一段起点
-                    if i > 0:
-                        curr_start = line.p1()
-                        if last_pos != curr_start:
-                            # 扫描时的连接线
-                            # 如果是双向扫描，通常是直接连过去的，但是是空走还是切割？
-                            # 扫描通常是：切 -> 移 -> 切
-                            # 即使是双向，换行的时候也是不发光的（通常）
-                            # 除非是 "S" 形扫描且边缘也切
-                            # 这里假设换行是空走
-                            t_line = QLineF(last_pos, curr_start)
-                            t_len = t_line.length()
-                            if t_len > 0.001:
-                                self.sim_paths.append({
-                                    'type': 'travel',
-                                    'path': t_line,
-                                    'length': t_len,
-                                    'speed': self.default_speed
-                                })
-                                total_travel_len += t_len
-                                # 扫描太密集，空走线可能不需要画，或者画淡一点
-                                # travel_item = self.preview_view.scene.addLine(t_line, QPen(QColor(0, 0, 100), 0.5, Qt.DashLine))
+                # 扫描模式通常只执行一次，或者重复扫描？
+                # 假设重复次数也适用于扫描
+                if repeat_count > 1:
+                    print(f"Scan mode repeat count: {repeat_count}")
                     
-                    # 切割当前线段
-                    # 将 QLineF 转为 QPainterPath 以统一格式
-                    seg_path = QPainterPath(line.p1())
-                    seg_path.lineTo(line.p2())
-                    length = line.length()
+                for _ in range(repeat_count):
+                    # 第一段的起点
+                    first_pt = scan_segments[0].p1()
                     
-                    self.sim_paths.append({
-                        'type': 'cut',
-                        'path': seg_path,
-                        'length': length,
-                        'speed': self.default_speed, # 扫描速度通常很快，这里暂用默认
-                        'power': 30.0
-                    })
-                    total_cut_len += length
-                    last_pos = line.p2()
+                    # 空走到第一段起点
+                    travel_line = QLineF(last_pos, first_pt)
+                    travel_len = travel_line.length()
+                    if travel_len > 0.001:
+                        self.sim_paths.append({
+                            'type': 'travel',
+                            'path': travel_line,
+                            'length': travel_len,
+                            'speed': self.default_speed
+                        })
+                        total_travel_len += travel_len
+                        # 修复：不显示空走路径，或者使用透明色
+                        # travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
+                        # travel_item.setZValue(-1)
+                    
+                    last_pos = first_pt
+                    
+                    for i, line in enumerate(scan_segments):
+                        # 如果不是第一段，需要从上一段终点移动到这一段起点
+                        if i > 0:
+                            curr_start = line.p1()
+                            if last_pos != curr_start:
+                                t_line = QLineF(last_pos, curr_start)
+                                t_len = t_line.length()
+                                if t_len > 0.001:
+                                    self.sim_paths.append({
+                                        'type': 'travel',
+                                        'path': t_line,
+                                        'length': t_len,
+                                        'speed': self.default_speed
+                                    })
+                                    total_travel_len += t_len
+                        
+                        # 切割当前线段
+                        seg_path = QPainterPath(line.p1())
+                        seg_path.lineTo(line.p2())
+                        length = line.length()
+                        
+                        self.sim_paths.append({
+                            'type': 'cut',
+                            'path': seg_path,
+                            'length': length,
+                            'speed': self.default_speed,
+                            'power': 30.0
+                        })
+                        total_cut_len += length
+                        last_pos = line.p2()
                     
             else:
-                # 切割模式 (原逻辑)
-                # 1. 空走到起点
+                # 切割模式
+                # 1. 空走到起点 (只在第一次循环前执行，或者每次都回到起点？)
+                # 通常切割闭合图形，终点即起点，所以后续循环不需要空走
+                # 如果是非闭合图形，需要空走回起点
+                
                 start_pt = scene_path.pointAtPercent(0)
+                
+                # 初始空走
                 travel_line = QLineF(last_pos, start_pt)
                 travel_len = travel_line.length()
                 if travel_len > 0.001:
@@ -581,21 +545,42 @@ class PreviewDialog(QDialog):
                         'speed': self.default_speed
                     })
                     total_travel_len += travel_len
-                    travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
-                    travel_item.setZValue(-1)
+                    # 修复：不显示空走路径
+                    # travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
+                    # travel_item.setZValue(-1)
                 
-                # 2. 切割路径
-                length = scene_path.length()
-                if length > 0:
-                    self.sim_paths.append({
-                        'type': 'cut',
-                        'path': scene_path,
-                        'length': length,
-                        'speed': self.default_speed,
-                        'power': 30.0
-                    })
-                    total_cut_len += length
-                last_pos = scene_path.pointAtPercent(1)
+                last_pos = start_pt
+                
+                if repeat_count > 1:
+                    print(f"Cut mode repeat count: {repeat_count}")
+
+                # 循环执行切割
+                for _ in range(repeat_count):
+                    # 检查是否需要从上一次终点回到起点 (针对非闭合图形)
+                    curr_start = scene_path.pointAtPercent(0)
+                    if last_pos != curr_start:
+                         t_line = QLineF(last_pos, curr_start)
+                         t_len = t_line.length()
+                         if t_len > 0.001:
+                            self.sim_paths.append({
+                                'type': 'travel',
+                                'path': t_line,
+                                'length': t_len,
+                                'speed': self.default_speed
+                            })
+                            total_travel_len += t_len
+                    
+                    length = scene_path.length()
+                    if length > 0:
+                        self.sim_paths.append({
+                            'type': 'cut',
+                            'path': scene_path,
+                            'length': length,
+                            'speed': self.default_speed,
+                            'power': 30.0
+                        })
+                        total_cut_len += length
+                    last_pos = scene_path.pointAtPercent(1)
 
         # 更新统计
         if min_x == float('inf'):
@@ -696,6 +681,56 @@ class PreviewDialog(QDialog):
         self.traversed_path = QPainterPath()
         self.preview_view.traversed_path_item.setPath(self.traversed_path)
 
+    def _append_path_segment(self, path, t_start, t_end, total_length):
+        """辅助方法：将路径片段添加到已加工路径中，支持采样以平滑曲线"""
+        if t_start >= t_end: return
+        
+        # 检查是否需要移动到起点 (处理空走后的断点)
+        # 逻辑优化：比较画笔当前位置与仿真头位置(last_sim_pos)
+        # 如果两者不一致，说明刚才发生了空走(Travel)，需要抬笔移动到仿真头位置
+        current_pen_pos = self.traversed_path.currentPosition()
+        
+        if self.traversed_path.elementCount() == 0:
+            # 第一次绘制，直接移动到起点
+            start_pos = path.pointAtPercent(t_start)
+            self.traversed_path.moveTo(start_pos)
+        elif self.last_sim_pos:
+            # 如果画笔不在仿真头位置，移动过去
+            if QLineF(current_pen_pos, self.last_sim_pos).length() > 0.001:
+                self.traversed_path.moveTo(self.last_sim_pos)
+        
+        # 采样步长 (mm)，越小越平滑但性能开销越大
+        step_size = 2.0 
+        
+        # 需要覆盖的长度
+        dist = (t_end - t_start) * total_length
+        
+        if dist <= step_size:
+            # 距离很短，直接画直线到终点
+            pos = path.pointAtPercent(t_end)
+            self.traversed_path.lineTo(pos)
+            self.last_sim_pos = pos
+        else:
+            # 距离较长，进行采样以拟合曲线
+            num_steps = int(dist / step_size)
+            if num_steps < 1: num_steps = 1
+            dt = (t_end - t_start) / num_steps
+            
+            for i in range(1, num_steps + 1):
+                t = t_start + i * dt
+                if t > t_end: t = t_end # 避免浮点误差
+                pos = path.pointAtPercent(t)
+                self.traversed_path.lineTo(pos)
+            
+            # 确保最后一点精确
+            end_pos = path.pointAtPercent(t_end)
+            # 避免重复点（如果采样恰好落在终点）
+            if self.last_sim_pos != end_pos: 
+                 self.traversed_path.lineTo(end_pos)
+            self.last_sim_pos = end_pos
+            
+        self.preview_view.traversed_path_item.setPath(self.traversed_path)
+
     def on_timer_tick(self):
         if not self.is_running or self.current_path_index >= len(self.sim_paths):
             self.stop_simulation()
@@ -716,6 +751,8 @@ class PreviewDialog(QDialog):
         else:
             t_step = 1.0
             
+        # 记录本此 tick 的起始 t
+        t_start = self.current_t
         self.current_t += t_step
         
         # 如果超过当前段
@@ -724,17 +761,10 @@ class PreviewDialog(QDialog):
             seg = self.sim_paths[self.current_path_index]
             
             if seg['type'] == 'cut':
-                end_pos = seg['path'].pointAtPercent(1.0)
-                # 补齐到终点的线段
-                if self.last_sim_pos:
-                    # 确保路径已开始
-                    if self.traversed_path.elementCount() == 0:
-                        self.traversed_path.moveTo(self.last_sim_pos)
-                    self.traversed_path.lineTo(end_pos)
-                    self.preview_view.traversed_path_item.setPath(self.traversed_path)
-                self.last_sim_pos = end_pos
+                # 绘制从 t_start 到 1.0 的路径
+                self._append_path_segment(seg['path'], t_start, 1.0, seg_len)
             else:
-                # Travel
+                # Travel: 直接更新位置
                 self.last_sim_pos = seg['path'].p2()
 
             # 剩余距离
@@ -751,9 +781,13 @@ class PreviewDialog(QDialog):
             seg = self.sim_paths[self.current_path_index]
             seg_len = seg['length']
             speed = seg['speed']
+            
+            # 重置 t_start 为 0，并计算新的 current_t
+            t_start = 0.0
             self.current_t = remain_dist / seg_len if seg_len > 0 else 1.0
             
-        # 更新位置
+        # 处理当前段剩余部分 (t_start 到 current_t)
+        seg = self.sim_paths[self.current_path_index]
         if seg['type'] == 'travel':
             # QLineF
             line = seg['path']
@@ -762,40 +796,16 @@ class PreviewDialog(QDialog):
             # 空走不画线，但更新最后位置
             self.last_sim_pos = pos
         else:
-            # QPainterPath
-            path = seg['path']
-            pos = path.pointAtPercent(self.current_t)
+            # Cut
+            self._append_path_segment(seg['path'], t_start, self.current_t, seg_len)
             self.update_stat_value(self.lbl_cur_power, f"{seg['power']}%")
             
-            # 绘制已加工路径（绿色）
-            if self.last_sim_pos is None:
-                self.traversed_path.moveTo(pos)
-            else:
-                # 如果是新的一段开始（或者上一段是空走），可能需要 moveTo
-                # 但这里我们简单处理：如果是连续切割，lineTo；如果是断开的，moveTo
-                # 实际上，last_sim_pos 应该是上一次的位置
-                # 检查距离，如果距离过大（说明是空走过来的），则 moveTo
-                dist = QLineF(self.last_sim_pos, pos).length()
-                if dist > 1.0 and seg['type'] == 'cut': # 阈值
-                     # 理论上不应该发生，因为空走也会更新 last_sim_pos
-                     # 但为了保险
-                     pass
-                
-                # 只有在切割时才画线
-                if self.traversed_path.elementCount() == 0:
-                    self.traversed_path.moveTo(self.last_sim_pos)
-                
-                # 只有当起点和终点不同时才画线
-                if self.last_sim_pos != pos:
-                     self.traversed_path.lineTo(pos)
-                     self.preview_view.traversed_path_item.setPath(self.traversed_path)
-            
-            self.last_sim_pos = pos
-            
-        self.preview_view.head_marker.setPos(pos) # Center marker
+        if self.last_sim_pos:
+            self.preview_view.head_marker.setPos(self.last_sim_pos)
         
         # 更新状态
-        self.update_stat_value(self.lbl_cur_pos, f"{pos.x():.1f}mm, {pos.y():.1f}mm")
+        if self.last_sim_pos:
+            self.update_stat_value(self.lbl_cur_pos, f"{self.last_sim_pos.x():.1f}mm, {self.last_sim_pos.y():.1f}mm")
         self.update_stat_value(self.lbl_cur_speed, f"{speed:.1f}mm/s")
         
         # 更新进度条

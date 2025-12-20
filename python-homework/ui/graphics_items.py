@@ -4,9 +4,10 @@
 图形项定义 - 避免循环导入
 """
 
-from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem
+from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent
+import math
 
 
 class EditablePathItem(QGraphicsPathItem):
@@ -22,6 +23,10 @@ class EditablePathItem(QGraphicsPathItem):
         self.setFlags(QGraphicsPathItem.ItemIsSelectable | QGraphicsPathItem.ItemIsMovable)
         # 用于记录拖动前的原始点
         self._move_orig_points = None
+
+    def setPen(self, pen):
+        super().setPen(pen)
+        self._color = pen.color()
 
     def _update_path(self):
         path = QPainterPath()
@@ -73,10 +78,6 @@ class EditablePathItem(QGraphicsPathItem):
 
     def set_color(self, color: QColor):
         """设置路径颜色"""
-        self._color = color
-        self._update_path()
-
-    def set_color(self, color: QColor):
         self._color = color
         self._update_path()
 
@@ -236,3 +237,63 @@ class _DragHandle(QGraphicsEllipseItem):
         except Exception:
             pass
         event.accept()
+
+
+class EditableEllipseItem(QGraphicsEllipseItem):
+    def __init__(self, cx, cy, rx, ry, color: QColor):
+        # 确保参数有效
+        if rx <= 0: rx = 0.1
+        if ry <= 0: ry = 0.1
+        super().__init__(cx - rx, cy - ry, 2 * rx, 2 * ry)
+        self._color = color
+        self._update_pen()
+        self.setFlags(QGraphicsEllipseItem.ItemIsSelectable | QGraphicsEllipseItem.ItemIsMovable)
+        
+    # 移除 type() 重写，避免潜在冲突，使用 isinstance 即可
+
+    def setPen(self, pen):
+        super().setPen(pen)
+        self._color = pen.color()
+
+    def _update_pen(self):
+        pen = QPen(self._color)
+        pen.setCosmetic(True)
+        pen.setWidthF(1.2)
+        self.setPen(pen)
+
+    def set_color(self, color: QColor):
+        self._color = color
+        self._update_pen()
+        
+    def color(self):
+        return self._color
+
+    # 移除 points 方法，避免潜在的递归或性能问题
+    # GCodeExporter 已更新为不依赖此方法
+
+    def get_params(self):
+        """获取椭圆参数 (cx, cy, rx, ry) 场景坐标"""
+        rect = self.rect()
+        
+        # 优化：如果场景未设置，直接返回本地参数
+        if not self.scene():
+            return rect.center().x(), rect.center().y(), rect.width()/2, rect.height()/2
+
+        # 获取场景坐标下的圆心
+        center_scene = self.mapToScene(rect.center())
+        cx = center_scene.x()
+        cy = center_scene.y()
+        
+        # 获取半径（注意：如果被缩放，这里返回的是原始半径，G代码导出可能需要考虑缩放）
+        # 为了简单起见，我们假设没有非均匀缩放，或者在导出时处理
+        # 如果有缩放，mapToScene 会处理位置，但半径需要单独处理
+        # 这里我们返回本地半径，导出器需要注意
+        rx = rect.width() / 2
+        ry = rect.height() / 2
+        
+        # 尝试获取缩放系数
+        transform = self.sceneTransform()
+        scale_x = math.sqrt(transform.m11()**2 + transform.m12()**2)
+        scale_y = math.sqrt(transform.m21()**2 + transform.m22()**2)
+        
+        return cx, cy, rx * scale_x, ry * scale_y
