@@ -11,10 +11,11 @@ from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence, QColor, QPalette
 from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidget, QLabel, QFileDialog, QMessageBox,
-                             QLineEdit, QGraphicsPixmapItem)
+                             QLineEdit, QGraphicsPixmapItem, QDialog)
 
 from my_io.importers.supported_filter import SUPPORTED_FILTER
 from ui.left_toolbar import LeftToolbar
+from ui.node_edit_toolbar import NodeEditToolbar
 from ui.right_panel import RightPanel
 from ui.whiteboard import WhiteboardWidget
 from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
@@ -24,6 +25,7 @@ from ui.whiteboard import Path
 from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
 from ui.lead_line_dialog import LeadLineDialog
 from ui.preview_dialog import PreviewDialog
+from ui.manufacturer_settings_dialog import ManufacturerPasswordDialog, ManufacturerSettingsDialog
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -82,6 +84,15 @@ class MainWindow(QMainWindow):
         self.coord_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.statusBar().addWidget(self.coord_label, 0) # stretch=0，紧跟在status_label后面
 
+        # 测量信息标签
+        self.measure_label = QLabel("W: 0.00 mm  H: 0.00 mm")
+        # QFrame.Sunken = 48, QFrame.StyledPanel = 6
+        # self.measure_label.setFrameStyle(54) 
+        self.measure_label.setStyleSheet("QLabel { color : blue; }") # 蓝色文字以区分
+        self.measure_label.setMinimumWidth(150)
+        self.measure_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.statusBar().addWidget(self.measure_label, 0) # stretch=0，在坐标后面
+
         # 添加一个弹簧占位符，把前面两个挤到左边
         spacer = QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
@@ -89,6 +100,7 @@ class MainWindow(QMainWindow):
         
         # 连接信号
         self.whiteboard.canvas.headMoved.connect(self.update_mouse_coordinates)
+        self.whiteboard.canvas.measurementChanged.connect(self.measure_label.setText)
         self.whiteboard.canvas.scene.changed.connect(self.on_scene_changed)
         # 连接右侧面板的图层参数变化信号，以便更新路径预览
         self.right_panel.layerParamsChanged.connect(self.on_scene_changed)
@@ -203,6 +215,38 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.WindowText, QColor(50, 50, 50))
         self.setPalette(palette)
 
+    def open_manufacturer_settings(self):
+        """打开厂家设置"""
+        try:
+            pwd_dialog = ManufacturerPasswordDialog(self)
+            if pwd_dialog.exec_() == QDialog.Accepted:
+                settings_dialog = ManufacturerSettingsDialog(self)
+                settings_dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开厂家设置失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def common_gallery(self):
+        QMessageBox.information(self, "功能未实现", "常用图库功能尚未实现")
+
+    def import_background_image(self):
+        # 简单实现导入底图逻辑，或者提示
+        file_path, _ = QFileDialog.getOpenFileName(self, "导入底图", "", "Images (*.png *.jpg *.bmp)")
+        if file_path:
+             QMessageBox.information(self, "提示", f"已选择底图: {file_path}\n(功能开发中)")
+             # 如果有 clear_bg_action 可以在这里启用
+             if hasattr(self, 'clear_bg_action'):
+                 self.clear_bg_action.setEnabled(True)
+
+    def clear_background_image(self):
+         QMessageBox.information(self, "提示", "底图已清除")
+         if hasattr(self, 'clear_bg_action'):
+             self.clear_bg_action.setEnabled(False)
+
+    def get_scanned_image(self):
+        QMessageBox.information(self, "功能未实现", "扫描功能需要硬件支持")
+
     def create_menu_bar(self):
         """创建菜单栏"""
         menubar = self.menuBar()
@@ -210,7 +254,7 @@ class MainWindow(QMainWindow):
         # 文件菜单
         file_menu = menubar.addMenu('文件(F)')
 
-        new_action = QAction('新建(&N)', self)
+        new_action = QAction('新建(&N)...', self)
         new_action.setShortcut(QKeySequence.New)
         new_action.setStatusTip('创建新的RLD文件')
         new_action.triggered.connect(self.new_file)
@@ -229,28 +273,67 @@ class MainWindow(QMainWindow):
         file_menu.addAction(save_action)
 
         save_as_action = QAction('另存为(&A)...', self)
-        save_as_action.setShortcut(QKeySequence.SaveAs)
         save_as_action.setStatusTip('另存为新RLD文件')
         save_as_action.triggered.connect(self.save_as_file)
         file_menu.addAction(save_as_action)
 
         file_menu.addSeparator()
 
-        export_action = QAction('导入(&E)...', self)
-        export_action.setStatusTip('导入图像文件')
-        export_action.triggered.connect(self.import_image)
+        import_action = QAction('导入(&I)...', self)
+        import_action.setShortcut("Ctrl+I")
+        import_action.setStatusTip('导入图像文件')
+        import_action.triggered.connect(self.import_image)
+        file_menu.addAction(import_action)
+
+        export_action = QAction('导出(&E)...', self)
+        export_action.setShortcut("Ctrl+E")
+        export_action.setStatusTip('导出文件')
+        # 如果有专门的导出功能，可以连接，目前暂时连接到导出NC或保留原样
+        # 根据截图，这里是 通用导出，之前代码里有 export_to_nc
+        # 这里为了演示，我先连接到 export_to_nc，或者创建一个占位符
+        export_action.triggered.connect(self.export_to_nc) 
         file_menu.addAction(export_action)
 
-        # 添加导出动作
-        export_nc_action = QAction('导出为NC(&X)...', self)
-        export_nc_action.setStatusTip('导出为G代码NC文件')
-        export_nc_action.triggered.connect(self.export_to_nc)
-        file_menu.addAction(export_nc_action)
+        gallery_action = QAction('常用图库', self)
+        gallery_action.triggered.connect(self.common_gallery)
+        file_menu.addAction(gallery_action)
+
+        file_menu.addSeparator()
+
+        import_bg_action = QAction('导入底图', self)
+        import_bg_action.triggered.connect(self.import_background_image)
+        file_menu.addAction(import_bg_action)
+
+        clear_bg_action = QAction('清除底图', self)
+        clear_bg_action.triggered.connect(self.clear_background_image)
+        # 默认禁用清除底图，直到有底图导入
+        clear_bg_action.setEnabled(False) 
+        self.clear_bg_action = clear_bg_action
+        file_menu.addAction(clear_bg_action)
+
+        file_menu.addSeparator()
+
+        scan_action = QAction('获取扫描图象', self)
+        scan_action.setShortcut("Ctrl+8")
+        scan_action.triggered.connect(self.get_scanned_image)
+        file_menu.addAction(scan_action)
+
+        file_menu.addSeparator()
+
+        manu_settings_action = QAction('厂家设置', self)
+        manu_settings_action.triggered.connect(self.open_manufacturer_settings)
+        file_menu.addAction(manu_settings_action)
+
+        file_menu.addSeparator()
+
+        recent_files_action = QAction('最近文件', self)
+        recent_files_action.setEnabled(False) # 暂时禁用，需要实现最近文件逻辑
+        file_menu.addAction(recent_files_action)
 
         file_menu.addSeparator()
 
         exit_action = QAction('退出(&X)', self)
-        exit_action.setShortcut(QKeySequence.Quit)
+        exit_action.setShortcut("Ctrl+X") # Screenshot convention often uses Ctrl+Q or Alt+F4, but menu says X
         exit_action.setStatusTip('退出应用程序')
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -259,78 +342,209 @@ class MainWindow(QMainWindow):
         edit_menu = menubar.addMenu('编辑(E)')
 
         # 定义为实例变量，方便后续连接信号
-        self.undo_action = QAction('撤销(&U)', self)
-        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action = QAction('撤销', self)
+        self.undo_action.setShortcut('Ctrl+Z') 
         self.undo_action.setStatusTip('撤销上一步操作')
         self.undo_action.triggered.connect(self.whiteboard.canvas.edit_manager.undo)
         edit_menu.addAction(self.undo_action)
 
-        self.redo_action = QAction('恢复(&R)', self)
-        self.redo_action.setShortcut(QKeySequence.Redo)
+        self.redo_action = QAction('恢复', self)
+        self.redo_action.setShortcut('Ctrl+Y')
         self.redo_action.setStatusTip('恢复上一步操作')
         self.redo_action.triggered.connect(self.whiteboard.canvas.edit_manager.redo)
         edit_menu.addAction(self.redo_action)
 
         edit_menu.addSeparator()
 
-        self.cut_action = QAction('剪切(&T)', self)
-        self.cut_action.setShortcut(QKeySequence.Cut)
+        self.cut_action = QAction('剪切', self)
+        self.cut_action.setShortcut('Ctrl+X')
         self.cut_action.setStatusTip('剪切选中内容')
         self.cut_action.triggered.connect(self.whiteboard.canvas.edit_manager.cut)
         edit_menu.addAction(self.cut_action)
 
-        self.copy_action = QAction('复制(&C)', self)
-        self.copy_action.setShortcut(QKeySequence.Copy)
+        self.copy_action = QAction('复制', self)
+        self.copy_action.setShortcut('Ctrl+C')
         self.copy_action.setStatusTip('复制选中内容')
         self.copy_action.triggered.connect(self.whiteboard.canvas.edit_manager.copy)
         edit_menu.addAction(self.copy_action)
 
-        self.paste_action = QAction('粘贴(&P)', self)
-        self.paste_action.setShortcut(QKeySequence.Paste)
+        self.paste_action = QAction('粘贴', self)
+        self.paste_action.setShortcut('Ctrl+V')
         self.paste_action.setStatusTip('粘贴内容')
         self.paste_action.triggered.connect(self.whiteboard.canvas.edit_manager.paste)
         edit_menu.addAction(self.paste_action)
 
-        edit_menu.addSeparator()
-
-        self.delete_action = QAction('删除(&D)', self)
-        self.delete_action.setShortcut(QKeySequence.Delete)
+        self.delete_action = QAction('删除', self)
+        self.delete_action.setShortcut('Del')
         self.delete_action.setStatusTip('删除选中内容')
         self.delete_action.triggered.connect(self.whiteboard.canvas.edit_manager.delete)
-        edit_menu.addAction(self.delete_action)
+        edit_menu.addAction(self.delete_action) # 这里只添加，没有分隔符
 
-        self.select_all_action = QAction('全选(&A)', self)
-        self.select_all_action.setShortcut(QKeySequence.SelectAll)
+        edit_menu.addSeparator()
+
+        # Group 3: 视图/工具
+        move_action = QAction('移动', self)
+        move_action.setStatusTip('移动画布')
+        move_action.triggered.connect(self.set_pan_tool)
+        edit_menu.addAction(move_action)
+
+        zoom_in_edit_action = QAction('放大', self)
+        zoom_in_edit_action.setStatusTip('放大视图')
+        zoom_in_edit_action.triggered.connect(self.view_zoom_in)
+        edit_menu.addAction(zoom_in_edit_action)
+
+        zoom_out_edit_action = QAction('缩小', self)
+        zoom_out_edit_action.setStatusTip('缩小视图')
+        zoom_out_edit_action.triggered.connect(self.view_zoom_out)
+        edit_menu.addAction(zoom_out_edit_action)
+
+        box_zoom_action = QAction('框选查看', self)
+        box_zoom_action.setStatusTip('框选区域放大查看')
+        box_zoom_action.triggered.connect(self.set_box_zoom_tool)
+        edit_menu.addAction(box_zoom_action)
+
+        page_range_action = QAction('页面范围', self)
+        page_range_action.setStatusTip('缩放到页面范围')
+        page_range_action.triggered.connect(self.zoom_to_page)
+        edit_menu.addAction(page_range_action)
+
+        data_range_action = QAction('数据范围', self)
+        data_range_action.setStatusTip('缩放到数据范围')
+        data_range_action.triggered.connect(self.zoom_to_data)
+        edit_menu.addAction(data_range_action)
+
+        show_all_action = QAction('显示所有', self)
+        show_all_action.setStatusTip('显示所有内容')
+        show_all_action.triggered.connect(self.zoom_to_all)
+        edit_menu.addAction(show_all_action)
+
+        preview_action = QAction('加工预览', self)
+        preview_action.setStatusTip('显示加工预览')
+        preview_action.triggered.connect(self.show_preview_dialog)
+        edit_menu.addAction(preview_action)
+
+        edit_menu.addSeparator()
+
+        # Group 4: 路径设置
+        self.show_path_action_menu = QAction('显示路径', self)
+        self.show_path_action_menu.setCheckable(True)
+        self.show_path_action_menu.setChecked(False)
+        self.show_path_action_menu.triggered.connect(self.toggle_show_path)
+        edit_menu.addAction(self.show_path_action_menu)
+
+        set_lead_action = QAction('设置引入引出', self)
+        set_lead_action.triggered.connect(self.set_lead_line)
+        edit_menu.addAction(set_lead_action)
+
+        edit_menu.addAction(QAction('设置切割属性', self))
+        edit_menu.addAction(QAction('设置切割点', self))
+        edit_menu.addAction(QAction('设置切割方向', self))
+
+        edit_menu.addSeparator()
+
+        # Group 5: 选择
+        self.select_all_action = QAction('选择全部', self)
+        self.select_all_action.setShortcut('Ctrl+A')
         self.select_all_action.setStatusTip('选择全部内容')
         self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
         edit_menu.addAction(self.select_all_action)
 
-        # ========== 新增：定位点菜单 ==========
+        select_similar_action = QAction('选择相似图形', self)
+        select_similar_action.setShortcut('Ctrl+Shift+S')
+        select_similar_action.setEnabled(False)
+        edit_menu.addAction(select_similar_action)
+
+        replace_similar_action = QAction('替换相似图形', self)
+        replace_similar_action.setEnabled(False)
+        edit_menu.addAction(replace_similar_action)
+
         edit_menu.addSeparator()
 
-        # 添加十字定位点
+        # Group 6: 群组
+        edit_menu.addAction(QAction('自动群组', self))
+        edit_menu.addAction(QAction('群组', self))
+        edit_menu.addAction(QAction('解散群组', self))
+
+        edit_menu.addSeparator()
+
+        # Group 7: 变换
+        edit_menu.addAction(QAction('变换', self))
+
+        # ========== 绘制菜单 (原视图和绘图工具移动到这里) ==========
+        draw_menu = menubar.addMenu('绘制(D)')
+        
+        # 将原工具栏的绘图工具移动到这里
+        pen_action = QAction('画笔(&P)', self)
+        pen_action.setStatusTip('选择画笔工具')
+        pen_action.triggered.connect(self.select_pen)
+        draw_menu.addAction(pen_action)
+
+        eraser_action = QAction('橡皮擦(&E)', self)
+        eraser_action.setStatusTip('选择橡皮擦工具')
+        eraser_action.triggered.connect(self.select_eraser)
+        draw_menu.addAction(eraser_action)
+
+        draw_menu.addSeparator()
+
+        line_action = QAction('直线(&L)', self)
+        line_action.setStatusTip('绘制直线')
+        line_action.triggered.connect(self.select_line)
+        draw_menu.addAction(line_action)
+
+        rectangle_action = QAction('矩形(&R)', self)
+        rectangle_action.setStatusTip('绘制矩形')
+        rectangle_action.triggered.connect(self.select_rectangle)
+        draw_menu.addAction(rectangle_action)
+
+        circle_action = QAction('圆形(&C)', self)
+        circle_action.setStatusTip('绘制圆形')
+        circle_action.triggered.connect(self.select_circle)
+        draw_menu.addAction(circle_action)
+
+        draw_menu.addSeparator()
+        
+        # 添加定位点功能到绘制菜单
         self.add_cross_fiducial_action = QAction('添加十字定位点', self)
         self.add_cross_fiducial_action.setStatusTip('添加十字形定位点（右键点击设置位置）')
         self.add_cross_fiducial_action.triggered.connect(self.enable_cross_fiducial_mode)
-        edit_menu.addAction(self.add_cross_fiducial_action)
+        draw_menu.addAction(self.add_cross_fiducial_action)
 
-        # 添加圆形定位点
         self.add_circle_fiducial_action = QAction('添加圆形定位点', self)
         self.add_circle_fiducial_action.setStatusTip('添加圆形定位点（右键点击设置位置）')
         self.add_circle_fiducial_action.triggered.connect(self.enable_circle_fiducial_mode)
-        edit_menu.addAction(self.add_circle_fiducial_action)
+        draw_menu.addAction(self.add_circle_fiducial_action)
 
-        # 删除定位点
         self.remove_fiducial_action = QAction('删除定位点', self)
         self.remove_fiducial_action.setStatusTip('删除当前定位点')
         self.remove_fiducial_action.triggered.connect(self.remove_fiducial)
-        edit_menu.addAction(self.remove_fiducial_action)
+        draw_menu.addAction(self.remove_fiducial_action)
 
-        # 视图菜单
-        view_menu = menubar.addMenu('视图(D)')
+        # 设置菜单
+        settings_menu = menubar.addMenu('设置(S)')
+        settings_menu.addAction(QAction('参数设置', self))
+        settings_menu.addAction(QAction('系统配置', self))
 
-        # 重命名为视图而不是View
-        view_menu.setTitle('视图(D)')
+        # 处理菜单
+        process_menu = menubar.addMenu('处理(W)')
+        process_menu.addAction(QAction('开始加工', self))
+        process_menu.addAction(QAction('停止加工', self))
+
+        # 工具菜单(保留，但不包含基础绘图工具)
+        tools_menu = menubar.addMenu('工具(T)')
+        tools_menu.addAction(QAction('位图处理', self))
+        tools_menu.addAction(QAction('曲线平滑', self))
+        tools_menu.addAction(QAction('切割优化', self))
+
+        # 主板型号(M) (原主配置)
+        main_config_menu = menubar.addMenu('主板型号(M)')
+        main_config_menu.to_ns = "RDLC320-A" # 示例
+        action_board = QAction('RDLC320-A', self)
+        action_board.setCheckable(True)
+        action_board.setChecked(True)
+        main_config_menu.addAction(action_board)
+
+        # 查看菜单 (原视图)
+        view_menu = menubar.addMenu('查看(V)')
 
         zoom_in_action = QAction('放大(&I)', self)
         zoom_in_action.setShortcut(QKeySequence.ZoomIn)
@@ -358,65 +572,40 @@ class MainWindow(QMainWindow):
         fullscreen_action.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen_action)
 
-        # 设置菜单
-        settings_menu = menubar.addMenu('设置(S)')
-        settings_menu.addAction(QAction('参数设置', self))
-        settings_menu.addAction(QAction('系统配置', self))
-
-        # 处理菜单
-        process_menu = menubar.addMenu('处理(W)')
-        process_menu.addAction(QAction('开始加工', self))
-        process_menu.addAction(QAction('停止加工', self))
-
-        # 工具菜单
-        tools_menu = menubar.addMenu('工具(T)')
-
-        pen_action = QAction('画笔(&P)', self)
-        pen_action.setStatusTip('选择画笔工具')
-        pen_action.triggered.connect(self.select_pen)
-        tools_menu.addAction(pen_action)
-
-        eraser_action = QAction('橡皮擦(&E)', self)
-        eraser_action.setStatusTip('选择橡皮擦工具')
-        eraser_action.triggered.connect(self.select_eraser)
-        tools_menu.addAction(eraser_action)
-
-        line_action = QAction('直线(&L)', self)
-        line_action.setStatusTip('绘制直线')
-        line_action.triggered.connect(self.select_line)
-        tools_menu.addAction(line_action)
-
-        rectangle_action = QAction('矩形(&R)', self)
-        rectangle_action.setStatusTip('绘制矩形')
-        rectangle_action.triggered.connect(self.select_rectangle)
-        tools_menu.addAction(rectangle_action)
-
-        circle_action = QAction('圆形(&C)', self)
-        circle_action.setStatusTip('绘制圆形')
-        circle_action.triggered.connect(self.select_circle)
-        tools_menu.addAction(circle_action)
-
-        # 主配置菜单
-        main_config_menu = menubar.addMenu('主配置(M)')
-        main_config_menu.addAction(QAction('主要配置', self))
-
-        # 查看菜单
-        view2_menu = menubar.addMenu('查看(H)')
-        view2_menu.addAction(QAction('查看选项', self))
-
-        # 属性菜单
-        prop_menu = menubar.addMenu('属性(H)')
-        prop_menu.addAction(QAction('对象属性', self))
-
-        # 社区菜单
-        community_menu = menubar.addMenu('社区')
-        community_menu.addAction(QAction('在线帮助', self))
-        community_menu.addAction(QAction('用户论坛', self))
+        # 帮助菜单
+        help_menu = menubar.addMenu('帮助(H)')
 
         about_action = QAction('关于', self)
         about_action.setStatusTip('关于本应用程序')
         about_action.triggered.connect(self.show_about)
-        community_menu.addAction(about_action)
+        help_menu.addAction(about_action)
+
+        help_docs_action = QAction('帮助文档', self)
+        help_docs_action.setShortcut('F1')
+        help_docs_action.setStatusTip('查看帮助文档')
+        help_docs_action.triggered.connect(self.show_help_docs)
+        help_menu.addAction(help_docs_action)
+
+        view_log_action = QAction('日志查看', self)
+        view_log_action.setStatusTip('查看运行日志')
+        view_log_action.triggered.connect(self.show_logs)
+        help_menu.addAction(view_log_action)
+
+        # Language 子菜单
+        lang_menu = help_menu.addMenu('Language')
+        zh_action = QAction('中文', self)
+        zh_action.setCheckable(True)
+        zh_action.setChecked(True)
+        lang_menu.addAction(zh_action)
+        
+        en_action = QAction('English', self)
+        en_action.setCheckable(True)
+        lang_menu.addAction(en_action)
+        
+        # 社区菜单
+        community_menu = menubar.addMenu('社区')
+        community_menu.addAction(QAction('在线帮助', self))
+        community_menu.addAction(QAction('用户论坛', self))
 
     def create_toolbars(self):
         """创建三行工具栏"""
@@ -476,7 +665,7 @@ class MainWindow(QMainWindow):
 
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column1.png', '投影切割', self.new_file))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column2.png', '', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '测量工具', self.open_file))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '测量工具', self.set_measure_tool))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column4.png', 'Mark点定位', self.save_file))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '曲线平滑', None))
         toolbar2.addSeparator()
@@ -738,28 +927,47 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        from PyQt5.QtWidgets import QSizePolicy
+
+        # 左侧工具栏 (直接放入布局，不放入Splitter以防止压缩)
+        self.left_toolbar = LeftToolbar()
+        # 强制设置左侧工具栏固定宽度，防止被压缩
+        self.left_toolbar.setFixedWidth(50) 
+        # 设置适当的 SizePolicy 以确保垂直方向填充但不会撑大父布局
+        self.left_toolbar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
+        main_layout.addWidget(self.left_toolbar, 0)
+
+        # 节点编辑辅助工具栏（默认隐藏，固定宽度）
+        self.node_edit_toolbar = NodeEditToolbar()
+        self.node_edit_toolbar.setFixedWidth(30)
+        self.node_edit_toolbar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
+        self.node_edit_toolbar.hide()
+        main_layout.addWidget(self.node_edit_toolbar, 0)
+
         from PyQt5.QtWidgets import QSplitter
         from PyQt5.QtCore import Qt as _Qt
 
-        # 使用 QSplitter 管理三列，避免在窗口放大时单列被异常拉伸
-        splitter = QSplitter(_Qt.Horizontal)
-
-        # 左侧工具栏
-        self.left_toolbar = LeftToolbar()
-        splitter.addWidget(self.left_toolbar)
+        # 使用 QSplitter 管理中间白板和右侧面板
+        # 移除了左侧工具栏的Splitter管理，避免左侧工具变形，同时保留右侧面板的可调节性
+        self.splitter = QSplitter(_Qt.Horizontal)
+        # 为 Splitter 设置 SizePolicy，确保其能正确扩展
+        self.splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # 中间白板区域（优先扩展）
         self.whiteboard = WhiteboardWidget()
-        splitter.addWidget(self.whiteboard)
+        self.splitter.addWidget(self.whiteboard)
 
         # 右侧属性面板
         self.right_panel = RightPanel()
-        splitter.addWidget(self.right_panel)
+        self.splitter.addWidget(self.right_panel)
 
-        # 初始分配宽度（左, 中, 右）——中间白板优先扩展
-        splitter.setSizes([80, 1000, 420])
+        # 初始分配宽度（中, 右）
+        # 保证右侧面板可见，根据原比例 1000:420 分配
+        self.splitter.setSizes([1000, 420])
+        self.splitter.setCollapsible(0, False) # 白板区不可折叠消失
 
-        main_layout.addWidget(splitter)
+        # 添加 Splitter 到主布局，stretch 系数为 1，确保它占据所有剩余空间
+        main_layout.addWidget(self.splitter, 1)
         
         # 将画布引用传递给右侧面板
         self.right_panel.set_canvas(self.whiteboard.canvas)
@@ -768,6 +976,9 @@ class MainWindow(QMainWindow):
 
         # 连接左侧工具栏信号
         self.left_toolbar.toolChanged.connect(self.on_tool_changed)
+        
+        # 连接节点编辑工具栏信号
+        self.node_edit_toolbar.actionTriggered.connect(self.on_node_edit_action)
         
         # 连接画布的选中项变化信号，实时更新位置显示
         self.whiteboard.canvas.scene.selectionChanged.connect(self._update_position_display)
@@ -799,6 +1010,87 @@ class MainWindow(QMainWindow):
             sc2.setContext(Qt.ApplicationShortcut)
             sc2.activated.connect(_scale_minus)
         except Exception:
+            pass
+
+    def on_node_edit_action(self, action_id):
+        """处理节点编辑工具栏的动作"""
+        # 获取当前场景中处于节点编辑模式的项
+        target_item = None
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        from ui.graphics_items import EditablePathItem
+        selected_paths = [item for item in selected_items if isinstance(item, EditablePathItem) and getattr(item, '_node_edit_enabled', False)]
+        
+        # 处理连接节点动作 - 支持跨路径连接
+        if action_id == NodeEditToolbar.ACTION_CONNECT_NODES:
+            if len(selected_paths) == 2:
+                # 尝试连接两个路径
+                path1 = selected_paths[0]
+                path2 = selected_paths[1]
+                nodes1 = list(path1._selected_handle_indices)
+                nodes2 = list(path2._selected_handle_indices)
+                
+                if len(nodes1) == 1 and len(nodes2) == 1:
+                    idx1 = nodes1[0]
+                    idx2 = nodes2[0]
+                    pts1 = path1.points()
+                    pts2 = path2.points()
+                    n1 = len(pts1)
+                    n2 = len(pts2)
+                    
+                    new_points = []
+                    
+                    # 确定连接方式
+                    # 1. End of P1 -> Start of P2
+                    if idx1 == n1 - 1 and idx2 == 0:
+                        new_points = pts1 + pts2
+                    # 2. Start of P1 -> End of P2 (Prepending P2 to P1) => P2 + P1
+                    elif idx1 == 0 and idx2 == n2 - 1:
+                        new_points = pts2 + pts1
+                    # 3. End of P1 -> End of P2 (Reverse P2 and append)
+                    elif idx1 == n1 - 1 and idx2 == n2 - 1:
+                        new_points = pts1 + pts2[::-1]
+                    # 4. Start of P1 -> Start of P2 (Reverse P2 and prepend) => Rev(P2) + P1
+                    # Or Reverse P1 and append P2? Usually we keep P1 as base.
+                    # Let's say we reverse P1? Or Reverse P2?
+                    # If we connect Head to Head, we have to flip one.
+                    # Let's flip P1: Rev(P1) + P2 -> But object is path1.
+                    # Let's flip P2: P2[::-1] + P1 -> Prepend reversed P2.
+                    elif idx1 == 0 and idx2 == 0:
+                        new_points = pts2[::-1] + pts1
+                        
+                    if new_points:
+                        from edit.commands import MergePathsCommand
+                        cmd = MergePathsCommand(self.whiteboard.canvas, path1, path2, new_points)
+                        cmd.redo()
+                        self.whiteboard.canvas.edit_manager.push_undo(cmd)
+                        # Re-enable node edit for the survivor (path1)
+                        path1.enable_node_edit(True)
+                        path1.set_selected_handle(idx1, False) # Deselect or reset handles
+                        # Actually we should rebuild handles.
+                        return
+            elif len(selected_paths) == 1:
+                selected_paths[0].connect_selected_nodes()
+                return
+
+        # 其他动作仅处理单选（或优先处理第一个）
+        if selected_paths:
+            target_item = selected_paths[0]
+        
+        if target_item:
+            if action_id == NodeEditToolbar.ACTION_DELETE_NODE:
+                target_item.delete_selected_node()
+            elif action_id == NodeEditToolbar.ACTION_ADD_NODE:
+                target_item.add_node_at_suggestion()
+            elif action_id == NodeEditToolbar.ACTION_BREAK_CURVE:
+                target_item.break_curve_at_selected_nodes()
+            elif action_id == NodeEditToolbar.ACTION_TO_LINE:
+                target_item.set_selected_segments_type(False) # 直线
+            elif action_id == NodeEditToolbar.ACTION_TO_CURVE:
+                target_item.set_selected_segments_type(True)  # 曲线
+            elif action_id != NodeEditToolbar.ACTION_CONNECT_NODES: # handled above
+                 QMessageBox.information(self, "节点编辑", f"触发动做: {action_id}\n(功能开发中)")
+        else:
+            # QMessageBox.information(self, "提示", "请先选择处于节点编辑模式的图形")
             pass
 
     def on_tool_changed(self, tool_id):
@@ -847,6 +1139,13 @@ class MainWindow(QMainWindow):
 
             if tool_id in tool_names:
                 self.show_status_message(f'已选择: {tool_names[tool_id]}')
+
+            # --- 控制节点编辑工具栏的显示/隐藏 ---
+            if tool_id == LeftToolbar.TOOL_NODE_EDIT:
+                self.node_edit_toolbar.show()
+            else:
+                self.node_edit_toolbar.hide()
+            # -------------------------------------
 
             # 特殊工具处理
             if tool_id == LeftToolbar.TOOL_DELETE:
@@ -956,6 +1255,25 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "保存错误", f"保存文件时发生错误:\n{str(e)}")
 
+    def get_next_layer_color(self):
+        """获取下一个可用的图层颜色"""
+        import random
+        # 获取当前已使用的颜色
+        used_colors = set(self.right_panel.layer_data.keys())
+        
+        # 尝试生成随机颜色，直到找到一个未使用的
+        for _ in range(100):
+            # 生成鲜艳的颜色 (避免太黑或太白)
+            r = random.randint(50, 255)
+            g = random.randint(50, 255)
+            b = random.randint(50, 255)
+            color = QColor(r, g, b)
+            if color.name().upper() not in used_colors:
+                return color
+        
+        # 如果尝试多次都失败（不太可能），返回黑色
+        return QColor(0, 0, 0)
+
     def import_image(self):
         """
         合成后的图像/矢量文件导入总函数：整合原 _on_import_any、_filter、import_file_any 所有逻辑
@@ -999,10 +1317,20 @@ class MainWindow(QMainWindow):
                     paths = import_hpgl(path)
 
                     if paths:
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         # 添加路径到画布
                         for pts in paths:
                             if len(pts) > 0:
-                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                                self.whiteboard.canvas.add_polyline(pts, layer_color)
+
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True) # 刷新显示
 
                         self.whiteboard.canvas.fit_all()
                         path_count = len(paths)
@@ -1026,7 +1354,18 @@ class MainWindow(QMainWindow):
                 if wbmp_img:
                     self._current_bitmap = wbmp_img
                     pix = pil_to_qpixmap(wbmp_img)
-                    self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                    
+                    # 生成新图层颜色
+                    layer_color = self.get_next_layer_color()
+                    self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                    
+                    # 更新图层名称
+                    self.right_panel.update_layer_list(force=True)
+                    hex_color = layer_color.name().upper()
+                    if hex_color in self.right_panel.layer_data:
+                        self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                        self.right_panel.update_layer_list(force=True)
+
                     self.whiteboard.canvas.fit_all()
                     self.show_status_message(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
                     return
@@ -1039,7 +1378,18 @@ class MainWindow(QMainWindow):
                             im = Image.open(converted_path).convert('RGBA')
                             self._current_bitmap = im
                             pix = pil_to_qpixmap(im)
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
                             os.unlink(converted_path)
@@ -1064,8 +1414,19 @@ class MainWindow(QMainWindow):
 
                     if paths is not None:
                         # 矢量导入成功
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         for pts in paths:
-                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                            self.whiteboard.canvas.add_polyline(pts, layer_color)
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()
                         self.show_status_message(f"EPS矢量导入成功: {status_msg}", 5000)
                         return
@@ -1242,16 +1603,46 @@ class MainWindow(QMainWindow):
 
                             # 调用画布添加图片，传入精确位置与尺寸（毫米）
                             try:
-                                self.whiteboard.canvas.add_image(pix, x_mm, y_mm, width_mm=w_mm, height_mm=h_mm)
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, x_mm, y_mm, width_mm=w_mm, height_mm=h_mm, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.show_status_message(f"EPS位图导入成功", 5000)
                             except Exception as e:
                                 # 回退到原有自动居中导入
                                 self.logger.exception('自定义尺寸导入失败，使用默认导入')
-                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.show_status_message(f"EPS位图导入成功(自动)", 5000)
                         else:
                             # 用户取消，使用默认居中导入
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.show_status_message(f"EPS位图导入已取消自定义，已自动居中导入", 5000)
                     else:
                         raise RuntimeError(f"EPS文件导入失败:\n{error_msg if error_msg else status_msg}")
@@ -1262,7 +1653,18 @@ class MainWindow(QMainWindow):
                         im = Image.open(path).convert('RGBA')
                         self._current_bitmap = im
                         pix = pil_to_qpixmap(im)
-                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                        
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()
                         self.show_status_message(f'已导入位图: {os.path.basename(path)}', 5000)
                         return
@@ -1275,7 +1677,18 @@ class MainWindow(QMainWindow):
                                 im = Image.open(converted_path).convert('RGBA')
                                 self._current_bitmap = im
                                 pix = pil_to_qpixmap(im)
-                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                                
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.whiteboard.canvas.fit_all()
                                 self.show_status_message(f'已转换并导入位图: {os.path.basename(path)}', 5000)
                                 os.unlink(converted_path)
@@ -1309,7 +1722,18 @@ class MainWindow(QMainWindow):
 
                         # 保存位图副本并添加到画布
                         self._current_bitmap = bitmap_image.copy()
-                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)  # 添加到画布(0,0)位置
+                        
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)  # 添加到画布(0,0)位置
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()  # 自动调整视图以显示全图
 
                         # 显示成功信息
@@ -1339,12 +1763,22 @@ class MainWindow(QMainWindow):
                             f"第一个点坐标: {first_path_pts[0] if first_path_pts else '无'}"
                         )
 
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         # 绘制所有路径（红色，确保可见）
                         for idx, pts in enumerate(paths):
                             if len(pts) < 2:
                                 self.logger.warning(f"路径{idx}点数量不足（{len(pts)}个），跳过绘制")
                                 continue
-                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(255, 0, 0))  # 红色线条
+                            self.whiteboard.canvas.add_polyline(pts, layer_color)  # 使用新颜色
+
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
 
                         # 调整视图以显示所有路径
                         self.whiteboard.canvas.fit_all()
@@ -1414,14 +1848,35 @@ class MainWindow(QMainWindow):
                             # 直接显示位图
                             pix = self.pil_to_qpixmap(bitmap_image)  # 使用实例方法
                             self._current_bitmap = bitmap_image.copy()
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message("✓ PCX文件导入成功", 5000)
                             paths = []  # 位图导入成功，无需返回路径
                         elif pcx_paths is not None:
                             # 如果有矢量路径（理论上PCX不会有）
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
                             for pts in pcx_paths:
-                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                                self.whiteboard.canvas.add_polyline(pts, layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message("✓ PCX文件导入成功", 5000)
                             paths = pcx_paths
@@ -1462,8 +1917,19 @@ class MainWindow(QMainWindow):
 
             # --------------------------- 其他格式导入结果处理 - 保留原逻辑 ---------------------------
             if paths:
+                # 生成新图层颜色
+                layer_color = self.get_next_layer_color()
+
                 for pts in paths:
-                    self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                    self.whiteboard.canvas.add_polyline(pts, layer_color)
+                
+                # 更新图层名称
+                self.right_panel.update_layer_list(force=True)
+                hex_color = layer_color.name().upper()
+                if hex_color in self.right_panel.layer_data:
+                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                    self.right_panel.update_layer_list(force=True)
+
                 self.whiteboard.canvas.fit_all()
                 self.show_status_message(f'已导入: {os.path.basename(path)} / 路径数={len(paths)}', 5000)
             else:
@@ -1477,7 +1943,18 @@ class MainWindow(QMainWindow):
                             im = Image.open(converted_path).convert('RGBA')
                             self._current_bitmap = im
                             pix = pil_to_qpixmap(im)
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message(f'已转换并导入位图: {os.path.basename(path)}', 5000)
                             os.unlink(converted_path)
@@ -1544,7 +2021,11 @@ class MainWindow(QMainWindow):
                 config['grayscale_threshold'] = 128  # 中等灰度阈值
 
             # 执行导出
-            success = export_to_nc(self.whiteboard.canvas, filename, config)
+            allowed_colors = None
+            if hasattr(self, 'right_panel'):
+                allowed_colors = self.right_panel.get_output_enabled_colors()
+            
+            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors)
 
             if success:
                 # 读取生成的文件以获取更多信息
@@ -1740,6 +2221,11 @@ class MainWindow(QMainWindow):
         """平移工具"""
         self.whiteboard.set_tool(self.whiteboard.canvas.Tool.PAN)
         self.show_status_message('工具: 平移')
+
+    def set_measure_tool(self):
+        """测量工具"""
+        self.whiteboard.set_tool(self.whiteboard.canvas.Tool.MEASURE)
+        self.show_status_message('工具: 测量')
 
     def zoom_to_page(self):
         """页面范围"""
@@ -2071,6 +2557,22 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.logger.error(f'精确旋转失败: {e}', exc_info=True)
                 QMessageBox.warning(self, '旋转失败', f'精确旋转失败: {e}')
+
+    def show_help_docs(self):
+        """显示帮助文档"""
+        QMessageBox.information(self, "帮助文档", "使用说明书正在编制中。\n快捷键: F1")
+
+    def show_logs(self):
+        """显示日志"""
+        # 简单的日志查看实现
+        log_path = 'app.log'
+        if os.path.exists(log_path):
+            try:
+                os.startfile(log_path)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开日志文件: {e}")
+        else:
+             QMessageBox.information(self, "日志", "当前未生成日志文件。")
 
     def show_about(self):
         """显示关于对话框"""
