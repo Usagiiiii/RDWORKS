@@ -5,10 +5,8 @@ from PyQt5.QtGui import QTransform
 from typing import List, Any
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
-
+from ui.graphics_items import EditablePathItem, EditableEllipseItem
 from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand
-from ui.graphics_items import EditablePathItem
-
 
 class EditManager(QObject):
     # 信号：通知界面更新菜单项可用性
@@ -172,6 +170,7 @@ class EditManager(QObject):
             # 剪切逻辑：暂存选中项 → 删除 → 入撤销栈
             selected = self.canvas.get_selected_items()
             if selected:
+                self.clipboard = selected
                 cmd = DeleteItemsCommand(self.canvas, selected)
                 # 先执行删除操作，再将命令记录到历史
                 cmd.redo()
@@ -183,13 +182,60 @@ class EditManager(QObject):
             self.clipboard = self.canvas.get_selected_items()
 
     def paste(self):
-        # 粘贴逻辑：从剪贴板恢复图形 → 入撤销栈
+        # 粘贴逻辑：从剪贴板创建副本 → 入撤销栈
         if hasattr(self, 'clipboard') and self.clipboard:
+            # 清除当前选中，以便选中新粘贴的图形
+            if self.canvas.scene:
+                for item in self.canvas.scene.selectedItems():
+                    item.setSelected(False)
+
             for item in self.clipboard:
-                cmd = AddItemCommand(self.canvas, item)
-                # 先执行添加，再记录历史
-                cmd.redo()
-                self.push_undo(cmd)
+                new_item = self._clone_item(item)
+                if new_item:
+                    # 偏移一点位置，以便区分 (在原位置基础上 +10, +10)
+                    # 注意：如果多次粘贴，每次基于剪贴板里的原始位置偏移
+                    # 若要实现连续粘贴递增偏移，需要记录粘贴次数，这里暂简单处理
+                    new_item.moveBy(10, 10)
+                    new_item.setSelected(True)
+                    
+                    cmd = AddItemCommand(self.canvas, new_item)
+                    cmd.redo()
+                    self.push_undo(cmd)
+
+    def _clone_item(self, item):
+        """创建图形项的深拷贝"""
+        new_item = None
+        
+        if isinstance(item, EditablePathItem):
+            # 复制路径点和属性
+            pts = [pt for pt in item._points] # deep copy of points list
+            # color check
+            color = item._color if hasattr(item, '_color') else item.pen().color()
+            smooth = item._smooth
+            new_item = EditablePathItem(pts, color, smooth)
+            
+        elif isinstance(item, EditableEllipseItem):
+            rect = item.rect()
+            cx = rect.center().x()
+            cy = rect.center().y()
+            rx = rect.width() / 2
+            ry = rect.height() / 2
+            color = item._color if hasattr(item, '_color') else item.pen().color()
+            new_item = EditableEllipseItem(cx, cy, rx, ry, color)
+            
+        elif isinstance(item, QGraphicsPixmapItem):
+            new_item = QGraphicsPixmapItem(item.pixmap())
+            
+        # 复制通用变换属性
+        if new_item:
+            new_item.setPos(item.pos())
+            new_item.setRotation(item.rotation())
+            new_item.setScale(item.scale())
+            new_item.setZValue(item.zValue())
+            if not item.transform().isIdentity():
+                new_item.setTransform(item.transform())
+                
+        return new_item
 
     def delete(self):
         if self.has_selection:

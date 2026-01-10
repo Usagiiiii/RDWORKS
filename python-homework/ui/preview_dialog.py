@@ -357,6 +357,9 @@ class PreviewDialog(QDialog):
         min_x, min_y = float('inf'), float('inf')
         max_x, max_y = float('-inf'), float('-inf')
         
+        # 1. 收集所有需要加工的项
+        pending_items = []
+        
         # 用于检测重复项 (位置和形状完全相同的项)
         processed_signatures = set()
         
@@ -371,18 +374,11 @@ class PreviewDialog(QDialog):
             if not path or path.isEmpty():
                 continue
                 
-            # 转换到场景坐标（假设items来自主场景，且PreviewCanvas使用相同坐标系）
-            # 但我们需要在PreviewCanvas中重新绘制，所以需要提取几何信息
-            # 这里我们直接在PreviewCanvas中添加新的PathItem
-            
-            # 复制路径并应用变换
-            # scene_path = self.preview_view.mapFromScene(item.sceneBoundingRect()) # No, this is view mapping
-            # Correct way: map path to scene
+            # 转换到场景坐标
             item_transform = item.sceneTransform()
             scene_path = item_transform.map(path)
             
             # 生成唯一签名以检测重复项
-            # 签名包含：类型、包围盒(x,y,w,h)、颜色
             br_sig = scene_path.boundingRect()
             rect_sig = (round(br_sig.x(), 3), round(br_sig.y(), 3), round(br_sig.width(), 3), round(br_sig.height(), 3))
             color_sig = "NONE"
@@ -391,14 +387,10 @@ class PreviewDialog(QDialog):
                 if c.isValid():
                     color_sig = c.name()
             
-            # 简单的路径特征签名 (点数量, 长度)
             path_sig = (scene_path.elementCount(), round(scene_path.length(), 3))
-            
-            # 移除 type(item) 以便检测不同类型但几何相同的项
             signature = (rect_sig, color_sig, path_sig)
             
             if signature in processed_signatures:
-                # 跳过重复项
                 print(f"Skipping duplicate item: {signature}")
                 continue
             processed_signatures.add(signature)
@@ -420,7 +412,6 @@ class PreviewDialog(QDialog):
                 c = item.color()
                 if c.isValid():
                     hex_color = c.name().upper()
-                    # 尝试精确匹配
                     if hex_color in self.layer_data:
                         params = self.layer_data[hex_color]
                         mode = params.mode
@@ -428,12 +419,8 @@ class PreviewDialog(QDialog):
                         scan_mode = params.scan_mode
                         repeat_count = getattr(params, 'repeat_count', 1)
                     else:
-                        # 尝试模糊匹配 (忽略Alpha通道，或者长度不一致)
-                        # layer_data keys are usually #RRGGBB
-                        # hex_color might be #AARRGGBB or #RRGGBB
                         found = False
                         for k, v in self.layer_data.items():
-                            # 比较最后6位 (RRGGBB)
                             if len(k) >= 7 and len(hex_color) >= 7:
                                 if k[-6:] == hex_color[-6:]:
                                     params = v
@@ -443,18 +430,49 @@ class PreviewDialog(QDialog):
                                     repeat_count = getattr(params, 'repeat_count', 1)
                                     found = True
                                     break
-                        
-                        if not found:
-                            # 如果还是没找到，可能是颜色有微小差异，或者使用了默认颜色
-                            # 这里可以打印日志，或者使用默认值
-                            pass
+            
+            # 预计算起点 (用于就近排序)
+            # 对于扫描模式，起点大概在包围盒顶部或底部，这里简化用包围盒左上角近似
+            start_pt = QPointF(0,0)
+            if mode == "激光扫描":
+                start_pt = br.topLeft()
+            else:
+                start_pt = scene_path.pointAtPercent(0)
+                
+            pending_items.append({
+                'scene_path': scene_path,
+                'mode': mode,
+                'scan_interval': scan_interval,
+                'scan_mode': scan_mode,
+                'repeat_count': repeat_count,
+                'start_pt': start_pt
+            })
+
+        # 2. 就近排序并生成仿真路径
+        while pending_items:
+            # 寻找离 last_pos 最近的项
+            nearest_idx = -1
+            min_dist = float('inf')
+            
+            for i, p_item in enumerate(pending_items):
+                dist = QLineF(last_pos, p_item['start_pt']).length()
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_idx = i
+            
+            if nearest_idx == -1: break
+            
+            item_data = pending_items.pop(nearest_idx)
+            scene_path = item_data['scene_path']
+            mode = item_data['mode']
+            scan_interval = item_data['scan_interval']
+            scan_mode = item_data['scan_mode']
+            repeat_count = item_data['repeat_count']
 
             # 根据模式生成路径
             final_path = scene_path
             if mode == "激光扫描":
                 final_path = self.generate_scan_path(scene_path, scan_interval, scan_mode)
-                # 扫描模式下，预览显示填充效果（或者密集的线）
-                # 这里我们显示生成的扫描线
                 preview_item = QGraphicsPathItem(final_path)
                 preview_item.setPen(QPen(QColor(255, 0, 255), 0.5)) # 细线
             else:
@@ -469,8 +487,6 @@ class PreviewDialog(QDialog):
                 scan_segments = self.get_scan_segments(scene_path, scan_interval, scan_mode)
                 if not scan_segments: continue
                 
-                # 扫描模式通常只执行一次，或者重复扫描？
-                # 假设重复次数也适用于扫描
                 if repeat_count > 1:
                     print(f"Scan mode repeat count: {repeat_count}")
                     
@@ -489,9 +505,6 @@ class PreviewDialog(QDialog):
                             'speed': self.default_speed
                         })
                         total_travel_len += travel_len
-                        # 修复：不显示空走路径，或者使用透明色
-                        # travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
-                        # travel_item.setZValue(-1)
                     
                     last_pos = first_pt
                     
@@ -528,10 +541,6 @@ class PreviewDialog(QDialog):
                     
             else:
                 # 切割模式
-                # 1. 空走到起点 (只在第一次循环前执行，或者每次都回到起点？)
-                # 通常切割闭合图形，终点即起点，所以后续循环不需要空走
-                # 如果是非闭合图形，需要空走回起点
-                
                 start_pt = scene_path.pointAtPercent(0)
                 
                 # 初始空走
@@ -545,9 +554,6 @@ class PreviewDialog(QDialog):
                         'speed': self.default_speed
                     })
                     total_travel_len += travel_len
-                    # 修复：不显示空走路径
-                    # travel_item = self.preview_view.scene.addLine(travel_line, QPen(QColor(0, 0, 100), 1, Qt.DashLine))
-                    # travel_item.setZValue(-1)
                 
                 last_pos = start_pt
                 

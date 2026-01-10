@@ -7,11 +7,13 @@
 import logging
 import os
 from typing import List, Tuple, Optional
-from PyQt5.QtCore import QPointF
+from PyQt5.QtCore import QPointF, Qt
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsPixmapItem
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtGui import QPixmap, QImage, QColor
 import numpy as np
 from PIL import Image
+
+LAYER_COLOR_ROLE = Qt.UserRole + 100
 # 尝试导入 EditableEllipseItem，如果失败则忽略（避免循环依赖或路径问题）
 try:
     from ui.graphics_items import EditableEllipseItem
@@ -52,7 +54,7 @@ class GCodeExporter:
         if config:
             self.config.update(config)
 
-    def export_canvas(self, canvas) -> List[str]:
+    def export_canvas(self, canvas, allowed_colors: List[str] = None) -> List[str]:
         """导出整个画布为G代码（支持定位点偏移）"""
         self.gcode_lines = []
 
@@ -64,7 +66,7 @@ class GCodeExporter:
             self._add_header(fiducial_point)
 
             # 获取所有可导出项
-            exportable_items = self._get_exportable_items(canvas)
+            exportable_items = self._get_exportable_items(canvas, allowed_colors)
             logger.info(f"找到 {len(exportable_items)} 个可导出项目")
 
             if not exportable_items:
@@ -106,7 +108,7 @@ class GCodeExporter:
         offset_x, offset_y = fiducial_offset
         return (x - offset_x, y - offset_y)
 
-    def _get_exportable_items(self, canvas) -> List[tuple]:
+    def _get_exportable_items(self, canvas, allowed_colors: List[str] = None) -> List[tuple]:
         """获取所有可导出项"""
         items = []
 
@@ -115,6 +117,31 @@ class GCodeExporter:
                 # 排除系统项
                 if self._is_system_item(item, canvas):
                     continue
+
+                # 检查图层是否允许输出
+                if allowed_colors is not None:
+                    item_color_hex = None
+                    
+                    # 尝试从 data 获取
+                    color_data = item.data(LAYER_COLOR_ROLE)
+                    if color_data:
+                        if isinstance(color_data, QColor):
+                            item_color_hex = color_data.name().upper()
+                        elif isinstance(color_data, str):
+                            item_color_hex = color_data.upper()
+                    
+                    # 如果 data 没有，尝试从 pen 获取 (针对矢量图)
+                    if not item_color_hex and hasattr(item, 'pen'):
+                        try:
+                            pen = item.pen()
+                            if pen and pen.color().isValid():
+                                item_color_hex = pen.color().name().upper()
+                        except:
+                            pass
+                            
+                    # 如果找到了颜色，且不在允许列表中，则跳过
+                    if item_color_hex and item_color_hex not in allowed_colors:
+                        continue
 
                 # 优先检查是否为椭圆/圆 (EditableEllipseItem)
                 if EditableEllipseItem and isinstance(item, EditableEllipseItem):
@@ -593,7 +620,7 @@ class GCodeExporter:
         self.laser_on = False
 
 
-def export_to_nc(canvas, filename: str, config: dict = None) -> bool:
+def export_to_nc(canvas, filename: str, config: dict = None, allowed_colors: List[str] = None) -> bool:
     """导出画布为NC文件（支持定位点）"""
     try:
         exporter = GCodeExporter()
@@ -601,7 +628,7 @@ def export_to_nc(canvas, filename: str, config: dict = None) -> bool:
         if config:
             exporter.set_config(config)
 
-        gcode_lines = exporter.export_canvas(canvas)
+        gcode_lines = exporter.export_canvas(canvas, allowed_colors)
 
         # 检查定位点信息
         fiducial = canvas.get_fiducial()

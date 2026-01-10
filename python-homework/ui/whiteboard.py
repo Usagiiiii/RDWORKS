@@ -30,6 +30,8 @@ Path = List[Pt]
 
 from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF, QLineF
 
+LAYER_COLOR_ROLE = Qt.UserRole + 100
+
 class PathPreviewItem(QGraphicsItem):
     """显示切割路径预览的项"""
     def __init__(self, travels: List[QLineF], markers: List[QPointF], parent=None):
@@ -644,6 +646,7 @@ class RotateHandle(QGraphicsEllipseItem):
 class GridCanvas(QGraphicsView):
     headMoved = pyqtSignal(float, float)
     view_changed = pyqtSignal(float, QPoint)  # 缩放比例、偏移量信号（用于标尺联动）
+    measurementChanged = pyqtSignal(str) # 测量结果信号
 
     class Tool:
         SELECT = 0
@@ -667,6 +670,7 @@ class GridCanvas(QGraphicsView):
         DRAW_CIRCLE = 18  # 新增圆形绘制工具
         ROTATE = 19  # 旋转工具（鼠标拖拽或角度输入）
         BOX_ZOOM = 20  # 框选缩放工具
+        MEASURE = 21   # 测量工具
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -707,6 +711,10 @@ class GridCanvas(QGraphicsView):
         # 旋转把手（场景中的 QGraphicsItem），根据选中项显示/隐藏
         self._rotate_handle = None
 
+        # 测量工具相关
+        self._measuring_start = None  # QPointF
+        self._measuring_current = None # QPointF
+
     def align_origin_top_left(self):
         """将场景坐标 (0,0) 对齐到视窗左上角（使工作区角为 (0,0)）。"""
         try:
@@ -733,9 +741,20 @@ class GridCanvas(QGraphicsView):
     # -------------------------- 新增：选中状态变化处理 --------------------------
     def _on_selection_changed(self):
         """当画布选中项变化时，通知EditManager"""
+        # logging.info(f"Selection changed. Count: {len(self.scene.selectedItems())}")
         has_selection = len(self.get_selected_items()) > 0
         self.edit_manager.set_has_selection(has_selection)
         
+        # 如果当前是节点编辑工具，根据选中状态切换节点显示
+        if self._tool == self.Tool.NODE_EDIT:
+            sel = set(self.scene.selectedItems())
+            # 遍历所有可编辑项，选中则启用节点编辑，未选中则禁用
+            for it in self.all_paths():
+                should_enable = it in sel
+                # 减少不必要的调用
+                if getattr(it, '_node_edit_enabled', False) != should_enable:
+                    it.enable_node_edit(should_enable)
+
         # 清除缩放手柄（如果存在）
         self.clear_scale_handles()
 
@@ -869,27 +888,89 @@ class GridCanvas(QGraphicsView):
         offset = QPoint(int(-scene_top_left.x() * zoom), int(-scene_top_left.y() * zoom))
         self.view_changed.emit(zoom, offset)
 
+    def _get_black_arrow_cursor(self):
+        """生成一个黑色箭头光标"""
+        if hasattr(self, '_cached_black_arrow_cursor'):
+            return self._cached_black_arrow_cursor
+            
+        # 绘制一个黑色箭头
+        from PyQt5.QtGui import QPixmap, QPainter, QPolygon, QPen, QBrush, QColor, QCursor
+        from PyQt5.QtCore import QPoint
+        
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(QColor(0, 0, 0, 0)) # 透明背景
+        
+        painter = QPainter(pixmap)
+        
+        # 箭头多边形 (样式模仿标准光标但填充黑色)
+        points = QPolygon([
+            QPoint(0, 0),    # 顶点
+            QPoint(0, 20),   
+            QPoint(5, 15),
+            QPoint(9, 24),   # 尾巴左
+            QPoint(12, 23),  # 尾巴末端
+            QPoint(8, 14),   # 尾巴右
+            QPoint(15, 14)
+        ])
+        
+        # 绘制黑色填充，白色描边（以便在黑色背景也能看见）
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(1)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(0, 0, 0)))
+        painter.drawPolygon(points)
+        
+        painter.end()
+        
+        # 热点在顶端 (0, 0)
+        self._cached_black_arrow_cursor = QCursor(pixmap, 0, 0)
+        return self._cached_black_arrow_cursor
+
     # --- 工具设置方法 ---
     def set_tool(self, t: int):
         """设置当前工具"""
         old_tool = self._tool
         self._tool = t
 
+        if old_tool == self.Tool.MEASURE:
+            self._measuring_start = None
+            self._measuring_current = None
+            # self.measurementChanged.emit("")  # 保持上次测量结果显示
+            self.scene.update()
+
         # 退出节点编辑模式
         if old_tool == self.Tool.NODE_EDIT:
             for it in self.all_paths():
                 it.enable_node_edit(False)
+            # 恢复默认光标
+            self.viewport().unsetCursor()
 
         # 进入节点编辑模式
         if t == self.Tool.NODE_EDIT:
             for it in self.selected_paths():
                 it.enable_node_edit(True)
+            # 设置黑色光标
+            self.viewport().setCursor(self._get_black_arrow_cursor())
 
         # 设置拖动模式
         if t == self.Tool.PAN:
             self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.setInteractive(False)  # 禁用与图形项的交互（解决平移时误选误动图形的问题）
+        elif t == self.Tool.NODE_EDIT:
+            # 节点编辑模式下，也启用框选，方便多选
+            self.setDragMode(QGraphicsView.RubberBandDrag)
+            self.setInteractive(True)
+            # self.setDragMode(QGraphicsView.NoDrag)
+        elif t == self.Tool.MEASURE:
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setInteractive(False) # 测量时不选择元素
+            self.viewport().setCursor(Qt.CrossCursor)
         else:
             self.setDragMode(QGraphicsView.RubberBandDrag)
+            self.setInteractive(True)
+            # 恢复默认光标（RubberBandDrag 会自动设置箭头或十字）
+            self.viewport().unsetCursor()
 
         # 清除临时绘图状态
         self._clear_drawing_state()
@@ -1032,7 +1113,7 @@ class GridCanvas(QGraphicsView):
         return items
 
     # -------------------------- 修改：添加图片方法（支持选中 + 命令模式） --------------------------
-    def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0, width_mm: float = None, height_mm: float = None):
+    def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0, width_mm: float = None, height_mm: float = None, layer_color: QColor = None):
         # ========== 1. 计算图片尺寸和缩放比例 ==========
         # 获取工作区域尺寸
         work_area_width = self._work_w
@@ -1123,6 +1204,9 @@ class GridCanvas(QGraphicsView):
         item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
         item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
 
+        if layer_color:
+            item.setData(LAYER_COLOR_ROLE, layer_color)
+
         # 应用缩放转换（像素到毫米）
         s = 25.4 / 96.0  # 96dpi → 毫米的缩放系数
         # 移除 Y 轴翻转，使用正比例
@@ -1193,10 +1277,11 @@ class GridCanvas(QGraphicsView):
         return item
 
     def all_paths(self) -> List[EditablePathItem]:
-        return [it for it in self.scene.items() if isinstance(it, EditablePathItem)]
+        # Return all editable items (Paths and Ellipses)
+        return [it for it in self.scene.items() if hasattr(it, 'enable_node_edit')]
 
     def selected_paths(self) -> List[EditablePathItem]:
-        return [it for it in self.scene.selectedItems() if isinstance(it, EditablePathItem)]
+        return [it for it in self.scene.selectedItems() if hasattr(it, 'enable_node_edit')]
 
     def fit_all(self):
         logger.info("执行fit_all：调整视图至所有内容可见")
@@ -1535,8 +1620,24 @@ class GridCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, e: QMouseEvent):
         pos = self.mapToScene(e.pos())
-        # 发送信号，注意转换为 float
+        
+        # 始终发送坐标信号，确保坐标信息一直显示
         self.headMoved.emit(float(pos.x()), float(pos.y()))
+        
+        if self._tool == self.Tool.MEASURE:
+            self._measuring_current = pos
+            if self._measuring_start:
+                # 计算并通知测量信息
+                dx = pos.x() - self._measuring_start.x()
+                dy = pos.y() - self._measuring_start.y()
+                # 按照用户习惯，宽高为正值
+                w = abs(dx)
+                h = abs(dy)
+                self.measurementChanged.emit(f"W: {w:.2f} mm  H: {h:.2f} mm")
+                self.scene.update()
+            return
+
+        # 实时更新缩放手柄位置（如果存在且正在拖动选中项）
 
         # 实时更新缩放手柄位置（如果存在且正在拖动选中项）
         if self._tool == self.Tool.SELECT and hasattr(self, '_scale_handles') and self._scale_handles:
@@ -1715,7 +1816,7 @@ class GridCanvas(QGraphicsView):
     def leaveEvent(self, event):
         """鼠标离开画布事件"""
         # 发送特殊值表示离开
-        self.headMoved.emit(float('inf'), float('inf'))
+        # self.headMoved.emit(float('inf'), float('inf')) # 不清除坐标显示
         super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1798,6 +1899,24 @@ class GridCanvas(QGraphicsView):
             if handle.pos_type in positions:
                 handle.setPos(positions[handle.pos_type])
 
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        
+        # 绘制测量工具的临时矩形
+        if self._tool == self.Tool.MEASURE and self._measuring_start and self._measuring_current:
+            start = self._measuring_start
+            curr = self._measuring_current
+            
+            r = QRectF(start, curr).normalized()
+            
+            # 绘制半透明蓝色填充和虚线边框
+            pen = QPen(QColor(0, 120, 255))
+            pen.setStyle(Qt.DashLine)
+            pen.setWidth(0) # Cosmetic pen
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(0, 120, 255, 40)))
+            painter.drawRect(r)
+
     def clear_scale_handles(self):
         """清除缩放手柄"""
         if hasattr(self, '_scale_handles'):
@@ -1812,6 +1931,14 @@ class GridCanvas(QGraphicsView):
     # --- 鼠标事件处理 ---
     def mousePressEvent(self, e: QMouseEvent):
         """鼠标按下事件处理"""
+        # Shift多选支持 Hack：如果当前是选择工具或节点编辑工具且按住了Shift，模拟Ctrl的效果以实现多选
+        # (QGraphicsView默认Ctrl+Click为多选Toggle，Shift+Click为RangeSelection或无特殊处理)
+        if (self._tool == self.Tool.SELECT or self._tool == self.Tool.NODE_EDIT) and (e.modifiers() & Qt.ShiftModifier):
+             # 创建一个新的事件，将ShiftModifier替换为ControlModifier
+             new_modifiers = (e.modifiers() & ~Qt.ShiftModifier) | Qt.ControlModifier
+             e = QMouseEvent(e.type(), e.localPos(), e.windowPos(), e.screenPos(),
+                             e.button(), e.buttons(), new_modifiers, e.source())
+
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
 
@@ -1839,6 +1966,12 @@ class GridCanvas(QGraphicsView):
             self._move_tracking = []
 
         if e.button() == Qt.LeftButton:
+            if self._tool == self.Tool.MEASURE:
+                self._measuring_start = pos
+                self._measuring_current = pos
+                self.scene.update()
+                return
+
             # 旋转工具：开始旋转交互（仅当至少选中一项时）
             if self._tool == self.Tool.ROTATE:
                 try:
@@ -2112,6 +2245,14 @@ class GridCanvas(QGraphicsView):
     def mouseReleaseEvent(self, e: QMouseEvent):
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
+
+        if self._tool == self.Tool.MEASURE:
+            # 测量结束，清除状态
+            self._measuring_start = None
+            self._measuring_current = None
+            # self.measurementChanged.emit("") # 保持显示
+            self.scene.update()
+            return
 
         if e.button() == Qt.LeftButton:
             if self._tool == self.Tool.DRAW_RECT and self._drawing_pts:
