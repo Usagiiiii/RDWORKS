@@ -7,7 +7,7 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QToolButton, QButtonGroup
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtGui import QIcon
-
+from utils.language_manager import language_manager
 
 class LeftToolbar(QWidget):
     """左侧垂直工具栏"""
@@ -35,7 +35,7 @@ class LeftToolbar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.init_ui()
-        
+    
     def init_ui(self):
         """初始化界面"""
         layout = QVBoxLayout(self)
@@ -47,31 +47,36 @@ class LeftToolbar(QWidget):
         self.button_group.setExclusive(True)
         self.button_group.buttonClicked.connect(self.on_tool_button_clicked)
         
-        # 工具列表 - 使用 left_sidebar_icons 中的图标
+        # 工具列表: key, icon_text, default_tooltip, icon_path, tool_id
         tools = [
-            ("↖", "图形选取", "left_sidebar_icons/sidebar_icon1.png", self.TOOL_SELECT),
-            ("✏", "节点编辑", "left_sidebar_icons/sidebar_icon2.png", self.TOOL_NODE_EDIT),
-            ("▭", "直线", "left_sidebar_icons/sidebar_icon3.png", self.TOOL_LINE),
-            ("○", "折线", "left_sidebar_icons/sidebar_icon4.png", self.TOOL_POLYLINE),
-            ("⬢", "曲线", "left_sidebar_icons/sidebar_icon5.png", self.TOOL_CURVE),
-            ("▲", "矩形", "left_sidebar_icons/sidebar_icon6.png", self.TOOL_RECTANGLE),
-            ("◀", "椭圆", "left_sidebar_icons/sidebar_icon7.png", self.TOOL_ELLIPSE),
-            ("☰", "文字", "left_sidebar_icons/sidebar_icon8.png", self.TOOL_TEXT),
-            ("≋", "点", "left_sidebar_icons/sidebar_icon9.png", self.TOOL_POINT),
-            ("⊞", "生成网络", "left_sidebar_icons/sidebar_icon10.png", self.TOOL_GRID),
-            ("✂", "删除", "left_sidebar_icons/sidebar_icon11.png", self.TOOL_DELETE),
-            ("◐", "水平镜像", "left_sidebar_icons/sidebar_icon12.png", self.TOOL_H_MIRROR),
-            ("✱", "垂直镜像", "left_sidebar_icons/sidebar_icon13.png", self.TOOL_V_MIRROR),
-            ("T", "图形停靠", "left_sidebar_icons/sidebar_icon14.png", self.TOOL_DOCK),
-            ("", "阵列复制", "left_sidebar_icons/sidebar_icon15.png", self.TOOL_ARRAY),
+            ("Tool_Select", "↖", "图形选取", "left_sidebar_icons/sidebar_icon1.png", self.TOOL_SELECT),
+            ("Tool_NodeEdit", "✏", "节点编辑", "left_sidebar_icons/sidebar_icon2.png", self.TOOL_NODE_EDIT),
+            ("Tool_Line", "▭", "直线", "left_sidebar_icons/sidebar_icon3.png", self.TOOL_LINE),
+            ("Tool_Polyline", "○", "折线", "left_sidebar_icons/sidebar_icon4.png", self.TOOL_POLYLINE),
+            ("Tool_Curve", "⬢", "曲线", "left_sidebar_icons/sidebar_icon5.png", self.TOOL_CURVE),
+            ("Tool_Rectangle", "▲", "矩形", "left_sidebar_icons/sidebar_icon6.png", self.TOOL_RECTANGLE),
+            ("Tool_Ellipse", "◀", "椭圆", "left_sidebar_icons/sidebar_icon7.png", self.TOOL_ELLIPSE),
+            ("Tool_Text", "☰", "文字", "left_sidebar_icons/sidebar_icon8.png", self.TOOL_TEXT),
+            ("Tool_Point", "≋", "点", "left_sidebar_icons/sidebar_icon9.png", self.TOOL_POINT),
+            ("Tool_Grid", "⊞", "生成网络", "left_sidebar_icons/sidebar_icon10.png", self.TOOL_GRID),
+            ("Tool_Delete", "✂", "删除", "left_sidebar_icons/sidebar_icon11.png", self.TOOL_DELETE),
+            ("Tool_HMirror", "◐", "水平镜像", "left_sidebar_icons/sidebar_icon12.png", self.TOOL_H_MIRROR),
+            ("Tool_VMirror", "✱", "垂直镜像", "left_sidebar_icons/sidebar_icon13.png", self.TOOL_V_MIRROR),
+            ("Tool_Dock", "T", "图形停靠", "left_sidebar_icons/sidebar_icon14.png", self.TOOL_DOCK),
+            ("Tool_Array", "", "阵列复制", "left_sidebar_icons/sidebar_icon15.png", self.TOOL_ARRAY),
         ]
+        
+        # 保存所有按钮引用以便后续更新
+        self.tool_buttons = []
 
-        # 修改这里：解包所有4个元素
-        for icon_text, tooltip, icon_path, tool_id in tools:  # 解包4个变量
-            btn = self.create_tool_button(icon_text, tooltip, icon_path, tool_id)  # 传递tool_id
+        for tr_key, icon_text, default_tooltip, icon_path, tool_id in tools:
+            btn = self.create_tool_button(icon_text, default_tooltip, icon_path, tool_id)
+            btn.setProperty('tr_key', tr_key)
+            btn.setProperty('default_tooltip', default_tooltip)
             
             layout.addWidget(btn)
             self.button_group.addButton(btn)
+            self.tool_buttons.append(btn)
         
         # 第一个按钮默认选中
         if self.button_group.buttons():
@@ -81,7 +86,7 @@ class LeftToolbar(QWidget):
         layout.addStretch()
         
         # 设置固定宽度
-        self.setFixedWidth(50)
+        self.setFixedWidth(36)  # 减小宽度
         
         # 样式
         self.setStyleSheet("""
@@ -90,13 +95,24 @@ class LeftToolbar(QWidget):
                 border-right: 1px solid #d0d0d0;
             }
         """)
+
+        # 初始翻译
+        self.retranslate_ui()
         
+    def retranslate_ui(self):
+        """更新界面语言"""
+        for btn in self.tool_buttons:
+            tr_key = btn.property('tr_key')
+            default_tooltip = btn.property('default_tooltip')
+            tooltip = language_manager.tr('LeftToolbar', tr_key, default_tooltip)
+            btn.setToolTip(tooltip)
+
     def create_tool_button(self, text, tooltip, icon_path=None, tool_id=None):
         """创建工具按钮"""
         btn = QToolButton()
         btn.setToolTip(tooltip)
         btn.setCheckable(True)
-        btn.setFixedSize(44, 44)
+        btn.setFixedSize(32, 32)  # 减小按钮尺寸
         btn.setProperty("tool_id", tool_id)  # 存储工具ID
 
         # 尝试加载图标，如果失败则使用文本
@@ -104,7 +120,7 @@ class LeftToolbar(QWidget):
             icon = QIcon(icon_path)
             if not icon.isNull():
                 btn.setIcon(icon)
-                btn.setIconSize(QSize(36, 36))
+                btn.setIconSize(QSize(24, 24))  # 减小图标尺寸
             else:
                 btn.setText(text)
         else:
@@ -133,4 +149,34 @@ class LeftToolbar(QWidget):
         tool_id = button.property("tool_id")
         if tool_id is not None:
             self.toolChanged.emit(tool_id)
+
+    def select_tool(self, tool_id):
+        """手动选中指定工具（并触发所有相关逻辑）"""
+        for btn in self.button_group.buttons():
+            if btn.property("tool_id") == tool_id:
+                btn.setChecked(True)
+                self.toolChanged.emit(tool_id)
+                break
+
+    def update_selection_dependent_tools(self, has_selection):
+        """更新依赖选择的工具按钮状态"""
+        dependent_tools = [
+            self.TOOL_H_MIRROR,
+            self.TOOL_V_MIRROR,
+            self.TOOL_DOCK,
+            self.TOOL_ARRAY,
+            self.TOOL_DELETE  # 删除工具通常也依赖选择（虽然有点选模式，但为了符合用户“只有选取了对象那四个工具才变成可点击”的描述，可能用户指的是最下面那几个。不过用户明确说是“最下面的四个”。）
+        ]
+        # 用户指明是“最下面的四个”，即 11, 12, 13, 14。DELETE 是 10，在它们上面。
+        # 所以只处理 11, 12, 13, 14
+        target_tools = [self.TOOL_H_MIRROR, self.TOOL_V_MIRROR, self.TOOL_DOCK, self.TOOL_ARRAY]
+
+        for btn in self.tool_buttons:
+            tid = btn.property("tool_id")
+            if tid in target_tools:
+                btn.setEnabled(has_selection)
+                # 如果当前禁用的工具是被选中的，则切回选择工具
+                if not has_selection and btn.isChecked():
+                     if self.button_group.buttons():
+                         self.button_group.buttons()[0].click()
 

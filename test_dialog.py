@@ -1,26 +1,23 @@
 import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), 'python-homework'))
+
 from PyQt5.QtWidgets import QApplication
-from ui.manufacturer_settings_dialog import ManufacturerSettingsDialog, ManufacturerPasswordDialog
+from ui.text_dialog import TextDialog
 
 def test():
     app = QApplication(sys.argv)
     
-    print("Testing Password Dialog...")
-    pwd = ManufacturerPasswordDialog()
-    if pwd.exec_() == 1:
-        print("Password Accepted.")
-        print("Creating Settings Dialog...")
-        try:
-            dlg = ManufacturerSettingsDialog()
-            print("Settings Dialog Created. Showing...")
-            dlg.show()
-            sys.exit(app.exec_())
-        except Exception as e:
-            print(f"Error creating/showing settings dialog: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("Password Rejected.")
+    print("Testing TextDialog...")
+    try:
+        dlg = TextDialog()
+        print("Text Dialog Created. Showing...")
+        dlg.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"Error creating/showing dialog: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     test()

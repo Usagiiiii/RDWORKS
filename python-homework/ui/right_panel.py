@@ -8,10 +8,11 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox, QDialog, QButtonGroup)
+                             QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox, QDialog, QButtonGroup,
+                             QStyledItemDelegate, QStyle)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView, QListView
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor, QIcon, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter, QPen
 from .device_config_dialog import DeviceConfigDialog
 from my_io.gcode.gcode_exporter import GCodeExporter
 from utils.device_manager import DeviceManager
@@ -49,6 +50,196 @@ class LayerParams:
         self.min_power_2 = 30.0
         self.max_power_2 = 30.0
 
+class LayerColorDelegate(QStyledItemDelegate):
+    """自定义委托，用于第一列图层颜色的显示"""
+    def paint(self, painter, option, index):
+        # 1. 保存当前状态
+        painter.save()
+        
+        # 2. 如果选中，绘制高亮背景（深蓝色）
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, QColor("#0078d7"))  # 经典选中蓝
+            # 注意：不去除 State_Selected，否则文字颜色可能不正确（如果要绘制文字的话）
+            
+        # 3. 绘制图层颜色块
+        # 获取存储的颜色
+        bg_brush = index.data(Qt.BackgroundRole)
+        if bg_brush:
+             # 我们希望颜色块不要填满整个单元格，而是有一定的边距，或者填满但有文字
+             # 根据用户截图，颜色块是填满的或者很大的
+             # 这里直接使用 BackgroundRole 绘制，但可能会覆盖掉选中的蓝色背景
+             # 如果用户想要 "后面覆盖一层蓝色"，意味着颜色块可能比单元格小？
+             # 或者颜色块本身是透过一点蓝色的？
+             # "图层颜色不要被覆盖，后面覆盖一层蓝色" -> 这通常意味着颜色块是不透明的，且位于蓝色背景之上
+             
+             # 如果是全填充，那么蓝色就看不见了
+             # 所以，可能颜色块需要留一点边距？或者颜色块本来就不是全填充的？
+             # 如果直接使用默认的 paint，当选中时，style 会覆盖 background
+             
+             # 我们手动绘制颜色
+             color = bg_brush.color()
+             rect = option.rect
+             
+             # 方案：绘制一个略小的矩形作为颜色块，这样能看到背后的蓝色选中背景
+             # 或者，如果用户意思是像 Screenshot 3 那样（第一列依然是全显示的颜色）
+             # 那么选中色在第一列其实是被遮挡的？
+             # 但是 Screenshot 3 中，选中行第一列的字是白色的吗？如果是，说明选中状态生效了。
+             # 让我们尝试绘制全铺满的颜色，但是设置一定的透明度？不对。
+             
+             # 按照 "图层颜色不要被覆盖" 理解，应该优先显示图层颜色。
+             # 按照 "后面覆盖一层蓝色" 理解，如果图层颜色是半透明或者有边距，能看到蓝色。
+             # 如果图层颜色是不透明的全填充，那 "后面覆盖一层蓝色" 实际上是看不到的，除了可能文字变白。
+             
+             # 我们尝试：只绘制背景色，不绘制默认的选中背景覆盖
+             painter.fillRect(option.rect, color)
+             
+        # 4. 绘制文字（如果有）
+        text = index.data(Qt.DisplayRole)
+        if text:
+            # 选中时文字变白
+            if option.state & QStyle.State_Selected:
+                painter.setPen(Qt.white)
+            else:
+                # 需考虑背景色深浅
+                # 这里简单处理，如果 paint 已经填充了背景色，我们需要对比度
+                # 之前代码里有根据背景色判断文字颜色的逻辑
+                fg_brush = index.data(Qt.ForegroundRole)
+                if fg_brush:
+                    painter.setPen(fg_brush.color())
+                else:
+                     painter.setPen(Qt.black)
+            
+            painter.drawText(option.rect, Qt.AlignCenter, text)
+            
+        painter.restore()
+
+class LayerTable(QTableWidget):
+    """支持拖拽排序的图层表格"""
+    # 修改信号签名，传递源行号和目标行号
+    layerMoved = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropOverwriteMode(False)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.drop_indicator_row = -1 # 用于指示插入位置的行号
+
+    def dragMoveEvent(self, event):
+        """处理拖动过程中的移动事件，计算并绘制插入指示器"""
+        if event.source() == self:
+            event.accept()
+            # 获取当前鼠标位置对应的行
+            index = self.indexAt(event.pos())
+            if not index.isValid():
+                # 如果在最后一行下面，则指向最后一行之后
+                self.drop_indicator_row = self.rowCount()
+            else:
+                # 否则指向当前鼠标所在行的上方或下方？
+                # 通常逻辑：如果覆盖了某行，且是 InternalMove，我们假设插入到该行之前
+                # 但如果是最后一行，根据位置可能插入到最后
+                
+                # 简单处理：插入到鼠标所在行的位置（即该行之前）
+                # 为了防止闪烁，我们可以计算一下是在行的上半部分还是下半部分
+                # 这里简单点：直接插入到 indexAt 的行位置（即在此行上方插入）
+                self.drop_indicator_row = index.row()
+                
+                # 如果鼠标在最后一行的下半部分，则认为是追加到最后
+                # 但 QTableWidget 的 indexAt 是精确的
+                pass
+            
+            # 强制 viewport 重绘以显示指示线
+            self.viewport().update()
+        else:
+            super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        """拖出时清除指示器"""
+        self.drop_indicator_row = -1
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    def paintEvent(self, event):
+        """重写绘制事件，在 Items 绘制完后绘制插入指示线"""
+        super().paintEvent(event)
+        
+        if self.drop_indicator_row >= 0:
+            painter = QPainter(self.viewport())
+            painter.setPen(QPen(QColor("#808080"), 2)) # 灰色，2像素宽
+            
+            # 计算绘制位置
+            if self.drop_indicator_row < self.rowCount():
+                # 获取该行的 Y 坐标
+                # visualRect 返回的是在 viewport 中的坐标
+                rect = self.visualRect(self.model().index(self.drop_indicator_row, 0))
+                y = rect.top()
+            else:
+                # 如果是在最后一行之后
+                if self.rowCount() > 0:
+                    rect = self.visualRect(self.model().index(self.rowCount() - 1, 0))
+                    y = rect.bottom()
+                else:
+                    y = 0 # 表格为空时
+            
+            # 绘制横线
+            painter.drawLine(0, y, self.viewport().width(), y)
+
+    def dropEvent(self, event):
+        self.drop_indicator_row = -1 # 清除指示器
+        self.viewport().update()
+        
+        if event.source() == self:
+            event.accept()
+            rows = sorted(set(item.row() for item in self.selectedItems()))
+            if not rows:
+                return
+            current_row = rows[0]
+            
+            target_index = self.indexAt(event.pos())
+            if not target_index.isValid():
+                target_row = self.rowCount()
+            else:
+                target_row = target_index.row()
+                
+            if current_row == target_row:
+                return
+
+            # 不再在本地执行 move_row，而是通知上层去刷新数据
+            # self.move_row(current_row, target_row)
+            self.layerMoved.emit(current_row, target_row)
+        else:
+            super().dropEvent(event)
+
+    def move_row(self, source_row, target_row):
+        # 暂时屏蔽信号，防止在移除和插入过程中触发 itemChanged 等信号
+        self.blockSignals(True)
+        try:
+            items = []
+            for col in range(self.columnCount()):
+                items.append(self.takeItem(source_row, col))
+            
+            self.removeRow(source_row)
+            
+            if source_row < target_row:
+                target_row -= 1
+                
+            self.insertRow(target_row)
+            for col, item in enumerate(items):
+                # 只有当 item 不为 None 时才设置回表格
+                if item:
+                    self.setItem(target_row, col, item)
+            
+            self.selectRow(target_row)
+        except Exception as e:
+            print(f"Error moving layer row: {e}")
+        finally:
+            # 恢复信号
+            self.blockSignals(False)
+
 class RightPanel(QWidget):
     """右侧属性面板"""
     
@@ -59,6 +250,7 @@ class RightPanel(QWidget):
         super().__init__(parent)
         self.canvas = None # 持有 Canvas 引用
         self.layer_data = {} # Key: hex color string, Value: LayerParams
+        self.layer_order = [] # 存储图层顺序（hex color string list）
         
         self.communicator = LaserCommunicator()
         self.communicator.log_message.connect(self.on_comm_log)
@@ -223,6 +415,9 @@ class RightPanel(QWidget):
         lbl_pos = QLabel("图形定位位置:")
         combo_pos = QComboBox()
         combo_pos.setView(QListView())
+        combo_pos.setMaxVisibleItems(10)
+        combo_pos.setEditable(True)
+        combo_pos.lineEdit().setReadOnly(True)
         combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
         combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
         combo_pos.setMinimumHeight(24)
@@ -290,6 +485,7 @@ class RightPanel(QWidget):
         self.combo_device = QComboBox()
         self.combo_device.setView(QListView())
         self.combo_device.setMinimumHeight(28)
+        self.combo_device.setMaxVisibleItems(10)
         # 防止下拉框遮挡：设置为可编辑但只读
         self.combo_device.setEditable(True)
         self.combo_device.lineEdit().setReadOnly(True)
@@ -379,9 +575,14 @@ class RightPanel(QWidget):
     def get_output_enabled_colors(self) -> list:
         """获取允许输出的图层颜色列表"""
         allowed = []
-        for color_hex, params in self.layer_data.items():
-            if params.is_output:
-                allowed.append(color_hex)
+        # 使用 layer_order 确保输出顺序与列表顺序一致
+        order = self.layer_order if self.layer_order else self.layer_data.keys()
+        
+        for color_hex in order:
+            if color_hex in self.layer_data:
+                params = self.layer_data[color_hex]
+                if params.is_output:
+                    allowed.append(color_hex)
         return allowed
 
     def on_btn_start_clicked(self):
@@ -480,6 +681,45 @@ class RightPanel(QWidget):
             
         QMessageBox.information(self, "提示", "脱机文件输出功能已就绪。\n(此处应连接设备或执行输出逻辑)")
 
+    def on_layer_moved(self, source_row, target_row):
+        """处理图层移动"""
+        if not self.layer_order:
+             # 如果 layer_order 还没被初始化（应该不会，但做个保险）
+             self.update_layer_list() # 这会填充 self.layer_order
+             
+        if source_row < 0 or source_row >= len(self.layer_order):
+             return
+             
+        # 注意: target_row 可能等于 len，表示追加到最后
+        
+        # 在列表中移动元素
+        item = self.layer_order.pop(source_row)
+        
+        # 计算插入位置
+        # 如果是向下拖拽，source_row < target_row
+        # 比如 [A, B, C], 拖 A(0) 到 C(2) 位置。
+        # dropEvent 中 target_row 是 drop 时的 indexAt row
+        # 如果 drop 到 C (2), target_row=2.
+        # 我们希望插在 C 之前： [B, A, C]
+        # pop(0) -> A. list=[B, C]. 
+        # target=2. target-1=1. insert(1, A) -> [B, A, C]. 正确。
+        
+        # 如果是 drop 到最后空白处, target_row=3.
+        # pop(0) -> A. list=[B, C].
+        # target=3. target-1=2. insert(2, A) -> [B, C, A]. 正确。
+        
+        if source_row < target_row:
+             target_row -= 1
+        
+        # 边界检查
+        if target_row < 0: target_row = 0
+        if target_row > len(self.layer_order): target_row = len(self.layer_order)
+         
+        self.layer_order.insert(target_row, item)
+        
+        # 强制刷新表格
+        self.update_layer_list(force=True)
+
     def create_processing_tab(self):
         """创建加工标签页（图层列表与参数设置）"""
         widget = QWidget()
@@ -488,8 +728,9 @@ class RightPanel(QWidget):
         main_layout.setSpacing(8)
 
         # 1. 图层列表
-        self.layer_table = QTableWidget()
+        self.layer_table = LayerTable()
         self.layer_table.setColumnCount(5)
+        self.layer_table.layerMoved.connect(self.on_layer_moved)
         self.layer_table.setHorizontalHeaderLabels(["图层", "模式", "输出", "显示", "锁定"])
         self.layer_table.horizontalHeader().setStretchLastSection(False)
         self.layer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -504,22 +745,23 @@ class RightPanel(QWidget):
         self.layer_table.setEditTriggers(QAbstractItemView.NoEditTriggers) # 禁止直接编辑文本，双击弹窗
         self.layer_table.setMinimumHeight(150)
         
+        # 设置特定列的委托
+        self.layer_table.setItemDelegateForColumn(0, LayerColorDelegate(self.layer_table))
+
         # 样式优化
         self.layer_table.setStyleSheet("""
             QTableWidget {
                 border: 1px solid #d0d0d0;
                 background-color: #ffffff;
                 gridline-color: #e0e0e0;
+                selection-background-color: #0078d7; /* 选中背景色：深蓝 */
+                selection-color: #ffffff;            /* 选中文字色：白 */
             }
             QHeaderView::section {
                 background-color: #f0f0f0;
                 padding: 4px;
                 border: 1px solid #d0d0d0;
                 font-weight: bold;
-            }
-            QTableWidget::item:selected {
-                background-color: #e8f0fe;
-                color: #000;
             }
         """)
         
@@ -718,8 +960,17 @@ class RightPanel(QWidget):
         self.layer_table.blockSignals(True) # 暂停信号防止触发 itemChanged
         self.layer_table.setRowCount(0)
         
-        # 排序：按颜色 hex 排序或自定义顺序
-        sorted_colors = sorted(list(used_colors))
+        # 排序：优先使用已保存的顺序
+        if not self.layer_order:
+             sorted_colors = sorted(list(used_colors))
+        else:
+             # 保留 self.layer_order 中的顺序，并添加新出现的颜色
+             sorted_colors = [c for c in self.layer_order if c in used_colors]
+             new_colors = sorted([c for c in used_colors if c not in sorted_colors])
+             sorted_colors.extend(new_colors)
+        
+        # 更新 layer_order 以保持同步
+        self.layer_order = sorted_colors
         
         for row, hex_color in enumerate(sorted_colors):
             params = self.layer_data[hex_color]
@@ -1135,6 +1386,9 @@ class RightPanel(QWidget):
         cycle_row1.addWidget(QLabel("先切割后送料"),0)
         cycle_order=QComboBox()
         cycle_order.setView(QListView()) # 解决遮挡问题
+        cycle_order.setMaxVisibleItems(10)
+        cycle_order.setEditable(True)
+        cycle_order.lineEdit().setReadOnly(True)
         cycle_order.addItems(["先切割后送料","先送料后切割","往返送料"])
         cycle_row1.addWidget(cycle_order,1)
         cycle_layout.addLayout(cycle_row1)
@@ -1150,6 +1404,9 @@ class RightPanel(QWidget):
         cycle_row2.addWidget(QLabel("手动输入"),0)
         feed_input=QComboBox()
         feed_input.setView(QListView()) # 解决遮挡问题
+        feed_input.setMaxVisibleItems(10)
+        feed_input.setEditable(True)
+        feed_input.lineEdit().setReadOnly(True)
         feed_input.addItems(["手动输入","Y向幅面","图形高度","最小送料长度"])
         cycle_row2.addWidget(feed_input,1)
         cycle_layout.addLayout(cycle_row2)

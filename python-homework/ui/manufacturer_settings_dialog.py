@@ -156,6 +156,9 @@ class MotorSettingsWidget(QWidget):
         # Row 0
         config_grid.addWidget(QLabel("方向极性:"), 0, 0, alignment=Qt.AlignRight)
         self.dir_polarity = QComboBox()
+        self.dir_polarity.setMaxVisibleItems(10)
+        self.dir_polarity.setEditable(True)
+        self.dir_polarity.lineEdit().setReadOnly(True)
         self.dir_polarity.addItems(["负", "正"])
         config_grid.addWidget(self.dir_polarity, 0, 1)
 
@@ -171,12 +174,18 @@ class MotorSettingsWidget(QWidget):
         # Row 1
         config_grid.addWidget(QLabel("限位极性:"), 1, 0, alignment=Qt.AlignRight)
         self.limit_polarity = QComboBox()
+        self.limit_polarity.setMaxVisibleItems(10)
+        self.limit_polarity.setEditable(True)
+        self.limit_polarity.lineEdit().setReadOnly(True)
         self.limit_polarity.addItems(["负", "正"])
         config_grid.addWidget(self.limit_polarity, 1, 1)
 
         # Row 2
         config_grid.addWidget(QLabel("控制方式:"), 2, 0, alignment=Qt.AlignRight)
         self.control_mode = QComboBox()
+        self.control_mode.setMaxVisibleItems(10)
+        self.control_mode.setEditable(True)
+        self.control_mode.lineEdit().setReadOnly(True)
         self.control_mode.addItems(["脉冲+方向", "双脉冲"])
         config_grid.addWidget(self.control_mode, 2, 1)
 
@@ -359,6 +368,9 @@ class LaserSettingsWidget(QWidget):
         # Row 1
         top_layout.addWidget(QLabel("激光器类型:"), 1, 0, alignment=Qt.AlignRight)
         self.laser_type = QComboBox()
+        self.laser_type.setMaxVisibleItems(10)
+        self.laser_type.setEditable(True)
+        self.laser_type.lineEdit().setReadOnly(True)
         self.laser_type.addItems(["玻璃管", "射频管"])
         top_layout.addWidget(self.laser_type, 1, 1)
 
@@ -429,6 +441,9 @@ class LaserSettingsWidget(QWidget):
         add_param("预燃脉宽(%):", self.pre_pulse)
         
         self.signal_level = QComboBox()
+        self.signal_level.setMaxVisibleItems(10)
+        self.signal_level.setEditable(True)
+        self.signal_level.lineEdit().setReadOnly(True)
         self.signal_level.addItems(["低电平", "高电平"])
         add_param("开关信号电平:", self.signal_level)
         
@@ -462,10 +477,16 @@ class OtherSettingsWidget(QWidget):
         form_machine = QFormLayout()
         
         self.trans_mode = QComboBox()
+        self.trans_mode.setMaxVisibleItems(10)
+        self.trans_mode.setEditable(True)
+        self.trans_mode.lineEdit().setReadOnly(True)
         self.trans_mode.addItems(["皮带步进"])
         form_machine.addRow("传动模式:", self.trans_mode)
         
         self.feed_mode = QComboBox()
+        self.feed_mode.setMaxVisibleItems(10)
+        self.feed_mode.setEditable(True)
+        self.feed_mode.lineEdit().setReadOnly(True)
         self.feed_mode.addItems(["单向", "双向"])
         form_machine.addRow("上料模式:", self.feed_mode)
         
@@ -475,6 +496,9 @@ class OtherSettingsWidget(QWidget):
         form_machine.addRow("断电延时:", self.power_off_delay)
         
         self.z_feat = QComboBox()
+        self.z_feat.setMaxVisibleItems(10)
+        self.z_feat.setEditable(True)
+        self.z_feat.lineEdit().setReadOnly(True)
         self.z_feat.addItems(["平台"])
         self.z_feat.setEnabled(False) # Grayed out in screenshot
         form_machine.addRow("Z轴功能:", self.z_feat)
@@ -487,10 +511,16 @@ class OtherSettingsWidget(QWidget):
         form_multi = QFormLayout()
         
         self.head_count = QComboBox()
+        self.head_count.setMaxVisibleItems(10)
+        self.head_count.setEditable(True)
+        self.head_count.lineEdit().setReadOnly(True)
         self.head_count.addItems(["1", "2"])
         form_multi.addRow("互移头数:", self.head_count)
         
         self.trans_method = QComboBox()
+        self.trans_method.setMaxVisibleItems(10)
+        self.trans_method.setEditable(True)
+        self.trans_method.lineEdit().setReadOnly(True)
         self.trans_method.addItems(["单皮带型"])
         form_multi.addRow("传动方式:", self.trans_method)
         

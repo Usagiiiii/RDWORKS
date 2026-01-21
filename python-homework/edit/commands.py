@@ -630,27 +630,36 @@ class ChangeColorCommand(QUndoCommand):
 
 class BreakCurveCommand(Command):
     """打断曲线命令"""
-    def __init__(self, canvas, original_item, points1, points2):
+    def __init__(self, canvas, original_item, data1, data2):
         self.canvas = canvas
         self.original_item = original_item
         self.new_item = None 
-        self.points1 = points1
-        self.points2 = points2
-        self.old_points = original_item.points() # Save original state
+        self.data1 = data1
+        self.data2 = data2
+        
+        if hasattr(original_item, 'get_path_data'):
+            self.old_data = original_item.get_path_data()
+        else:
+             # Fallback
+            self.old_data = (original_item.points(), [], {})
+
         self.desc = "打断曲线"
         self._executed = False
 
     def redo(self):
         # Update original item
-        self.original_item.set_points(self.points1)
+        if hasattr(self.original_item, 'set_path_data'):
+            self.original_item.set_path_data(self.data1)
+        else:
+            self.original_item.set_points(self.data1[0])
         
         # Create new item if not exists
         if not self.new_item:
             from ui.graphics_items import EditablePathItem
-            # Inherit color/properties
-            # Note: Assuming original_item has _smooth attribute (or property)
+            pts, segs, cps = self.data2
             smooth = getattr(self.original_item, '_smooth', False)
-            self.new_item = EditablePathItem(self.points2, self.original_item.color(), smooth)
+            self.new_item = EditablePathItem(pts, self.original_item.color(), smooth)
+            self.new_item.set_path_data(self.data2) # Ensure segments/CPs set
             self.new_item.setZValue(self.original_item.zValue())
         
         if self.new_item.scene() != self.canvas.scene:
@@ -662,7 +671,11 @@ class BreakCurveCommand(Command):
 
     def undo(self):
         # Restore original item
-        self.original_item.set_points(self.old_points)
+        if hasattr(self.original_item, 'set_path_data'):
+            self.original_item.set_path_data(self.old_data)
+        else:
+            self.original_item.set_points(self.old_data[0])
+            
         # Remove new item
         if self.new_item and self.new_item.scene():
             self.canvas.scene.removeItem(self.new_item)
@@ -671,19 +684,28 @@ class BreakCurveCommand(Command):
 
 class MergePathsCommand(Command):
     """合并路径命令"""
-    def __init__(self, canvas, item1, item2, new_points):
+    def __init__(self, canvas, item1, item2, new_data):
         self.canvas = canvas
         self.item1 = item1
         self.item2 = item2
-        self.new_points = new_points
-        self.old_points1 = item1.points()
-        self.old_points2 = item2.points()
+        self.new_data = new_data
+        
+        # Save full state if possible, else fallback
+        if hasattr(item1, 'get_path_data'):
+            self.old_data1 = item1.get_path_data()
+        else:
+            self.old_data1 = item1.points()
+            
         self.desc = "合并路径"
         self._executed = False
 
     def redo(self):
-        # Update item1 with merged points
-        self.item1.set_points(self.new_points)
+        # Update item1 with merged data
+        if hasattr(self.item1, 'set_path_data'):
+            self.item1.set_path_data(self.new_data)
+        else:
+            self.item1.set_points(self.new_data) # Fallback if points passed? Assumes new_data matches expectation
+            
         # Remove item2
         if self.item2.scene() == self.canvas.scene:
             self.canvas.scene.removeItem(self.item2)
@@ -691,14 +713,15 @@ class MergePathsCommand(Command):
 
     def undo(self):
         # Restore item1
-        self.item1.set_points(self.old_points1)
+        if hasattr(self.item1, 'set_path_data'):
+            self.item1.set_path_data(self.old_data1)
+        else:
+            self.item1.set_points(self.old_data1)
+            
         # Add item2 back
         if self.item2.scene() != self.canvas.scene:
             self.canvas.scene.addItem(self.item2)
-        # We need to make sure item2 has correct state (it might have lost selection/edit mode)
-        # But for basics, just adding back is enough. 
-        # If we want to restore "node edit enabled" state, we might need to store it.
-        # But usually undo just restores data.
+            
         self._executed = False
 
 class ChangeSegmentTypeCommand(Command):
@@ -716,4 +739,21 @@ class ChangeSegmentTypeCommand(Command):
     def undo(self):
         if hasattr(self.item, 'set_segment_types'):
             self.item.set_segment_types(self.old_types)
+
+
+class MacroCommand(Command):
+    def __init__(self, description=''):
+        self.commands = []
+        self.description = description
+
+    def add_command(self, cmd):
+        self.commands.append(cmd)
+
+    def undo(self):
+        for cmd in reversed(self.commands):
+            cmd.undo()
+
+    def redo(self):
+        for cmd in self.commands:
+            cmd.redo()
 

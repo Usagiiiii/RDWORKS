@@ -7,7 +7,7 @@ import math
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QSlider, QWidget, QGraphicsView, 
                              QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
-                             QGroupBox, QProgressBar, QSizePolicy)
+                             QGroupBox, QProgressBar, QSizePolicy, QGraphicsEllipseItem, QGraphicsRectItem)
 from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF, QLineF
 from PyQt5.QtGui import QColor, QPen, QBrush, QPainter, QPainterPath, QFont
 
@@ -52,7 +52,7 @@ class PreviewCanvas(QGraphicsView):
         self.scene.setSceneRect(rect.adjusted(-50, -50, 50, 50))
 
 class PreviewDialog(QDialog):
-    def __init__(self, canvas_items, work_size=(600, 400), layer_data=None, parent=None):
+    def __init__(self, canvas_items, work_size=(600, 400), layer_data=None, parent=None, laser_pos=QPointF(0,0)):
         super().__init__(parent)
         self.setWindowTitle("加工预览")
         self.resize(1000, 700)
@@ -61,6 +61,7 @@ class PreviewDialog(QDialog):
         self.items = canvas_items
         self.work_w, self.work_h = work_size
         self.layer_data = layer_data or {}
+        self.laser_start_pos = laser_pos # 激光头初始位置
         
         # 仿真状态
         self.is_running = False
@@ -352,7 +353,11 @@ class PreviewDialog(QDialog):
         # 这里简化处理，直接按列表顺序，实际应按图层优先级
         # 假设传入的 items 已经是排好序的
         
-        last_pos = QPointF(0, 0)
+        last_pos = self.laser_start_pos
+        
+        # 显示激光头初始位置
+        self.preview_view.head_marker.setPos(last_pos - QPointF(5, 5)) # Offset needed because rect is -5,-5
+        self.preview_view.head_marker.setVisible(True)
         
         min_x, min_y = float('inf'), float('inf')
         max_x, max_y = float('-inf'), float('-inf')
@@ -366,9 +371,19 @@ class PreviewDialog(QDialog):
         for item in self.items:
             # 获取路径
             path = None
-            if hasattr(item, 'path'):
+            if isinstance(item, QGraphicsPathItem):
+                path = item.path()
+            elif isinstance(item, QGraphicsEllipseItem):
+                path = QPainterPath()
+                path.addEllipse(item.rect())
+            elif isinstance(item, QGraphicsRectItem):
+                path = QPainterPath()
+                path.addRect(item.rect())
+            elif hasattr(item, 'path'): # Fallback for duck typing
                 path = item.path()
             elif hasattr(item, 'shape'):
+                # 注意：shape() 包含 stroke width，对于切割预览可能不准确 (会产生双线)
+                # 尽量避免使用 shape() 除非是未知类型
                 path = item.shape()
             
             if not path or path.isEmpty():
@@ -380,18 +395,20 @@ class PreviewDialog(QDialog):
             
             # 生成唯一签名以检测重复项
             br_sig = scene_path.boundingRect()
-            rect_sig = (round(br_sig.x(), 3), round(br_sig.y(), 3), round(br_sig.width(), 3), round(br_sig.height(), 3))
+            # 放宽精度以更好去重 (3 -> 2 bits)
+            rect_sig = (round(br_sig.x(), 2), round(br_sig.y(), 2), round(br_sig.width(), 2), round(br_sig.height(), 2))
             color_sig = "NONE"
             if hasattr(item, 'color'):
                 c = item.color()
                 if c.isValid():
                     color_sig = c.name()
             
-            path_sig = (scene_path.elementCount(), round(scene_path.length(), 3))
+            # 路径长度也放宽精度
+            path_sig = (scene_path.elementCount(), round(scene_path.length(), 2))
             signature = (rect_sig, color_sig, path_sig)
             
             if signature in processed_signatures:
-                print(f"Skipping duplicate item: {signature}")
+                # print(f"Skipping duplicate item: {signature}")
                 continue
             processed_signatures.add(signature)
             
@@ -431,6 +448,10 @@ class PreviewDialog(QDialog):
                                     found = True
                                     break
             
+            # 强制修正可能的异常重复次数
+            if repeat_count < 1: repeat_count = 1
+            if repeat_count > 100: repeat_count = 1 
+
             # 预计算起点 (用于就近排序)
             # 对于扫描模式，起点大概在包围盒顶部或底部，这里简化用包围盒左上角近似
             start_pt = QPointF(0,0)
