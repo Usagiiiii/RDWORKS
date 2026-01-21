@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidge
 
 from my_io.importers.supported_filter import SUPPORTED_FILTER
 from ui.left_toolbar import LeftToolbar
+from ui.node_edit_toolbar import NodeEditToolbar
 from ui.right_panel import RightPanel
 from ui.whiteboard import WhiteboardWidget
 from utils.import_utils import pil_to_qpixmap, convert_wbmp_to_png
@@ -24,11 +25,21 @@ from ui.whiteboard import Path
 from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
 from ui.lead_line_dialog import LeadLineDialog
 from ui.preview_dialog import PreviewDialog
+
 from ui.smooth_curve_dialog import SmoothCurveSimpleDialog, SmoothCurveCustomDialog, chaikin_smooth
 from ui.auto_close_dialog import AutoCloseDialog
 from ui.data_check_dialog import DataCheckDialog
 from ui.bitmap_process_dialog import BitmapProcessDialog
 from ui.graphics_items import EditablePathItem
+
+from ui.manufacturer_settings_dialog import ManufacturerPasswordDialog, ManufacturerSettingsDialog
+from ui.system_settings_dialog import SystemSettingsDialog
+from utils.language_manager import language_manager
+from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+from PyQt5.QtWidgets import QMessageBox
+from ui.array_copy_dialog import ArrayCopyDialog
+from edit.commands import AddItemCommand, MacroCommand
+import copy
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -87,6 +98,15 @@ class MainWindow(QMainWindow):
         self.coord_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.statusBar().addWidget(self.coord_label, 0) # stretch=0，紧跟在status_label后面
 
+        # 测量信息标签
+        self.measure_label = QLabel("W: 0.00 mm  H: 0.00 mm")
+        # QFrame.Sunken = 48, QFrame.StyledPanel = 6
+        # self.measure_label.setFrameStyle(54) 
+        self.measure_label.setStyleSheet("QLabel { color : blue; }") # 蓝色文字以区分
+        self.measure_label.setMinimumWidth(150)
+        self.measure_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.statusBar().addWidget(self.measure_label, 0) # stretch=0，在坐标后面
+
         # 添加一个弹簧占位符，把前面两个挤到左边
         spacer = QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
@@ -94,6 +114,7 @@ class MainWindow(QMainWindow):
         
         # 连接信号
         self.whiteboard.canvas.headMoved.connect(self.update_mouse_coordinates)
+        self.whiteboard.canvas.measurementChanged.connect(self.measure_label.setText)
         self.whiteboard.canvas.scene.changed.connect(self.on_scene_changed)
         # 连接右侧面板的图层参数变化信号，以便更新路径预览
         self.right_panel.layerParamsChanged.connect(self.on_scene_changed)
@@ -171,7 +192,26 @@ class MainWindow(QMainWindow):
         if x == float('inf') or y == float('inf'):
             self.coord_label.setText("")
         else:
-            self.coord_label.setText(f"X: {x:.3f}  Y: {y:.3f} mm")
+            # 根据原点位置转换坐标
+            try:
+                canvas = self.whiteboard.canvas
+                loc = getattr(canvas, '_origin_location', 1)
+                w = getattr(canvas, '_work_w', 0.0)
+                h = getattr(canvas, '_work_h', 0.0)
+                
+                disp_x, disp_y = x, y
+                
+                if loc == 2: # TR (Top-Right)
+                    disp_x = w - x
+                elif loc == 3: # BL (Bottom-Left)
+                    disp_y = h - y
+                elif loc == 4: # BR (Bottom-Right)
+                    disp_x = w - x
+                    disp_y = h - y
+                    
+                self.coord_label.setText(f"X: {disp_x:.3f}  Y: {disp_y:.3f} mm")
+            except Exception:
+                self.coord_label.setText(f"X: {x:.3f}  Y: {y:.3f} mm")
 
     def on_scene_changed(self, region):
         """场景变化时更新路径预览"""
@@ -208,275 +248,903 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.WindowText, QColor(50, 50, 50))
         self.setPalette(palette)
 
+    def open_manufacturer_settings(self):
+        """打开厂家设置"""
+        try:
+            pwd_dialog = ManufacturerPasswordDialog(self)
+            if pwd_dialog.exec_() == QDialog.Accepted:
+                settings_dialog = ManufacturerSettingsDialog(self)
+                settings_dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开厂家设置失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def common_gallery(self):
+        QMessageBox.information(self, "功能未实现", "常用图库功能尚未实现")
+
+    def import_background_image(self):
+        # 简单实现导入底图逻辑，或者提示
+        file_path, _ = QFileDialog.getOpenFileName(self, "导入底图", "", "Images (*.png *.jpg *.bmp)")
+        if file_path:
+             QMessageBox.information(self, "提示", f"已选择底图: {file_path}\n(功能开发中)")
+             # 如果有 clear_bg_action 可以在这里启用
+             if hasattr(self, 'clear_bg_action'):
+                 self.clear_bg_action.setEnabled(True)
+
+    def clear_background_image(self):
+         QMessageBox.information(self, "提示", "底图已清除")
+         if hasattr(self, 'clear_bg_action'):
+             self.clear_bg_action.setEnabled(False)
+
+    def get_scanned_image(self):
+        QMessageBox.information(self, "功能未实现", "扫描功能需要硬件支持")
+
     def create_menu_bar(self):
         """创建菜单栏"""
         menubar = self.menuBar()
 
-        # 文件菜单
-        file_menu = menubar.addMenu('文件(F)')
+        # 将菜单保存为实例变量，以便后续更新文本
+        self.file_menu = menubar.addMenu('文件(F)')
+        
+        self.new_action = QAction('新建(&N)...', self)
+        self.new_action.setShortcut(QKeySequence.New)
+        self.new_action.triggered.connect(self.new_file)
+        self.file_menu.addAction(self.new_action)
 
-        new_action = QAction('新建(&N)', self)
-        new_action.setShortcut(QKeySequence.New)
-        new_action.setStatusTip('创建新的RLD文件')
-        new_action.triggered.connect(self.new_file)
-        file_menu.addAction(new_action)
+        self.open_action = QAction('打开(&O)...', self)
+        self.open_action.setShortcut(QKeySequence.Open)
+        self.open_action.triggered.connect(self.open_file)
+        self.file_menu.addAction(self.open_action)
 
-        open_action = QAction('打开(&O)...', self)
-        open_action.setShortcut(QKeySequence.Open)
-        open_action.setStatusTip('打开现有RLD文件')
-        open_action.triggered.connect(self.open_file)
-        file_menu.addAction(open_action)
+        self.save_action = QAction('保存(&S)', self)
+        self.save_action.setShortcut(QKeySequence.Save)
+        self.save_action.triggered.connect(self.save_file)
+        self.file_menu.addAction(self.save_action)
 
-        save_action = QAction('保存(&S)', self)
-        save_action.setShortcut(QKeySequence.Save)
-        save_action.setStatusTip('保存当前RLD文件')
-        save_action.triggered.connect(self.save_file)
-        file_menu.addAction(save_action)
+        self.save_as_action = QAction('另存为(&A)...', self)
+        self.save_as_action.triggered.connect(self.save_as_file)
+        self.file_menu.addAction(self.save_as_action)
 
-        save_as_action = QAction('另存为(&A)...', self)
-        save_as_action.setShortcut(QKeySequence.SaveAs)
-        save_as_action.setStatusTip('另存为新RLD文件')
-        save_as_action.triggered.connect(self.save_as_file)
-        file_menu.addAction(save_as_action)
+        self.file_menu.addSeparator()
 
-        file_menu.addSeparator()
+        self.import_action = QAction('导入(&I)...', self)
+        self.import_action.setShortcut("Ctrl+I")
+        self.import_action.triggered.connect(self.import_image)
+        self.file_menu.addAction(self.import_action)
 
-        export_action = QAction('导入(&E)...', self)
-        export_action.setStatusTip('导入图像文件')
-        export_action.triggered.connect(self.import_image)
-        file_menu.addAction(export_action)
+        self.export_action = QAction('导出(&E)...', self)
+        self.export_action.setShortcut("Ctrl+E")
+        self.export_action.triggered.connect(self.export_to_nc) 
+        self.file_menu.addAction(self.export_action)
 
-        # 添加导出动作
-        export_nc_action = QAction('导出为NC(&X)...', self)
-        export_nc_action.setStatusTip('导出为G代码NC文件')
-        export_nc_action.triggered.connect(self.export_to_nc)
-        file_menu.addAction(export_nc_action)
+        gallery_action = QAction('常用图库', self) # 暂未翻译
+        gallery_action.triggered.connect(self.common_gallery)
+        self.file_menu.addAction(gallery_action)
 
-        file_menu.addSeparator()
+        self.file_menu.addSeparator()
 
-        exit_action = QAction('退出(&X)', self)
-        exit_action.setShortcut(QKeySequence.Quit)
-        exit_action.setStatusTip('退出应用程序')
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+        self.import_bg_action = QAction('导入底图', self)
+        self.import_bg_action.triggered.connect(self.import_background_image)
+        self.file_menu.addAction(self.import_bg_action)
+
+        self.clear_bg_action = QAction('清除底图', self)
+        self.clear_bg_action.triggered.connect(self.clear_background_image)
+        self.clear_bg_action.setEnabled(False) 
+        self.file_menu.addAction(self.clear_bg_action)
+
+        self.file_menu.addSeparator()
+
+        self.scan_action = QAction('获取扫描图象', self)
+        self.scan_action.setShortcut("Ctrl+8")
+        self.scan_action.triggered.connect(self.get_scanned_image)
+        self.file_menu.addAction(self.scan_action)
+
+        self.file_menu.addSeparator()
+
+        self.manu_settings_action = QAction('厂家设置', self)
+        self.manu_settings_action.triggered.connect(self.open_manufacturer_settings)
+        self.file_menu.addAction(self.manu_settings_action)
+
+        self.file_menu.addSeparator()
+        
+        # ... recent files ...
+
+        self.file_menu.addSeparator()
+
+        self.exit_action = QAction('退出(&X)', self)
+        self.exit_action.setShortcut("Ctrl+X")
+        self.exit_action.triggered.connect(self.close)
+        self.file_menu.addAction(self.exit_action)
 
         # 编辑菜单
-        edit_menu = menubar.addMenu('编辑(E)')
+        self.edit_menu = menubar.addMenu('编辑(E)')
 
         # 定义为实例变量，方便后续连接信号
-        self.undo_action = QAction('撤销(&U)', self)
-        self.undo_action.setShortcut(QKeySequence.Undo)
-        self.undo_action.setStatusTip('撤销上一步操作')
+        self.undo_action = QAction('撤销', self)
+        self.undo_action.setShortcut('Ctrl+Z') 
         self.undo_action.triggered.connect(self.whiteboard.canvas.edit_manager.undo)
-        edit_menu.addAction(self.undo_action)
+        self.edit_menu.addAction(self.undo_action)
 
-        self.redo_action = QAction('恢复(&R)', self)
-        self.redo_action.setShortcut(QKeySequence.Redo)
-        self.redo_action.setStatusTip('恢复上一步操作')
+        self.redo_action = QAction('恢复', self)
+        self.redo_action.setShortcut('Ctrl+Y')
         self.redo_action.triggered.connect(self.whiteboard.canvas.edit_manager.redo)
-        edit_menu.addAction(self.redo_action)
+        self.edit_menu.addAction(self.redo_action)
 
-        edit_menu.addSeparator()
+        self.edit_menu.addSeparator()
 
-        self.cut_action = QAction('剪切(&T)', self)
-        self.cut_action.setShortcut(QKeySequence.Cut)
-        self.cut_action.setStatusTip('剪切选中内容')
+        self.cut_action = QAction('剪切', self)
+        self.cut_action.setShortcut('Ctrl+X')
         self.cut_action.triggered.connect(self.whiteboard.canvas.edit_manager.cut)
-        edit_menu.addAction(self.cut_action)
+        self.edit_menu.addAction(self.cut_action)
 
-        self.copy_action = QAction('复制(&C)', self)
-        self.copy_action.setShortcut(QKeySequence.Copy)
-        self.copy_action.setStatusTip('复制选中内容')
+        self.copy_action = QAction('复制', self)
+        self.copy_action.setShortcut('Ctrl+C')
         self.copy_action.triggered.connect(self.whiteboard.canvas.edit_manager.copy)
-        edit_menu.addAction(self.copy_action)
+        self.edit_menu.addAction(self.copy_action)
 
-        self.paste_action = QAction('粘贴(&P)', self)
-        self.paste_action.setShortcut(QKeySequence.Paste)
-        self.paste_action.setStatusTip('粘贴内容')
+        self.paste_action = QAction('粘贴', self)
+        self.paste_action.setShortcut('Ctrl+V')
         self.paste_action.triggered.connect(self.whiteboard.canvas.edit_manager.paste)
-        edit_menu.addAction(self.paste_action)
+        self.edit_menu.addAction(self.paste_action)
 
-        edit_menu.addSeparator()
-
-        self.delete_action = QAction('删除(&D)', self)
-        self.delete_action.setShortcut(QKeySequence.Delete)
-        self.delete_action.setStatusTip('删除选中内容')
+        self.delete_action = QAction('删除', self)
+        self.delete_action.setShortcut('Del')
         self.delete_action.triggered.connect(self.whiteboard.canvas.edit_manager.delete)
-        edit_menu.addAction(self.delete_action)
+        self.edit_menu.addAction(self.delete_action)
 
-        self.select_all_action = QAction('全选(&A)', self)
-        self.select_all_action.setShortcut(QKeySequence.SelectAll)
-        self.select_all_action.setStatusTip('选择全部内容')
+        self.edit_menu.addSeparator()
+        
+        # ... view edit actions (Move, Zoom etc)
+        self.move_action = QAction('移动', self)
+        self.move_action.triggered.connect(self.set_pan_tool)
+        self.edit_menu.addAction(self.move_action)
+
+        self.zoom_in_edit_action = QAction('放大', self)
+        self.zoom_in_edit_action.triggered.connect(self.view_zoom_in)
+        self.edit_menu.addAction(self.zoom_in_edit_action)
+
+        self.zoom_out_edit_action = QAction('缩小', self)
+        self.zoom_out_edit_action.triggered.connect(self.view_zoom_out)
+        self.edit_menu.addAction(self.zoom_out_edit_action)
+
+        self.box_zoom_action = QAction('框选查看', self)
+        self.box_zoom_action.triggered.connect(self.set_box_zoom_tool)
+        self.edit_menu.addAction(self.box_zoom_action)
+
+        self.page_range_action = QAction('页面范围', self)
+        self.page_range_action.triggered.connect(self.zoom_to_page)
+        self.edit_menu.addAction(self.page_range_action)
+
+        self.data_range_action = QAction('数据范围', self)
+        self.data_range_action.triggered.connect(self.zoom_to_data)
+        self.edit_menu.addAction(self.data_range_action)
+
+        self.show_all_action = QAction('显示所有', self)
+        self.show_all_action.triggered.connect(self.zoom_to_all)
+        self.edit_menu.addAction(self.show_all_action)
+
+        self.preview_action = QAction('加工预览', self)
+        self.preview_action.triggered.connect(self.show_preview_dialog)
+        self.edit_menu.addAction(self.preview_action)
+
+        self.edit_menu.addSeparator()
+
+        # Group 4: 路径设置
+        self.show_path_action_menu = QAction('显示路径', self)
+        self.show_path_action_menu.setCheckable(True)
+        self.show_path_action_menu.setChecked(False)
+        self.show_path_action_menu.triggered.connect(self.toggle_show_path)
+        self.edit_menu.addAction(self.show_path_action_menu)
+
+        self.set_lead_action = QAction('设置引入引出', self)
+        self.set_lead_action.triggered.connect(self.set_lead_line)
+        self.edit_menu.addAction(self.set_lead_action)
+        
+        # ... other edit actions
+
+        self.edit_menu.addSeparator()
+
+        # Group 5: 选择
+        self.select_all_action = QAction('选择全部', self)
+        self.select_all_action.setShortcut('Ctrl+A')
         self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
-        edit_menu.addAction(self.select_all_action)
+        self.edit_menu.addAction(self.select_all_action)
+        
+        # ... select similar actions ...
 
-        # ========== 新增：定位点菜单 ==========
-        edit_menu.addSeparator()
+        self.edit_menu.addSeparator()
+        
+        # ========== 绘制菜单 (根据截图更新) ==========
+        self.draw_menu = menubar.addMenu('绘制(D)')
+        
+        # 1. 选择工具
+        self.select_action = QAction('选择', self)
+        self.select_action.setCheckable(True)
+        self.select_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_SELECT))
+        self.draw_menu.addAction(self.select_action)
 
-        # 添加十字定位点
-        self.add_cross_fiducial_action = QAction('添加十字定位点', self)
-        self.add_cross_fiducial_action.setStatusTip('添加十字形定位点（右键点击设置位置）')
-        self.add_cross_fiducial_action.triggered.connect(self.enable_cross_fiducial_mode)
-        edit_menu.addAction(self.add_cross_fiducial_action)
+        # 2. 节点编辑
+        self.node_edit_action = QAction('节点编辑', self)
+        self.node_edit_action.setCheckable(True)
+        self.node_edit_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_NODE_EDIT))
+        self.draw_menu.addAction(self.node_edit_action)
 
-        # 添加圆形定位点
-        self.add_circle_fiducial_action = QAction('添加圆形定位点', self)
-        self.add_circle_fiducial_action.setStatusTip('添加圆形定位点（右键点击设置位置）')
-        self.add_circle_fiducial_action.triggered.connect(self.enable_circle_fiducial_mode)
-        edit_menu.addAction(self.add_circle_fiducial_action)
+        # 3. 曲线编辑 (子菜单)
+        self.curve_edit_menu = self.draw_menu.addMenu('曲线编辑')
+        
+        # 定义辅助函数快捷添加，并保存Action引用
+        # 注意：这里需要修改辅助函数以返回action并保存
+        self.curve_add_node_action = QAction('添加节点', self)
+        self.curve_add_node_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_ADD_NODE))
+        self.curve_edit_menu.addAction(self.curve_add_node_action)
 
-        # 删除定位点
-        self.remove_fiducial_action = QAction('删除定位点', self)
-        self.remove_fiducial_action.setStatusTip('删除当前定位点')
-        self.remove_fiducial_action.triggered.connect(self.remove_fiducial)
-        edit_menu.addAction(self.remove_fiducial_action)
+        self.curve_del_node_action = QAction('删除节点', self)
+        self.curve_del_node_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_DELETE_NODE))
+        self.curve_edit_menu.addAction(self.curve_del_node_action)
+        
+        self.curve_edit_menu.addSeparator()
+        
+        self.curve_connect_action = QAction('连接节点', self)
+        self.curve_connect_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_CONNECT_NODES))
+        self.curve_edit_menu.addAction(self.curve_connect_action)
 
-        # 视图菜单
-        view_menu = menubar.addMenu('视图(D)')
+        self.curve_break_action = QAction('分割曲线', self)
+        self.curve_break_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_BREAK_CURVE))
+        self.curve_edit_menu.addAction(self.curve_break_action)
+        
+        self.curve_edit_menu.addSeparator()
+        
+        self.curve_to_curve_action = QAction('直线转曲线', self)
+        self.curve_to_curve_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_TO_CURVE))
+        self.curve_edit_menu.addAction(self.curve_to_curve_action)
 
-        # 重命名为视图而不是View
-        view_menu.setTitle('视图(D)')
+        self.curve_to_line_action = QAction('曲线转直线', self)
+        self.curve_to_line_action.triggered.connect(lambda: self.on_node_edit_action(NodeEditToolbar.ACTION_TO_LINE))
+        self.curve_edit_menu.addAction(self.curve_to_line_action)
 
-        zoom_in_action = QAction('放大(&I)', self)
-        zoom_in_action.setShortcut(QKeySequence.ZoomIn)
-        zoom_in_action.setStatusTip('放大视图')
-        zoom_in_action.triggered.connect(self.zoom_in)
-        view_menu.addAction(zoom_in_action)
+        # 初始状态设为可用
+        self.curve_edit_menu.setEnabled(True)
 
-        zoom_out_action = QAction('缩小(&O)', self)
-        zoom_out_action.setShortcut(QKeySequence.ZoomOut)
-        zoom_out_action.setStatusTip('缩小视图')
-        zoom_out_action.triggered.connect(self.zoom_out)
-        view_menu.addAction(zoom_out_action)
+        self.draw_menu.addSeparator()
 
-        zoom_reset_action = QAction('实际大小(&R)', self)
-        zoom_reset_action.setShortcut('Ctrl+0')
-        zoom_reset_action.setStatusTip('重置为100%')
-        zoom_reset_action.triggered.connect(self.zoom_reset)
-        view_menu.addAction(zoom_reset_action)
+        # 4. 绘图工具
+        self.line_action = QAction('直线', self)
+        self.line_action.setCheckable(True)
+        self.line_action.setShortcut('Ctrl+1')
+        self.line_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_LINE))
+        self.draw_menu.addAction(self.line_action)
 
-        view_menu.addSeparator()
+        self.poly_action = QAction('折线', self)
+        self.poly_action.setCheckable(True)
+        self.poly_action.setShortcut('Ctrl+2')
+        self.poly_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_POLYLINE))
+        self.draw_menu.addAction(self.poly_action)
 
-        fullscreen_action = QAction('全屏(&F)', self)
-        fullscreen_action.setShortcut('F11')
-        fullscreen_action.setStatusTip('切换全屏模式')
-        fullscreen_action.triggered.connect(self.toggle_fullscreen)
-        view_menu.addAction(fullscreen_action)
+        self.curve_action = QAction('曲线', self)
+        self.curve_action.setCheckable(True)
+        self.curve_action.setShortcut('Ctrl+3')
+        self.curve_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_CURVE))
+        self.draw_menu.addAction(self.curve_action)
+
+        self.rect_action = QAction('矩形', self)
+        self.rect_action.setCheckable(True)
+        self.rect_action.setShortcut('Ctrl+4')
+        self.rect_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_RECTANGLE))
+        self.draw_menu.addAction(self.rect_action)
+
+        self.ellipse_action = QAction('椭圆', self)
+        self.ellipse_action.setCheckable(True)
+        self.ellipse_action.setShortcut('Ctrl+5')
+        self.ellipse_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_ELLIPSE))
+        self.draw_menu.addAction(self.ellipse_action)
+
+        self.text_action = QAction('文本', self)
+        self.text_action.setCheckable(True)
+        self.text_action.setShortcut('Ctrl+6')
+        self.text_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_TEXT))
+        self.draw_menu.addAction(self.text_action)
+
+        self.point_action = QAction('点', self)
+        self.point_action.setCheckable(True)
+        self.point_action.setShortcut('Ctrl+7')
+        self.point_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_POINT))
+        self.draw_menu.addAction(self.point_action)
+
+        self.draw_menu.addSeparator()
+
+        # 5. 编辑操作
+        # ...
+
+        self.draw_menu.addSeparator()
+
+        # 6. 镜像与停靠
+        self.h_mirror_action = QAction('水平镜像', self)
+        self.h_mirror_action.setCheckable(True)
+        self.h_mirror_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_H_MIRROR))
+        self.draw_menu.addAction(self.h_mirror_action)
+
+        self.v_mirror_action = QAction('垂直镜像', self)
+        self.v_mirror_action.setCheckable(True)
+        self.v_mirror_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_V_MIRROR))
+        self.draw_menu.addAction(self.v_mirror_action)
+
+        self.dock_action = QAction('图形停靠', self)
+        self.dock_action.setCheckable(True)
+        self.dock_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_DOCK))
+        self.draw_menu.addAction(self.dock_action)
+
+        self.array_action = QAction('阵列复制', self)
+        self.array_action.setCheckable(True)
+        self.array_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_ARRAY))
+        self.draw_menu.addAction(self.array_action)
+
+        self.draw_menu.addSeparator()
+
+        # 7. 对齐菜单
+        self.align_menu = self.draw_menu.addMenu('对齐')
+        
+        # 获取 edit_manager 引用
+        align_em = self.whiteboard.canvas.edit_manager
+        
+        # 需要修改 addAction 为 QAction 实例，才能翻译
+        self.align_left_action = model_action = QAction('左对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('left'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_right_action = model_action = QAction('右对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('right'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_top_action = model_action = QAction('顶端对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('top'))
+        self.align_menu.addAction(model_action)
+
+        self.align_bottom_action = model_action = QAction('底端对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('bottom'))
+        self.align_menu.addAction(model_action)
+
+        self.align_hcenter_action = model_action = QAction('水平居中对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('hcenter'))
+        self.align_menu.addAction(model_action)
+
+        self.align_vcenter_action = model_action = QAction('垂直居中对齐', self)
+        model_action.triggered.connect(lambda: align_em.align_items('vcenter'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_page_center_action = model_action = QAction('在页面居中', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('center'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_menu.addSeparator() # 分隔符不需要翻译
+        
+        self.align_eq_h_action = model_action = QAction('等水平间距', self)
+        model_action.triggered.connect(lambda: align_em.distribute_items('horizontal'))
+        self.align_menu.addAction(model_action)
+
+        self.align_eq_v_action = model_action = QAction('等垂直间距', self)
+        model_action.triggered.connect(lambda: align_em.distribute_items('vertical'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_eq_w_action = model_action = QAction('等宽', self)
+        model_action.triggered.connect(lambda: align_em.make_same_size('width'))
+        self.align_menu.addAction(model_action)
+
+        self.align_eq_h_size_action = model_action = QAction('等高', self)
+        model_action.triggered.connect(lambda: align_em.make_same_size('height'))
+        self.align_menu.addAction(model_action)
+
+        self.align_eq_size_action = model_action = QAction('等大小', self)
+        model_action.triggered.connect(lambda: align_em.make_same_size('size'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_menu.addSeparator()
+        
+        self.align_tl_action = model_action = QAction('左上', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('top_left'))
+        self.align_menu.addAction(model_action)
+
+        self.align_tr_action = model_action = QAction('右上', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('top_right'))
+        self.align_menu.addAction(model_action)
+
+        self.align_br_action = model_action = QAction('右下', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('bottom_right'))
+        self.align_menu.addAction(model_action)
+
+        self.align_bl_action = model_action = QAction('左下', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('bottom_left'))
+        self.align_menu.addAction(model_action)
+        
+        self.align_menu.addSeparator()
+        
+        self.align_dock_l_action = model_action = QAction('靠左', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('left'))
+        self.align_menu.addAction(model_action)
+
+        self.align_dock_r_action = model_action = QAction('靠右', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('right'))
+        self.align_menu.addAction(model_action)
+
+        self.align_dock_t_action = model_action = QAction('靠上', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('top'))
+        self.align_menu.addAction(model_action)
+
+        self.align_dock_b_action = model_action = QAction('靠下', self)
+        model_action.triggered.connect(lambda: align_em.align_to_page('bottom'))
+        self.align_menu.addAction(model_action)
 
         # 设置菜单
-        settings_menu = menubar.addMenu('设置(S)')
-        settings_menu.addAction(QAction('参数设置', self))
-        settings_menu.addAction(QAction('系统配置', self))
+        self.settings_menu = menubar.addMenu('设置(S)')
+        
+        self.sys_setting_action = QAction('系统设置', self)
+        self.sys_setting_action.triggered.connect(self.open_system_settings)
+        self.settings_menu.addAction(self.sys_setting_action)
+        
+        self.settings_menu.addSeparator()
+
+        self.pwd_setting_action = QAction('密码设置', self)
+        self.pwd_setting_action.triggered.connect(self.open_manufacturer_settings)
+        self.settings_menu.addAction(self.pwd_setting_action)
+        
+        self.settings_menu.addSeparator()
+
+        self.dock_point_setting_action = QAction('停靠点设置', self)
+        self.dock_point_setting_action.setEnabled(False) # 暂未实现
+        self.settings_menu.addAction(self.dock_point_setting_action)
+        
+        self.settings_menu.addSeparator()
+
+        self.fill_scan_action = QAction('填充扫描图形', self)
+        self.fill_scan_action.setEnabled(False) # 暂未实现
+        self.settings_menu.addAction(self.fill_scan_action)
+
+        self.show_array_action = QAction('显示阵列', self)
+        self.show_array_action.setCheckable(True)
+        self.show_array_action.setChecked(True)
+        self.settings_menu.addAction(self.show_array_action)
 
         # 处理菜单
-        process_menu = menubar.addMenu('处理(W)')
-        process_menu.addAction(QAction('开始加工', self))
-        process_menu.addAction(QAction('停止加工', self))
+        self.process_menu = menubar.addMenu('处理(W)')
+        
+        # 保存处理菜单项
+        self.process_curve_auto_close_action = add_process_action = QAction('曲线自动闭合', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_bitmap_handle_action = add_process_action = QAction('位图处理', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_curve_smooth_action = add_process_action = QAction('曲线平滑', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_path_optimize_action = add_process_action = QAction('路径优化', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_merge_lines_action = add_process_action = QAction('合并相连线', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_del_dup_lines_action = add_process_action = QAction('删除重线', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_gen_parallel_action = add_process_action = QAction('生成平行线', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_data_check_action = add_process_action = QAction('数据检查', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_fill_to_bitmap_action = add_process_action = QAction('填充成位图', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_bridge_action = add_process_action = QAction('桥位', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
+
+        self.process_micro_joint_action = add_process_action = QAction('微连', self)
+        add_process_action.setEnabled(False)
+        self.process_menu.addAction(add_process_action)
 
         # 工具菜单
-        tools_menu = menubar.addMenu('工具(T)')
+        self.tools_menu = menubar.addMenu('工具(T)')
+        
+        # Project Cut
+        self.tool_project_cut_action = action = QAction('投影切割', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
-        pen_action = QAction('画笔(&P)', self)
-        pen_action.setStatusTip('选择画笔工具')
-        pen_action.triggered.connect(self.select_pen)
-        tools_menu.addAction(pen_action)
+        # Measure
+        self.tool_measure_action = action = QAction('测量工具', self)
+        action.triggered.connect(self.set_measure_tool)
+        self.tools_menu.addAction(action)
 
-        eraser_action = QAction('橡皮擦(&E)', self)
-        eraser_action.setStatusTip('选择橡皮擦工具')
-        eraser_action.triggered.connect(self.select_eraser)
-        tools_menu.addAction(eraser_action)
+        # Auto Nest
+        self.tool_auto_nest_action = action = QAction('自动排版', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
-        line_action = QAction('直线(&L)', self)
-        line_action.setStatusTip('绘制直线')
-        line_action.triggered.connect(self.select_line)
-        tools_menu.addAction(line_action)
+        # EncLas400G
+        self.tool_enclas400g_action = action = QAction('EncLas400G', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
-        rectangle_action = QAction('矩形(&R)', self)
-        rectangle_action.setStatusTip('绘制矩形')
-        rectangle_action.triggered.connect(self.select_rectangle)
-        tools_menu.addAction(rectangle_action)
+        # Mark Point
+        self.tool_mark_point_action = action = QAction('Mark点定位', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
-        circle_action = QAction('圆形(&C)', self)
-        circle_action.setStatusTip('绘制圆形')
-        circle_action.triggered.connect(self.select_circle)
-        tools_menu.addAction(circle_action)
+        # Light Guide
+        self.tool_light_guide_action = action = QAction('导光板设计', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
-        # 主配置菜单
-        main_config_menu = menubar.addMenu('主配置(M)')
-        main_config_menu.addAction(QAction('主要配置', self))
+        # Add Label
+        self.tool_add_label_action = action = QAction('加标签', self)
+        action.setEnabled(False)
+        self.tools_menu.addAction(action)
 
+        # 主板型号(M) (原主配置)
+        self.main_config_menu = menubar.addMenu('主板型号(M)')
+        self.main_config_menu.to_ns = "RDLC320-A" # 示例
+        action_board = QAction('RDLC320-A', self)
+        action_board.setCheckable(True)
+        action_board.setChecked(True)
+        self.main_config_menu.addAction(action_board)
+
+        # 查看菜单 (原视图)
         # 查看菜单
-        view2_menu = menubar.addMenu('查看(H)')
-        view2_menu.addAction(QAction('查看选项', self))
+        self.view_menu = menubar.addMenu('查看(V)')
+        
+        # 辅助函数：添加可勾选的查看菜单项
+        def add_view_action(text, checked=True, callback=None, tr_key=None):
+            action = QAction(text, self)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            if callback:
+                action.triggered.connect(callback)
+            if tr_key:
+                action.setProperty('tr_key', tr_key)
+            self.view_menu.addAction(action)
+            return action
 
-        # 属性菜单
-        prop_menu = menubar.addMenu('属性(H)')
-        prop_menu.addAction(QAction('对象属性', self))
+        self.view_sys_toolbar = add_view_action('系统工具栏', True, self.toggle_sys_toolbar, 'View_SysToolbar')
+        self.view_status_bar = add_view_action('系统状态栏', True, self.toggle_status_bar, 'View_StatusBar')
+        self.view_draw_toolbar = add_view_action('绘制工具栏', True, self.toggle_draw_toolbar, 'View_DrawToolbar')
+        self.view_cut_prop_bar = add_view_action('切割属性栏', True, self.toggle_cut_prop_bar, 'View_CutPropBar')
+        self.view_align_toolbar = add_view_action('对齐工具栏', True, self.toggle_align_toolbar, 'View_AlignToolbar')
+        self.view_color_toolbar = add_view_action('颜色工具栏', True, self.toggle_color_toolbar, 'View_ColorToolbar')
+        self.view_sys_workspace = add_view_action('系统工作区', True, self.toggle_sys_workspace, 'View_SysWorkspace')
+        self.view_process_ctrl_bar = add_view_action('加工控制栏', True, self.toggle_process_ctrl_bar, 'View_ProcessCtrlBar')
+        self.view_add_toolbar = add_view_action('附加工具栏', True, self.toggle_add_toolbar, 'View_AddToolbar')
+        
+        self.view_menu.addSeparator() 
+        
+        self.view_lead_io_tool = add_view_action('引入引出工具', False, None, 'View_LeadIOTool')
+        self.view_element_name = add_view_action('图元名称', False, None, 'View_ElementName')
+        
+        self.view_process_toolbar = add_view_action('处理工具栏', True, self.toggle_process_toolbar, 'View_ProcessToolbar')
+        self.view_canvas_toolbar = add_view_action('画布工具栏', True, self.toggle_canvas_toolbar, 'View_CanvasToolbar')
+
+        # 帮助菜单
+        self.help_menu = menubar.addMenu('帮助(H)')
+
+        self.about_action = QAction('关于', self)
+        self.about_action.triggered.connect(self.show_about)
+        self.help_menu.addAction(self.about_action)
+
+        self.help_docs_action = QAction('帮助文档', self)
+        self.help_docs_action.setShortcut('F1')
+        self.help_docs_action.triggered.connect(self.show_help_docs)
+        self.help_menu.addAction(self.help_docs_action)
+
+        self.view_log_action = QAction('日志查看', self)
+        self.view_log_action.triggered.connect(self.show_logs)
+        self.help_menu.addAction(self.view_log_action)
+
+        # Language 子菜单
+        self.lang_menu = self.help_menu.addMenu('Language')
+        
+        # 定义语言列表（按照截图顺序）
+        languages = [
+            ('简体中文', 'chs'), ('繁体中文', 'cht'), ('英语', 'en'),
+            ('日语', 'jp'), ('法语', 'fr'), ('德语', 'de'), 
+            ('波兰语', 'pl'), ('葡萄牙语', 'pt'), ('西班牙语', 'es'), ('俄语', 'ru'), ('韩语', 'kr'), 
+            ('越南语', 'vn'), ('印尼语', 'id'), ('意大利语', 'it'), ('土耳其语', 'tr'), ('阿拉伯语', 'ar'), ('芬兰语', 'fi')
+        ]
+        
+        self.lang_actions = []
+        
+        for lang_name, lang_code in languages:
+            action = QAction(lang_name, self)
+            action.setCheckable(True)
+            action.setProperty('lang_code', lang_code)
+            
+            if lang_code == language_manager.current_lang:
+                action.setChecked(True)
+                
+            self.lang_menu.addAction(action)
+            self.lang_actions.append(action)
+            
+            # 使用闭包连接信号，处理语言切换
+            def on_lang_triggered(checked, code=lang_code, act=action):
+                if checked:
+                     # 取消其他选中
+                     for other_act in self.lang_actions:
+                         if other_act != act:
+                             other_act.setChecked(False)
+                     # 切换语言
+                     self.switch_language(code)
+                else:
+                    # 不允许取消所有选中
+                    act.setChecked(True)
+
+            # 注意：triggered信号默认传递(checked=False)，所以这里需要用 partial 或者 lambda 包装正确
+            # QAction.triggered(checked) is emitted when clicked. checked is bool.
+            action.triggered.connect(on_lang_triggered)
 
         # 社区菜单
-        community_menu = menubar.addMenu('社区')
-        community_menu.addAction(QAction('在线帮助', self))
-        community_menu.addAction(QAction('用户论坛', self))
+        self.community_menu = menubar.addMenu('社区')
+        
+        def open_browser(url):
+            import webbrowser
+            webbrowser.open(url)
+            
+        self.comm_forum_action = QAction('技术论坛', self)
+        self.comm_forum_action.triggered.connect(lambda: open_browser('https://www.chanelink.cn/'))
+        self.community_menu.addAction(self.comm_forum_action)
+        
+        self.comm_video_action = QAction('激光视频', self)
+        self.comm_video_action.triggered.connect(lambda: open_browser('https://www.chanelink.cn/video'))
+        self.community_menu.addAction(self.comm_video_action)
+        
+        self.comm_vector_action = QAction('切割矢量文件', self)
+        self.comm_vector_action.triggered.connect(lambda: open_browser('https://www.chanelink.cn/'))
+        self.community_menu.addAction(self.comm_vector_action)
+        
+        self.comm_app_action = QAction('社区APP', self)
+        self.comm_app_action.triggered.connect(lambda: open_browser('https://www.chanelink.com/app_download'))
+        self.community_menu.addAction(self.comm_app_action)
 
-        about_action = QAction('关于', self)
-        about_action.setStatusTip('关于本应用程序')
-        about_action.triggered.connect(self.show_about)
-        community_menu.addAction(about_action)
+        # 初始化翻译
+        self.retranslate_ui()
+    
+    def switch_language(self, lang_code):
+        """切换语言"""
+        language_manager.load_language(lang_code)
+        self.retranslate_ui()
+        self.show_status_message(f"Language switched to {lang_code}")
+
+    def retranslate_ui(self):
+        """重新设置界面文本（多语言支持）"""
+        tr = lambda k, d: language_manager.tr('MainWindow', k, d)
+        
+        # Menus
+        self.file_menu.setTitle(tr('Menu_File', '文件(F)'))
+        self.edit_menu.setTitle(tr('Menu_Edit', '编辑(E)'))
+        self.draw_menu.setTitle(tr('Menu_Draw', '绘制(D)'))
+        self.settings_menu.setTitle(tr('Menu_Settings', '设置(S)'))
+        self.process_menu.setTitle(tr('Menu_Process', '处理(W)'))
+        self.tools_menu.setTitle(tr('Menu_Tools', '工具(T)'))
+        self.main_config_menu.setTitle(tr('Menu_Board', '主板型号(M)'))
+        self.view_menu.setTitle(tr('Menu_View', '查看(V)'))
+        self.help_menu.setTitle(tr('Menu_Help', '帮助(H)'))
+        self.community_menu.setTitle(tr('Menu_Community', '社区'))
+
+        # File actions
+        self.new_action.setText(tr('Action_New', '新建(&N)...'))
+        self.new_action.setStatusTip(tr('Tip_New', '创建新的RLD文件'))
+        self.open_action.setText(tr('Action_Open', '打开(&O)...'))
+        self.save_action.setText(tr('Action_Save', '保存(&S)'))
+        self.save_as_action.setText(tr('Action_SaveAs', '另存为(&A)...'))
+        self.import_action.setText(tr('Action_Import', '导入(&I)...'))
+        self.export_action.setText(tr('Action_Export', '导出(&E)...'))
+        self.import_bg_action.setText(tr('Action_ImportBg', '导入底图'))
+        self.clear_bg_action.setText(tr('Action_ClearBg', '清除底图'))
+        self.scan_action.setText(tr('Action_Scan', '获取扫描图象'))
+        self.manu_settings_action.setText(tr('Action_ManuSettings', '厂家设置'))
+        self.exit_action.setText(tr('Action_Exit', '退出(&X)'))
+
+        # Edit actions
+        self.undo_action.setText(tr('Action_Undo', '撤销'))
+        self.redo_action.setText(tr('Action_Redo', '恢复'))
+        self.cut_action.setText(tr('Action_Cut', '剪切'))
+        self.copy_action.setText(tr('Action_Copy', '复制'))
+        self.paste_action.setText(tr('Action_Paste', '粘贴'))
+        self.delete_action.setText(tr('Action_Delete', '删除'))
+        self.select_all_action.setText(tr('Action_SelectAll', '选择全部'))
+        self.move_action.setText(tr('Action_Move', '移动'))
+        self.zoom_in_edit_action.setText(tr('Action_ZoomIn', '放大'))
+        self.zoom_out_edit_action.setText(tr('Action_ZoomOut', '缩小'))
+        self.box_zoom_action.setText(tr('Action_BoxZoom', '框选查看'))
+        self.page_range_action.setText(tr('Action_PageRange', '页面范围'))
+        self.data_range_action.setText(tr('Action_DataRange', '数据范围'))
+        self.show_all_action.setText(tr('Action_ShowAll', '显示所有'))
+        self.preview_action.setText(tr('Action_Preview', '加工预览'))
+        self.show_path_action_menu.setText(tr('Action_ShowPath', '显示路径'))
+        self.set_lead_action.setText(tr('Action_SetLead', '设置引入引出'))
+
+        # Draw actions
+        self.select_action.setText(tr('Action_Select', '选择'))
+        self.node_edit_action.setText(tr('Action_NodeEdit', '节点编辑'))
+        self.curve_edit_menu.setTitle(tr('Menu_CurveEdit', '曲线编辑'))
+        
+        self.line_action.setText(tr('Action_Line', '直线'))
+        self.poly_action.setText(tr('Action_Polyline', '折线'))
+        self.curve_action.setText(tr('Action_Curve', '曲线'))
+        self.rect_action.setText(tr('Action_Rectangle', '矩形'))
+        self.ellipse_action.setText(tr('Action_Ellipse', '椭圆'))
+        self.text_action.setText(tr('Action_Text', '文本'))
+        self.point_action.setText(tr('Action_Point', '点'))
+        self.h_mirror_action.setText(tr('Action_HMirror', '水平镜像'))
+        self.v_mirror_action.setText(tr('Action_VMirror', '垂直镜像'))
+        self.dock_action.setText(tr('Action_Dock', '图形停靠'))
+        self.array_action.setText(tr('Action_Array', '阵列复制'))
+        self.align_menu.setTitle(tr('Menu_Align', '对齐'))
+
+        # Align actions
+        self.align_left_action.setText(tr('Align_Left', '左对齐'))
+        self.align_right_action.setText(tr('Align_Right', '右对齐'))
+        self.align_top_action.setText(tr('Align_Top', '顶端对齐'))
+        self.align_bottom_action.setText(tr('Align_Bottom', '底端对齐'))
+        self.align_hcenter_action.setText(tr('Align_HCenter', '水平居中对齐'))
+        self.align_vcenter_action.setText(tr('Align_VCenter', '垂直居中对齐'))
+        self.align_page_center_action.setText(tr('Align_CenterPage', '在页面居中'))
+        self.align_eq_h_action.setText(tr('Align_EqH', '等水平间距'))
+        self.align_eq_v_action.setText(tr('Align_EqV', '等垂直间距'))
+        self.align_eq_w_action.setText(tr('Align_EqW', '等宽'))
+        self.align_eq_h_size_action.setText(tr('Align_EqH_Size', '等高'))
+        self.align_eq_size_action.setText(tr('Align_EqSize', '等大小'))
+        self.align_tl_action.setText(tr('Align_TopLeft', '左上'))
+        self.align_tr_action.setText(tr('Align_TopRight', '右上'))
+        self.align_br_action.setText(tr('Align_BottomRight', '右下'))
+        self.align_bl_action.setText(tr('Align_BottomLeft', '左下'))
+        self.align_dock_l_action.setText(tr('Align_DockLeft', '靠左'))
+        self.align_dock_r_action.setText(tr('Align_DockRight', '靠右'))
+        self.align_dock_t_action.setText(tr('Align_DockTop', '靠上'))
+        self.align_dock_b_action.setText(tr('Align_DockBottom', '靠下'))
+        
+        # Curve Edit actions
+        self.curve_add_node_action.setText(tr('Curve_AddNode', '添加节点'))
+        self.curve_del_node_action.setText(tr('Curve_DelNode', '删除节点'))
+        self.curve_connect_action.setText(tr('Curve_Connect', '连接节点'))
+        self.curve_break_action.setText(tr('Curve_Break', '分割曲线'))
+        self.curve_to_curve_action.setText(tr('Curve_ToCurve', '直线转曲线'))
+        self.curve_to_line_action.setText(tr('Curve_ToLine', '曲线转直线'))
+
+        # Settings
+        self.sys_setting_action.setText(tr('Action_SysSettings', '系统设置'))
+        self.pwd_setting_action.setText(tr('Action_PwdSettings', '密码设置'))
+        self.dock_point_setting_action.setText(tr('Action_DockPoint', '停靠点设置'))
+        self.fill_scan_action.setText(tr('Action_FillScan', '填充扫描图形'))
+        self.show_array_action.setText(tr('Action_ShowArray', '显示阵列'))
+
+        # Process
+        self.process_curve_auto_close_action.setText(tr('Action_CurveAutoClose', '曲线自动闭合'))
+        self.process_bitmap_handle_action.setText(tr('Action_BitmapHandle', '位图处理'))
+        self.process_curve_smooth_action.setText(tr('Action_CurveSmooth', '曲线平滑'))
+        self.process_path_optimize_action.setText(tr('Action_PathOptimize', '路径优化'))
+        self.process_merge_lines_action.setText(tr('Action_MergeLines', '合并相连线'))
+        self.process_del_dup_lines_action.setText(tr('Action_DelDupLines', '删除重线'))
+        self.process_gen_parallel_action.setText(tr('Action_GenParallel', '生成平行线'))
+        self.process_data_check_action.setText(tr('Action_DataCheck', '数据检查'))
+        self.process_fill_to_bitmap_action.setText(tr('Action_FillToBitmap', '填充成位图'))
+        self.process_bridge_action.setText(tr('Action_Bridge', '桥位'))
+        self.process_micro_joint_action.setText(tr('Action_MicroJoint', '微连'))
+
+        # Tools
+        self.tool_project_cut_action.setText(tr('Action_ProjectCut', '投影切割'))
+        self.tool_measure_action.setText(tr('Action_Measure', '测量工具'))
+        self.tool_auto_nest_action.setText(tr('Action_AutoNest', '自动排版'))
+        self.tool_enclas400g_action.setText(tr('Action_EncLas400G', 'EncLas400G'))
+        self.tool_mark_point_action.setText(tr('Action_MarkPoint', 'Mark点定位'))
+        self.tool_light_guide_action.setText(tr('Action_LightGuide', '导光板设计'))
+        self.tool_add_label_action.setText(tr('Action_AddLabel', '加标签'))
+
+        # About/Help
+        self.about_action.setText(tr('Action_About', '关于'))
+        self.help_docs_action.setText(tr('Action_HelpDocs', '帮助文档'))
+        self.view_log_action.setText(tr('Action_ViewLog', '日志查看'))
+        self.lang_menu.setTitle(tr('Menu_Language', 'Language'))
+        self.comm_forum_action.setText(tr('Action_UserForum', '用户论坛')) # Mapped slightly wrong in INI but okay
+        self.comm_video_action.setText(tr('Action_LaserVideo', '激光视频'))
+        self.comm_vector_action.setText(tr('Action_CutVector', '切割矢量文件'))
+        self.comm_app_action.setText(tr('Action_CommunityApp', '社区APP'))
+        
+        # Update Window Title
+        self.setWindowTitle(tr('Title', '激光加工控制系统'))
+
+        # View Menu Actions
+        if hasattr(self, 'view_sys_toolbar'):
+            self.view_sys_toolbar.setText(tr('View_SysToolbar', '系统工具栏'))
+            self.view_status_bar.setText(tr('View_StatusBar', '系统状态栏'))
+            self.view_draw_toolbar.setText(tr('View_DrawToolbar', '绘制工具栏'))
+            self.view_cut_prop_bar.setText(tr('View_CutPropBar', '切割属性栏'))
+            self.view_align_toolbar.setText(tr('View_AlignToolbar', '对齐工具栏'))
+            self.view_color_toolbar.setText(tr('View_ColorToolbar', '颜色工具栏'))
+            self.view_sys_workspace.setText(tr('View_SysWorkspace', '系统工作区'))
+            self.view_process_ctrl_bar.setText(tr('View_ProcessCtrlBar', '加工控制栏'))
+            self.view_add_toolbar.setText(tr('View_AddToolbar', '附加工具栏'))
+            self.view_lead_io_tool.setText(tr('View_LeadIOTool', '引入引出工具'))
+            self.view_element_name.setText(tr('View_ElementName', '图元名称'))
+            self.view_process_toolbar.setText(tr('View_ProcessToolbar', '处理工具栏'))
+            self.view_canvas_toolbar.setText(tr('View_CanvasToolbar', '画布工具栏'))
+
+        # Update Left Toolbar
+        if hasattr(self, 'left_toolbar'):
+            self.left_toolbar.retranslate_ui()
+            
+        # Update Toolbar Actions
+        if hasattr(self, 'toolbar_actions_list'):
+            for action in self.toolbar_actions_list:
+                key = action.property('tr_key')
+                default = action.property('default_tooltip')
+                text = tr(key, default)
+                action.setToolTip(text)
+                action.setStatusTip(text)
+
 
     def create_toolbars(self):
         """创建三行工具栏"""
         # 第一行工具栏 - toolbar_row1_icons 的所有图标
-        toolbar1 = QToolBar('工具栏1')
-        toolbar1.setIconSize(QSize(28, 28))
-        toolbar1.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, toolbar1)
+        self.toolbar1 = QToolBar('工具栏1')
+        self.toolbar1.setIconSize(QSize(22, 22))  # 缩小图标尺寸
+        self.toolbar1.setMovable(False)
+        self.addToolBar(Qt.TopToolBarArea, self.toolbar1)
 
         # 左侧新建和打开按钮
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column1.png', '新建', self.new_file))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column2.png', '打开', self.open_file))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', self.save_file))
-        toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', self.import_image))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', self.export_to_nc))
-        toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', self.undo))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', self.redo))
-        toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', self.set_pan_tool))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', self.view_zoom_in))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', self.view_zoom_out))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', self.zoom_to_page))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围 ', self.zoom_to_data))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', self.zoom_to_all))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', self.set_box_zoom_tool))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column1.png', '新建', self.new_file))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column2.png', '打开', self.open_file))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', self.save_file))
+        self.toolbar1.addSeparator()
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', self.import_image, tr_key='Action_Import'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', self.export_to_nc, tr_key='Action_Export'))
+        self.toolbar1.addSeparator()
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', self.undo, tr_key='Action_Undo'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', self.redo, tr_key='Action_Redo'))
+        self.toolbar1.addSeparator()
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', self.set_pan_tool, tr_key='Action_Move'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', self.view_zoom_in, tr_key='Action_ZoomIn'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', self.view_zoom_out, tr_key='Action_ZoomOut'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', self.zoom_to_page, tr_key='Action_PageRange'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围', self.zoom_to_data, tr_key='Action_DataRange'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', self.zoom_to_all, tr_key='Action_ShowAll'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', self.set_box_zoom_tool, tr_key='Action_BoxZoom'))
         # 复用页面范围图标作为回到原点图标
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '回到原点', self.align_origin))
-        toolbar1.addSeparator()
-        self.show_path_action = self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', self.toggle_show_path, is_checkable=True)
-        toolbar1.addAction(self.show_path_action)
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '回到原点', self.align_origin))
+        self.toolbar1.addSeparator()
+        self.show_path_action = self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', self.toggle_show_path, is_checkable=True, tr_key='Action_ShowPath')
+        self.toolbar1.addAction(self.show_path_action)
         # 连接选择改变信号，以便在选中项改变时更新路径预览
         try:
             self.whiteboard.canvas.scene.selectionChanged.connect(self.toggle_show_path)
         except Exception:
             pass
 
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置引入引出', self.set_lead_line))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', None))
-        toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', self.show_preview_dialog))
-        toolbar1.addSeparator()
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column19.png', '自动群组', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column20.png', '群组', None))
-        toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column21.png', '解散群组', None))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置引入引出', self.set_lead_line, tr_key='Action_SetLead'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', None))
+        self.toolbar1.addSeparator()
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', self.show_preview_dialog, tr_key='Action_Preview'))
+        self.toolbar1.addSeparator()
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column19.png', '自动群组', None))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column20.png', '群组', None))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column21.png', '解散群组', None))
 
 
         # 第二行工具栏
-        toolbar2 = QToolBar('工具栏2')
-        toolbar2.setIconSize(QSize(28, 28))
-        toolbar2.setMovable(False)
+        self.toolbar2 = QToolBar('工具栏2')
+        self.toolbar2.setIconSize(QSize(22, 22))  # 缩小图标尺寸
+        self.toolbar2.setMovable(False)
         # 将第二行工具栏放到新的一行
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBarBreak(Qt.TopToolBarArea)
+
         self.addToolBar(Qt.TopToolBarArea, toolbar2)
 
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column1.png', '投影切割', self.new_file))
@@ -501,60 +1169,61 @@ class MainWindow(QMainWindow):
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column17.png', '放置图形', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column18.png', '底图显示', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column19.png', '画布参数设置', None))
+
         
         # 新增：激光连接按钮
-        toolbar2.addSeparator()
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/lianjie.png', '图片处理', self.open_laser_window))
+        self.toolbar2.addSeparator()
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/lianjie.png', '图片处理', self.open_laser_window))
 
         # 第三行工具栏
-        toolbar3 = QToolBar('工具栏3')
-        toolbar3.setIconSize(QSize(32, 32))
-        toolbar3.setMovable(False)
-        toolbar3.setMinimumHeight(70)
+        self.toolbar3 = QToolBar('工具栏3')
+        self.toolbar3.setIconSize(QSize(25, 25))  # 缩小图标尺寸
+        self.toolbar3.setMovable(False)
+        self.toolbar3.setMinimumHeight(40)  # 减小最小高度
         self.addToolBarBreak(Qt.TopToolBarArea)
-        self.addToolBar(Qt.TopToolBarArea, toolbar3)
+        self.addToolBar(Qt.TopToolBarArea, self.toolbar3)
 
         # 创建属性输入区域
         from PyQt5.QtWidgets import QGridLayout
 
         properties_widget = QWidget()
-        properties_widget.setMinimumHeight(65)
-        properties_widget.setMaximumHeight(65)
+        properties_widget.setMinimumHeight(52)  # 进一步减小高度
+        properties_widget.setMaximumHeight(52)
         properties_widget.setMaximumWidth(450)
         properties_layout = QGridLayout(properties_widget)
-        properties_layout.setContentsMargins(5, 5, 5, 5)
-        properties_layout.setSpacing(3)
+        properties_layout.setContentsMargins(2, 2, 2, 2)  # 减小边距
+        properties_layout.setSpacing(2)
         properties_layout.setHorizontalSpacing(3)
-        properties_layout.setVerticalSpacing(5)
+        properties_layout.setVerticalSpacing(2)  # 减小垂直间距
 
         # 第一行
         properties_layout.addWidget(QLabel("X"), 0, 0)
         self.x_input = QLineEdit("0")
         self.x_input.setMaximumWidth(55)
-        self.x_input.setMinimumHeight(24)  # 增加输入框高度
-        self.x_input.setMaximumHeight(24)
+        self.x_input.setMinimumHeight(22)  # 减小输入框高度
+        self.x_input.setMaximumHeight(22)
         properties_layout.addWidget(self.x_input, 0, 1)
         properties_layout.addWidget(QLabel("mm"), 0, 2)
 
         # 宽度图标
         kuandu_icon = QLabel()
-        kuandu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_width.png").pixmap(QSize(20, 20)))
-        kuandu_icon.setMaximumWidth(22)
+        kuandu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_width.png").pixmap(QSize(18, 18)))
+        kuandu_icon.setMaximumWidth(20)
         properties_layout.addWidget(kuandu_icon, 0, 3)
 
         # 宽度
         self.width_input = QLineEdit("0")
         self.width_input.setMaximumWidth(55)
-        self.width_input.setMinimumHeight(24)  # 增加输入框高度
-        self.width_input.setMaximumHeight(24)
+        self.width_input.setMinimumHeight(22)
+        self.width_input.setMaximumHeight(22)
         properties_layout.addWidget(self.width_input, 0, 4)
         properties_layout.addWidget(QLabel("mm"), 0, 5)
 
         # 百分比
         self.percent_input = QLineEdit("100")
         self.percent_input.setMaximumWidth(55)
-        self.percent_input.setMinimumHeight(24)  # 增加输入框高度
-        self.percent_input.setMaximumHeight(24)
+        self.percent_input.setMinimumHeight(22)
+        self.percent_input.setMaximumHeight(22)
         properties_layout.addWidget(self.percent_input, 0, 6)
         properties_layout.addWidget(QLabel("%"), 0, 7)
 
@@ -563,34 +1232,34 @@ class MainWindow(QMainWindow):
         properties_layout.addWidget(QLabel("Y"), 1, 0)
         self.y_input = QLineEdit("0")
         self.y_input.setMaximumWidth(55)
-        self.y_input.setMinimumHeight(24)  # 增加输入框高度
-        self.y_input.setMaximumHeight(24)
+        self.y_input.setMinimumHeight(22)
+        self.y_input.setMaximumHeight(22)
         properties_layout.addWidget(self.y_input, 1, 1)
         properties_layout.addWidget(QLabel("mm"), 1, 2)
 
         # 高度图标（光度）
         gaodu_icon = QLabel()
-        gaodu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_height.png").pixmap(QSize(20, 20)))
-        gaodu_icon.setMaximumWidth(22)
+        gaodu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_height.png").pixmap(QSize(18, 18)))
+        gaodu_icon.setMaximumWidth(20)
         properties_layout.addWidget(gaodu_icon, 1, 3)
 
         # 高度
         self.height_input = QLineEdit("0")
         self.height_input.setMaximumWidth(55)
-        self.height_input.setMinimumHeight(24)  # 增加输入框高度
-        self.height_input.setMaximumHeight(24)
+        self.height_input.setMinimumHeight(22)
+        self.height_input.setMaximumHeight(22)
         properties_layout.addWidget(self.height_input, 1, 4)
         properties_layout.addWidget(QLabel("mm"), 1, 5)
 
         # 百分比（第二行）
         self.percent_input2 = QLineEdit("100")
         self.percent_input2.setMaximumWidth(55)
-        self.percent_input2.setMinimumHeight(24)  # 增加输入框高度
-        self.percent_input2.setMaximumHeight(24)
+        self.percent_input2.setMinimumHeight(22)
+        self.percent_input2.setMaximumHeight(22)
         properties_layout.addWidget(self.percent_input2, 1, 6)
         properties_layout.addWidget(QLabel("%"), 1, 7)
 
-        toolbar3.addWidget(properties_widget)
+        self.toolbar3.addWidget(properties_widget)
         
         # 连接输入框的信号，实现参数化输入
         self.x_input.returnPressed.connect(lambda: self._apply_position_and_size_changes())
@@ -601,45 +1270,44 @@ class MainWindow(QMainWindow):
         self.percent_input2.returnPressed.connect(lambda: self._apply_percent_scale(False))
 
         # 变换工具
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '锁住', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column2.png', '选择位置坐标基准', None))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column3.png', '修改尺寸', None))
-        toolbar3.addSeparator()
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '锁住', None))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column2.png', '选择位置坐标基准', None))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column3.png', '修改尺寸', None))
+        self.toolbar3.addSeparator()
 
         # 使用左侧循环箭头图标作为“按输入角度旋转”的快捷按钮
         try:
             rotate_action = self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '按输入角度旋转选中项', None, True)
-            toolbar3.addAction(rotate_action)
+            self.toolbar3.addAction(rotate_action)
             try:
                 rotate_action.triggered.connect(lambda: self.rotate_selected_by_angle())
             except Exception:
                 pass
         except Exception:
             # fallback: add original action if creation fails
-            toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '恢复', None, False))
+            self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '恢复', None, False))
 
         # 角度输入框和加工序号输入框（合并到一个widget中，防止全屏时分开）
         from PyQt5.QtWidgets import QSizePolicy
 
         angle_order_widget = QWidget()
-        angle_order_widget.setMinimumWidth(280)
-        angle_order_widget.setMaximumWidth(280)
-        angle_order_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)  # 固定宽度
+        angle_order_widget.setFixedWidth(230) # 减小固定宽度，使其更紧凑
+        angle_order_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
 
         angle_order_layout = QHBoxLayout(angle_order_widget)
-        angle_order_layout.setContentsMargins(3, 0, 3, 0)
-        angle_order_layout.setSpacing(5)
+        angle_order_layout.setContentsMargins(1, 0, 1, 0) # 减小边距
+        angle_order_layout.setSpacing(2) # 减小间距
 
         # 角度输入框（公开为 self.angle_input）
         self.angle_input = QLineEdit("0")
-        self.angle_input.setMaximumWidth(70)
-        self.angle_input.setMinimumHeight(40)
-        self.angle_input.setMaximumHeight(40)
+        self.angle_input.setMaximumWidth(50) # 减小宽度
+        self.angle_input.setMinimumHeight(24) # 减小高度
+        self.angle_input.setMaximumHeight(24)
         self.angle_input.setAlignment(Qt.AlignCenter)
         angle_order_layout.addWidget(self.angle_input)
 
         degree_label = QLabel("°")
-        degree_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        degree_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         angle_order_layout.addWidget(degree_label)
 
         # 角度应用由左侧工具图标触发（或在输入框按回车）
@@ -648,9 +1316,10 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QPushButton
         precise_btn = QPushButton()
         precise_btn.setToolTip('精确旋转...')
-        precise_btn.setFixedSize(28, 28)
+        precise_btn.setFixedSize(22, 22) # 减小按钮尺寸
         try:
             precise_btn.setIcon(QtGui.QIcon('toolbar_row3_icons/xuanzhuan.png'))
+            precise_btn.setIconSize(QSize(18, 18))
         except Exception:
             precise_btn.setText('...')
         angle_order_layout.addWidget(precise_btn)
@@ -664,46 +1333,46 @@ class MainWindow(QMainWindow):
 
         # 加工序号标签
         order_label = QLabel("加工序号")
-        order_label.setStyleSheet("font-size: 14px; font-weight: bold;")  # 加大字体到14px并加粗
+        order_label.setStyleSheet("font-size: 12px; font-weight: bold;")  # 加大字体到14px并加粗
         angle_order_layout.addWidget(order_label)
 
         # 加工序号输入框
         order_input = QLineEdit("0")
-        order_input.setMaximumWidth(70)
-        order_input.setMinimumHeight(40)
-        order_input.setMaximumHeight(40)
+        order_input.setMaximumWidth(50) # 减小宽度
+        order_input.setMinimumHeight(24) # 减小高度
+        order_input.setMaximumHeight(24)
         order_input.setAlignment(Qt.AlignCenter)
         angle_order_layout.addWidget(order_input)
 
-        toolbar3.addWidget(angle_order_widget)
-        toolbar3.addSeparator()  # 在第五个按钮后添加分隔符
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('left')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('right')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('top')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('bottom')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('hcenter')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('vcenter')))
-        toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', lambda: self.whiteboard.canvas.edit_manager.distribute_items('horizontal')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', lambda: self.whiteboard.canvas.edit_manager.distribute_items('vertical')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', lambda: self.whiteboard.canvas.edit_manager.make_same_size('width')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', lambda: self.whiteboard.canvas.edit_manager.make_same_size('height')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', lambda: self.whiteboard.canvas.edit_manager.make_same_size('size')))
-        toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_left')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_right')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_right')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_left')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', lambda: self.whiteboard.canvas.edit_manager.align_to_page('center')))
-        toolbar3.addSeparator()
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '移至左边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('left')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '移至右边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('right')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '移至上边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top')))
-        toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '移至下边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom')))
+        self.toolbar3.addWidget(angle_order_widget)
+        self.toolbar3.addSeparator()  # 在第五个按钮后添加分隔符
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('top')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('bottom')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('hcenter')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('vcenter')))
+        self.toolbar3.addSeparator()
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', lambda: self.whiteboard.canvas.edit_manager.distribute_items('horizontal')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', lambda: self.whiteboard.canvas.edit_manager.distribute_items('vertical')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', lambda: self.whiteboard.canvas.edit_manager.make_same_size('width')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', lambda: self.whiteboard.canvas.edit_manager.make_same_size('height')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', lambda: self.whiteboard.canvas.edit_manager.make_same_size('size')))
+        self.toolbar3.addSeparator()
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', lambda: self.whiteboard.canvas.edit_manager.align_to_page('center')))
+        self.toolbar3.addSeparator()
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '移至左边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '移至右边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '移至上边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '移至下边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom')))
 
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().Expanding, spacer.sizePolicy().Preferred)
-        toolbar3.addWidget(spacer)
+        self.toolbar3.addWidget(spacer)
 
     def create_tool_action(self, icon_text, tooltip, callback):
         """创建工具栏动作（使用文本图标）"""
@@ -714,9 +1383,17 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
         return action
 
-    def create_tool_action_with_icon(self, icon_path, tooltip, callback, show_tooltip=True, is_checkable=False):
+    def create_tool_action_with_icon(self, icon_path, tooltip, callback, show_tooltip=True, is_checkable=False, tr_key=None):
         """创建工具栏动作（使用真实图标）"""
         action = QAction(self)
+        
+        # Store translation info
+        if tr_key:
+            action.setProperty('tr_key', tr_key)
+            action.setProperty('default_tooltip', tooltip)
+            # Apply initial translation
+            tooltip = language_manager.tr('MainWindow', tr_key, tooltip)
+
         if show_tooltip:
             action.setToolTip(tooltip)
             action.setStatusTip(tooltip)  # 状态栏显示提示
@@ -734,6 +1411,13 @@ class MainWindow(QMainWindow):
 
         if callback:
             action.triggered.connect(callback)
+            
+        # Add to the list of toolbar actions to be retranslated later (if needed)
+        if not hasattr(self, 'toolbar_actions_list'):
+            self.toolbar_actions_list = []
+        if tr_key:
+            self.toolbar_actions_list.append(action)
+            
         return action
 
     def create_central_widget(self):
@@ -743,28 +1427,47 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        from PyQt5.QtWidgets import QSizePolicy
+
+        # 左侧工具栏 (直接放入布局，不放入Splitter以防止压缩)
+        self.left_toolbar = LeftToolbar()
+        # 强制设置左侧工具栏固定宽度，防止被压缩
+        self.left_toolbar.setFixedWidth(50) 
+        # 设置适当的 SizePolicy 以确保垂直方向填充但不会撑大父布局
+        self.left_toolbar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
+        main_layout.addWidget(self.left_toolbar, 0)
+
+        # 节点编辑辅助工具栏（默认隐藏，固定宽度）
+        self.node_edit_toolbar = NodeEditToolbar()
+        self.node_edit_toolbar.setFixedWidth(30)
+        self.node_edit_toolbar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
+        self.node_edit_toolbar.hide()
+        main_layout.addWidget(self.node_edit_toolbar, 0)
+
         from PyQt5.QtWidgets import QSplitter
         from PyQt5.QtCore import Qt as _Qt
 
-        # 使用 QSplitter 管理三列，避免在窗口放大时单列被异常拉伸
-        splitter = QSplitter(_Qt.Horizontal)
-
-        # 左侧工具栏
-        self.left_toolbar = LeftToolbar()
-        splitter.addWidget(self.left_toolbar)
+        # 使用 QSplitter 管理中间白板和右侧面板
+        # 移除了左侧工具栏的Splitter管理，避免左侧工具变形，同时保留右侧面板的可调节性
+        self.splitter = QSplitter(_Qt.Horizontal)
+        # 为 Splitter 设置 SizePolicy，确保其能正确扩展
+        self.splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # 中间白板区域（优先扩展）
         self.whiteboard = WhiteboardWidget()
-        splitter.addWidget(self.whiteboard)
+        self.splitter.addWidget(self.whiteboard)
 
         # 右侧属性面板
         self.right_panel = RightPanel()
-        splitter.addWidget(self.right_panel)
+        self.splitter.addWidget(self.right_panel)
 
-        # 初始分配宽度（左, 中, 右）——中间白板优先扩展
-        splitter.setSizes([80, 1000, 420])
+        # 初始分配宽度（中, 右）
+        # 保证右侧面板可见，根据原比例 1000:420 分配
+        self.splitter.setSizes([1000, 420])
+        self.splitter.setCollapsible(0, False) # 白板区不可折叠消失
 
-        main_layout.addWidget(splitter)
+        # 添加 Splitter 到主布局，stretch 系数为 1，确保它占据所有剩余空间
+        main_layout.addWidget(self.splitter, 1)
         
         # 将画布引用传递给右侧面板
         self.right_panel.set_canvas(self.whiteboard.canvas)
@@ -774,8 +1477,16 @@ class MainWindow(QMainWindow):
         # 连接左侧工具栏信号
         self.left_toolbar.toolChanged.connect(self.on_tool_changed)
         
+        # 连接节点编辑工具栏信号
+        self.node_edit_toolbar.actionTriggered.connect(self.on_node_edit_action)
+        
         # 连接画布的选中项变化信号，实时更新位置显示
         self.whiteboard.canvas.scene.selectionChanged.connect(self._update_position_display)
+        # 同时也更新工具栏状态（镜像、阵列等工具仅在有选中时可用）
+        self.whiteboard.canvas.scene.selectionChanged.connect(self.update_toolbar_selection_state)
+
+        # 初始化工具栏状态（默认禁用依赖选择的工具）
+        self.update_toolbar_selection_state()
         
         # 创建定时器用于实时更新位置（图形移动时）
         from PyQt5.QtCore import QTimer
@@ -806,8 +1517,317 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def on_node_edit_action(self, action_id):
+        """处理节点编辑工具栏的动作"""
+        # 获取当前场景中处于节点编辑模式的项
+        target_item = None
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        from ui.graphics_items import EditablePathItem
+        selected_paths = [item for item in selected_items if isinstance(item, EditablePathItem) and getattr(item, '_node_edit_enabled', False)]
+        
+        # 处理连接节点动作 - 支持跨路径连接
+        if action_id == NodeEditToolbar.ACTION_CONNECT_NODES:
+            if len(selected_paths) == 2:
+                # 尝试连接两个路径
+                path1 = selected_paths[0]
+                path2 = selected_paths[1]
+                nodes1 = list(path1._selected_handle_indices)
+                nodes2 = list(path2._selected_handle_indices)
+                
+                if len(nodes1) == 1 and len(nodes2) == 1:
+                    idx1 = nodes1[0]
+                    idx2 = nodes2[0]
+                    
+                    data1 = path1.get_path_data()
+                    data2 = path2.get_path_data()
+                    
+                    pts1 = data1[0]
+                    pts2 = data2[0]
+                    n1 = len(pts1)
+                    n2 = len(pts2)
+                    
+                    merged_data = None
+                    
+                    def merge_data(d1, d2):
+                        p1, s1, c1 = d1
+                        p2, s2, c2 = d2
+                        new_pts = p1 + p2
+                        new_segs = s1 + [0] + s2
+                        new_cps = c1.copy()
+                        offset = len(p1)
+                        for k, v in c2.items():
+                            new_cps[k + offset] = v
+                        return (new_pts, new_segs, new_cps)
+
+                    # 1. End of P1 -> Start of P2
+                    if idx1 == n1 - 1 and idx2 == 0:
+                        merged_data = merge_data(data1, data2)
+                    # 2. Start of P1 -> End of P2 (P2 + P1)
+                    elif idx1 == 0 and idx2 == n2 - 1:
+                        merged_data = merge_data(data2, data1)
+                    # 3. End of P1 -> End of P2 (P1 + Rev(P2))
+                    elif idx1 == n1 - 1 and idx2 == n2 - 1:
+                        rev2 = EditablePathItem.reverse_path_data(data2)
+                        merged_data = merge_data(data1, rev2)
+                    # 4. Start of P1 -> Start of P2 (Rev(P2) + P1)
+                    elif idx1 == 0 and idx2 == 0:
+                        rev2 = EditablePathItem.reverse_path_data(data2)
+                        merged_data = merge_data(rev2, data1)
+                        
+                    if merged_data:
+                        from edit.commands import MergePathsCommand
+                        cmd = MergePathsCommand(self.whiteboard.canvas, path1, path2, merged_data)
+                        cmd.redo()
+                        self.whiteboard.canvas.edit_manager.push_undo(cmd)
+                        # Re-enable node edit for the survivor (path1)
+                        path1.enable_node_edit(True)
+                        path1._selected_handle_indices.clear()
+                        path1._rebuild_handles()
+                        return
+            elif len(selected_paths) == 1:
+                selected_paths[0].connect_selected_nodes()
+                return
+
+        # 其他动作仅处理单选（或优先处理第一个）
+        if selected_paths:
+            target_item = selected_paths[0]
+        
+        if target_item:
+            if action_id == NodeEditToolbar.ACTION_DELETE_NODE:
+                target_item.delete_selected_node()
+            elif action_id == NodeEditToolbar.ACTION_ADD_NODE:
+                target_item.add_node_at_suggestion()
+            elif action_id == NodeEditToolbar.ACTION_BREAK_CURVE:
+                target_item.break_curve_at_selected_nodes()
+            elif action_id == NodeEditToolbar.ACTION_TO_LINE:
+                target_item.set_selected_segments_type(False) # 直线
+            elif action_id == NodeEditToolbar.ACTION_TO_CURVE:
+                target_item.set_selected_segments_type(True)  # 曲线
+            elif action_id != NodeEditToolbar.ACTION_CONNECT_NODES: # handled above
+                 QMessageBox.information(self, "节点编辑", f"触发动做: {action_id}\n(功能开发中)")
+        else:
+            # QMessageBox.information(self, "提示", "请先选择处于节点编辑模式的图形")
+            pass
+
+    def _set_tool_from_menu(self, tool_id):
+        """辅助方法：从菜单设置工具，并同步左侧工具栏状态"""
+        # 触发 on_tool_changed 以设置白板工具和状态栏
+        self.on_tool_changed(tool_id)
+        
+        # 同步左侧工具栏按钮状态
+        if hasattr(self, 'left_toolbar'):
+            for btn in self.left_toolbar.button_group.buttons():
+                if btn.property("tool_id") == tool_id:
+                    btn.setChecked(True)
+                    break
+
+    def update_toolbar_selection_state(self):
+        """更新工具栏状态（根据是否有选中项）"""
+        try:
+            # 获取是否有选中的图形项
+            selected = self.whiteboard.canvas.scene.selectedItems()
+            has_selection = bool(selected)
+            if hasattr(self, 'left_toolbar'):
+                self.left_toolbar.update_selection_dependent_tools(has_selection)
+        except Exception:
+            pass
+
+    def _clone_item(self, item):
+        new_item = None
+        if isinstance(item, EditablePathItem):
+            # args: pts, color, smooth
+            new_item = EditablePathItem(item.points(), item.color(), item._smooth)
+        elif isinstance(item, EditableEllipseItem):
+            # args: cx, cy, rx, ry, color
+            rect = item.rect()
+            cx = rect.x() + rect.width()/2
+            cy = rect.y() + rect.height()/2
+            rx = rect.width()/2
+            ry = rect.height()/2
+            new_item = EditableEllipseItem(cx, cy, rx, ry, item._color)
+        elif isinstance(item, TextGraphicsItem):
+            # args: text, settings
+            new_item = TextGraphicsItem(item.text_data, item.settings)
+        
+        if new_item:
+            # Copy common properties
+            new_item.setPos(item.pos())
+            new_item.setRotation(item.rotation())
+            new_item.setScale(item.scale())
+            new_item.setZValue(item.zValue())
+            new_item.setTransform(item.transform())
+            new_item.setPen(item.pen())
+            new_item.setBrush(item.brush())
+            
+        return new_item
+
+    def _perform_array_copy(self, data, selected_items):
+        nx = int(data['x_count'])
+        ny = int(data['y_count'])
+        dx = float(data['x_interval'])
+        dy = float(data['y_interval'])
+        
+        dir_mode = data['direction_mode']
+        order_mode = data['order_mode']
+
+        sx, sy = 1, 1
+        # Mapping 4 directions based on typical icon order
+        if dir_mode == 0: sx, sy = 1, 1      # 1st Quadrant (Right-Down per screen coords)
+        elif dir_mode == 1: sx, sy = 1, -1   # Right-Up
+        elif dir_mode == 2: sx, sy = -1, -1  # Left-Up
+        elif dir_mode == 3: sx, sy = -1, 1   # Left-Down
+        # Adjust mapping if icons are 1=RD, 2=LD, etc. Usually:
+        # 1. Right-Down, 2. Left-Down, 3. Left-Up, 4. Right-Up? 
+        # Let's stick to standard quadrants or user testing.
+        # Assuming: 0: R-D, 1: R-U, 2: L-U, 3: L-D?
+        # Actually icons usually rotate clockwise or counter-clockwise.
+        # Let's try: 0=RD (Default), 1=LD, 2=LU, 3=RU
+        if dir_mode == 0: sx, sy = 1, 1
+        elif dir_mode == 1: sx, sy = -1, 1
+        elif dir_mode == 2: sx, sy = -1, -1
+        elif dir_mode == 3: sx, sy = 1, -1
+        
+        union_rect = None
+        for item in selected_items:
+            br = item.sceneBoundingRect()
+            if union_rect is None: union_rect = br
+            else: union_rect = union_rect.united(br)
+                
+        if not union_rect: return
+        
+        # Calculate steps relative to bounding box top-left?
+        # Or just relative move.
+        # dx is gap. Step = Width + Gap.
+        
+        width = union_rect.width()
+        height = union_rect.height()
+        
+        step_x = (width + dx) * sx
+        step_y = (height + dy) * sy
+        
+        new_items = []
+        macro_cmd = MacroCommand(description="Array Copy")
+        scene = self.whiteboard.canvas.scene
+        
+        # Determine grid execution order
+        # We need to generate a list of (i, j) coordinates
+        
+        grid_coords = []
+        
+        # Order Mode mapping:
+        # 0: X-S (Row priority, Zigzag) -> Right, Left, Right...
+        # 1: Y-S (Col priority, Zigzag) -> Down, Up, Down...
+        # 2: X-Parallel (Row priority, unidirectional)
+        # 3: Y-Parallel (Col priority, unidirectional)
+        
+        if order_mode == 0: # X-S Zigzag (Row-Major)
+            for j in range(ny):
+                row_indices = range(nx)
+                if j % 2 == 1: 
+                    row_indices = reversed(row_indices)
+                for i in row_indices:
+                    grid_coords.append((i, j))
+                    
+        elif order_mode == 1: # Y-S Zigzag (Col-Major)
+            for i in range(nx):
+                col_indices = range(ny)
+                if i % 2 == 1:
+                    col_indices = reversed(col_indices)
+                for j in col_indices:
+                    grid_coords.append((i, j))
+                    
+        elif order_mode == 2: # X-Parallel (Row-Major)
+            for j in range(ny):
+                for i in range(nx):
+                    grid_coords.append((i, j))
+                    
+        else: # Y-Parallel (Col-Major)
+             for i in range(nx):
+                for j in range(ny):
+                    grid_coords.append((i, j))
+        
+        # Execute creation
+        for i, j in grid_coords:
+            if i == 0 and j == 0 and dir_mode == 0:
+                 # If origin is at 0,0 and we want to keep original?
+                 # Actually array copy usually creates copies including the original position or excluding?
+                 # If "Array Copy", usually includes original as one of the N.
+                 # If so, we skip creating a NEW one at 0,0, but we should make sure expected count is reached.
+                 # If user says 1x1, nothing happens.
+                 pass
+            
+            # Position offset
+            ox = i * step_x
+            oy = j * step_y
+            
+            # If (ox, oy) is (0,0), it's the original position.
+            # We skip duplication for original items to avoid double stacking.
+            if abs(ox) < 0.001 and abs(oy) < 0.001:
+                continue
+
+            for item in selected_items:
+                clone = self._clone_item(item)
+                if clone:
+                    # Move relative to original
+                    clone.moveBy(ox, oy)
+                    scene.addItem(clone)
+                    new_items.append(clone)
+                    cmd = AddItemCommand(self.whiteboard.canvas, clone)
+                    macro_cmd.add_command(cmd)
+
+        if macro_cmd.commands:
+            self.whiteboard.canvas.edit_manager.push_undo(macro_cmd)
+            # Select new items
+            scene.clearSelection()
+            for it in new_items:
+                it.setSelected(True)
+
+
     def on_tool_changed(self, tool_id):
         """左侧工具栏工具切换"""
+        # 特殊处理删除工具：如果当前有选中的对象，则直接删除并切回选择工具
+        if tool_id == LeftToolbar.TOOL_DELETE:
+            # 检查是否有选中的用户图形（排除辅助及背景项）
+            selected = self.whiteboard.canvas.get_selected_items() 
+            if selected:
+                self.whiteboard.delete()
+                # 删除完成后自动切回选择工具
+                self.left_toolbar.select_tool(LeftToolbar.TOOL_SELECT)
+                return
+
+        # 特殊处理图形停靠工具（移动至画布中心）
+        if tool_id == LeftToolbar.TOOL_DOCK:
+            self.whiteboard.dock_to_center()
+            self.left_toolbar.select_tool(LeftToolbar.TOOL_SELECT)
+            return
+
+        # 处理阵列复制
+        if tool_id == LeftToolbar.TOOL_ARRAY:
+            selected = self.whiteboard.canvas.get_selected_items() 
+            if not selected:
+                QMessageBox.warning(self, "提示", "请选择需要阵列的对象")
+                self.left_toolbar.select_tool(LeftToolbar.TOOL_SELECT)
+                return
+            
+            union_rect = None
+            for item in selected:
+                br = item.sceneBoundingRect()
+                if union_rect is None: union_rect = br
+                else: union_rect = union_rect.united(br)
+            size = (union_rect.width(), union_rect.height()) if union_rect else (0,0)
+
+            # Pass canvas work area
+            canvas_w = getattr(self.whiteboard.canvas, '_work_w', 1200.0)
+            canvas_h = getattr(self.whiteboard.canvas, '_work_h', 800.0)
+
+            dlg = ArrayCopyDialog(selected_item_size=size, canvas_size=(canvas_w, canvas_h), parent=self)
+            if dlg.exec_() == QDialog.Accepted:
+                data = dlg.get_data()
+                self._perform_array_copy(data, selected)
+            
+            self.left_toolbar.select_tool(LeftToolbar.TOOL_SELECT)
+            return
+
         # 工具ID映射：LeftToolbar工具ID -> Whiteboard工具ID
         tool_mapping = {
             LeftToolbar.TOOL_SELECT: self.whiteboard.canvas.Tool.SELECT,
@@ -824,7 +1844,7 @@ class MainWindow(QMainWindow):
             LeftToolbar.TOOL_H_MIRROR: self.whiteboard.canvas.Tool.H_MIRROR,
             LeftToolbar.TOOL_V_MIRROR: self.whiteboard.canvas.Tool.V_MIRROR,
             LeftToolbar.TOOL_DOCK: self.whiteboard.canvas.Tool.DOCK,
-            LeftToolbar.TOOL_ARRAY: self.whiteboard.canvas.Tool.ARRAY,
+            # LeftToolbar.TOOL_ARRAY: self.whiteboard.canvas.Tool.ARRAY,
         }
 
         if tool_id in tool_mapping:
@@ -852,6 +1872,49 @@ class MainWindow(QMainWindow):
 
             if tool_id in tool_names:
                 self.show_status_message(f'已选择: {tool_names[tool_id]}')
+        
+        # 同步更新菜单项的选中状态
+        self._update_draw_menu_selection(tool_id)
+
+        # 同步更新曲线编辑菜单的可用性
+        # if hasattr(self, 'curve_edit_menu'):
+        #    self.curve_edit_menu.setEnabled(tool_id == LeftToolbar.TOOL_NODE_EDIT)
+
+    def _update_draw_menu_selection(self, tool_id):
+        """根据当前工具ID更新菜单项选中状态"""
+        # 工具ID -> 菜单Action属性名
+        action_map = {
+            LeftToolbar.TOOL_SELECT: 'select_action',
+            LeftToolbar.TOOL_NODE_EDIT: 'node_edit_action',
+            LeftToolbar.TOOL_LINE: 'line_action',
+            LeftToolbar.TOOL_POLYLINE: 'poly_action',
+            LeftToolbar.TOOL_CURVE: 'curve_action',
+            LeftToolbar.TOOL_RECTANGLE: 'rect_action',
+            LeftToolbar.TOOL_ELLIPSE: 'ellipse_action',
+            LeftToolbar.TOOL_TEXT: 'text_action',
+            LeftToolbar.TOOL_POINT: 'point_action',
+            LeftToolbar.TOOL_H_MIRROR: 'h_mirror_action',
+            LeftToolbar.TOOL_V_MIRROR: 'v_mirror_action',
+            LeftToolbar.TOOL_DOCK: 'dock_action',
+            LeftToolbar.TOOL_ARRAY: 'array_action'
+        }
+        
+        # 先取消所有相关Action的选中状态
+        for action_name in action_map.values():
+            if hasattr(self, action_name):
+                getattr(self, action_name).setChecked(False)
+        
+        # 选中当前工具对应的Action
+        if tool_id in action_map and hasattr(self, action_map[tool_id]):
+            getattr(self, action_map[tool_id]).setChecked(True)
+
+
+            # --- 控制节点编辑工具栏的显示/隐藏 ---
+            if tool_id == LeftToolbar.TOOL_NODE_EDIT:
+                self.node_edit_toolbar.show()
+            else:
+                self.node_edit_toolbar.hide()
+            # -------------------------------------
 
             # 特殊工具处理
             if tool_id == LeftToolbar.TOOL_DELETE:
@@ -1155,6 +2218,25 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "保存错误", f"保存文件时发生错误:\n{str(e)}")
 
+    def get_next_layer_color(self):
+        """获取下一个可用的图层颜色"""
+        import random
+        # 获取当前已使用的颜色
+        used_colors = set(self.right_panel.layer_data.keys())
+        
+        # 尝试生成随机颜色，直到找到一个未使用的
+        for _ in range(100):
+            # 生成鲜艳的颜色 (避免太黑或太白)
+            r = random.randint(50, 255)
+            g = random.randint(50, 255)
+            b = random.randint(50, 255)
+            color = QColor(r, g, b)
+            if color.name().upper() not in used_colors:
+                return color
+        
+        # 如果尝试多次都失败（不太可能），返回黑色
+        return QColor(0, 0, 0)
+
     def import_image(self):
         """
         合成后的图像/矢量文件导入总函数：整合原 _on_import_any、_filter、import_file_any 所有逻辑
@@ -1198,10 +2280,20 @@ class MainWindow(QMainWindow):
                     paths = import_hpgl(path)
 
                     if paths:
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         # 添加路径到画布
                         for pts in paths:
                             if len(pts) > 0:
-                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                                self.whiteboard.canvas.add_polyline(pts, layer_color)
+
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True) # 刷新显示
 
                         self.whiteboard.canvas.fit_all()
                         path_count = len(paths)
@@ -1225,7 +2317,18 @@ class MainWindow(QMainWindow):
                 if wbmp_img:
                     self._current_bitmap = wbmp_img
                     pix = pil_to_qpixmap(wbmp_img)
-                    self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                    
+                    # 生成新图层颜色
+                    layer_color = self.get_next_layer_color()
+                    self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                    
+                    # 更新图层名称
+                    self.right_panel.update_layer_list(force=True)
+                    hex_color = layer_color.name().upper()
+                    if hex_color in self.right_panel.layer_data:
+                        self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                        self.right_panel.update_layer_list(force=True)
+
                     self.whiteboard.canvas.fit_all()
                     self.show_status_message(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
                     return
@@ -1238,7 +2341,18 @@ class MainWindow(QMainWindow):
                             im = Image.open(converted_path).convert('RGBA')
                             self._current_bitmap = im
                             pix = pil_to_qpixmap(im)
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message(f'已转换并导入WBMP位图: {os.path.basename(path)}', 5000)
                             os.unlink(converted_path)
@@ -1263,8 +2377,19 @@ class MainWindow(QMainWindow):
 
                     if paths is not None:
                         # 矢量导入成功
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         for pts in paths:
-                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                            self.whiteboard.canvas.add_polyline(pts, layer_color)
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()
                         self.show_status_message(f"EPS矢量导入成功: {status_msg}", 5000)
                         return
@@ -1441,16 +2566,46 @@ class MainWindow(QMainWindow):
 
                             # 调用画布添加图片，传入精确位置与尺寸（毫米）
                             try:
-                                self.whiteboard.canvas.add_image(pix, x_mm, y_mm, width_mm=w_mm, height_mm=h_mm)
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, x_mm, y_mm, width_mm=w_mm, height_mm=h_mm, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.show_status_message(f"EPS位图导入成功", 5000)
                             except Exception as e:
                                 # 回退到原有自动居中导入
                                 self.logger.exception('自定义尺寸导入失败，使用默认导入')
-                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.show_status_message(f"EPS位图导入成功(自动)", 5000)
                         else:
                             # 用户取消，使用默认居中导入
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.show_status_message(f"EPS位图导入已取消自定义，已自动居中导入", 5000)
                     else:
                         raise RuntimeError(f"EPS文件导入失败:\n{error_msg if error_msg else status_msg}")
@@ -1461,7 +2616,18 @@ class MainWindow(QMainWindow):
                         im = Image.open(path).convert('RGBA')
                         self._current_bitmap = im
                         pix = pil_to_qpixmap(im)
-                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                        
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()
                         self.show_status_message(f'已导入位图: {os.path.basename(path)}', 5000)
                         return
@@ -1474,7 +2640,18 @@ class MainWindow(QMainWindow):
                                 im = Image.open(converted_path).convert('RGBA')
                                 self._current_bitmap = im
                                 pix = pil_to_qpixmap(im)
-                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                                
+                                # 生成新图层颜色
+                                layer_color = self.get_next_layer_color()
+                                self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                                
+                                # 更新图层名称
+                                self.right_panel.update_layer_list(force=True)
+                                hex_color = layer_color.name().upper()
+                                if hex_color in self.right_panel.layer_data:
+                                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                    self.right_panel.update_layer_list(force=True)
+
                                 self.whiteboard.canvas.fit_all()
                                 self.show_status_message(f'已转换并导入位图: {os.path.basename(path)}', 5000)
                                 os.unlink(converted_path)
@@ -1508,7 +2685,18 @@ class MainWindow(QMainWindow):
 
                         # 保存位图副本并添加到画布
                         self._current_bitmap = bitmap_image.copy()
-                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0)  # 添加到画布(0,0)位置
+                        
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+                        self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)  # 添加到画布(0,0)位置
+                        
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
+
                         self.whiteboard.canvas.fit_all()  # 自动调整视图以显示全图
 
                         # 显示成功信息
@@ -1538,12 +2726,22 @@ class MainWindow(QMainWindow):
                             f"第一个点坐标: {first_path_pts[0] if first_path_pts else '无'}"
                         )
 
+                        # 生成新图层颜色
+                        layer_color = self.get_next_layer_color()
+
                         # 绘制所有路径（红色，确保可见）
                         for idx, pts in enumerate(paths):
                             if len(pts) < 2:
                                 self.logger.warning(f"路径{idx}点数量不足（{len(pts)}个），跳过绘制")
                                 continue
-                            self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(255, 0, 0))  # 红色线条
+                            self.whiteboard.canvas.add_polyline(pts, layer_color)  # 使用新颜色
+
+                        # 更新图层名称
+                        self.right_panel.update_layer_list(force=True)
+                        hex_color = layer_color.name().upper()
+                        if hex_color in self.right_panel.layer_data:
+                            self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                            self.right_panel.update_layer_list(force=True)
 
                         # 调整视图以显示所有路径
                         self.whiteboard.canvas.fit_all()
@@ -1613,14 +2811,35 @@ class MainWindow(QMainWindow):
                             # 直接显示位图
                             pix = self.pil_to_qpixmap(bitmap_image)  # 使用实例方法
                             self._current_bitmap = bitmap_image.copy()
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message("✓ PCX文件导入成功", 5000)
                             paths = []  # 位图导入成功，无需返回路径
                         elif pcx_paths is not None:
                             # 如果有矢量路径（理论上PCX不会有）
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
                             for pts in pcx_paths:
-                                self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                                self.whiteboard.canvas.add_polyline(pts, layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message("✓ PCX文件导入成功", 5000)
                             paths = pcx_paths
@@ -1661,8 +2880,19 @@ class MainWindow(QMainWindow):
 
             # --------------------------- 其他格式导入结果处理 - 保留原逻辑 ---------------------------
             if paths:
+                # 生成新图层颜色
+                layer_color = self.get_next_layer_color()
+
                 for pts in paths:
-                    self.whiteboard.canvas.add_polyline(pts, QtGui.QColor(0, 0, 0))
+                    self.whiteboard.canvas.add_polyline(pts, layer_color)
+                
+                # 更新图层名称
+                self.right_panel.update_layer_list(force=True)
+                hex_color = layer_color.name().upper()
+                if hex_color in self.right_panel.layer_data:
+                    self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                    self.right_panel.update_layer_list(force=True)
+
                 self.whiteboard.canvas.fit_all()
                 self.show_status_message(f'已导入: {os.path.basename(path)} / 路径数={len(paths)}', 5000)
             else:
@@ -1676,7 +2906,18 @@ class MainWindow(QMainWindow):
                             im = Image.open(converted_path).convert('RGBA')
                             self._current_bitmap = im
                             pix = pil_to_qpixmap(im)
-                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0)
+                            
+                            # 生成新图层颜色
+                            layer_color = self.get_next_layer_color()
+                            self.whiteboard.canvas.add_image(pix, 0.0, 0.0, layer_color=layer_color)
+                            
+                            # 更新图层名称
+                            self.right_panel.update_layer_list(force=True)
+                            hex_color = layer_color.name().upper()
+                            if hex_color in self.right_panel.layer_data:
+                                self.right_panel.layer_data[hex_color].name = os.path.basename(path)
+                                self.right_panel.update_layer_list(force=True)
+
                             self.whiteboard.canvas.fit_all()
                             self.show_status_message(f'已转换并导入位图: {os.path.basename(path)}', 5000)
                             os.unlink(converted_path)
@@ -1743,7 +2984,11 @@ class MainWindow(QMainWindow):
                 config['grayscale_threshold'] = 128  # 中等灰度阈值
 
             # 执行导出
-            success = export_to_nc(self.whiteboard.canvas, filename, config)
+            allowed_colors = None
+            if hasattr(self, 'right_panel'):
+                allowed_colors = self.right_panel.get_output_enabled_colors()
+            
+            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors)
 
             if success:
                 # 读取生成的文件以获取更多信息
@@ -1940,6 +3185,11 @@ class MainWindow(QMainWindow):
         self.whiteboard.set_tool(self.whiteboard.canvas.Tool.PAN)
         self.show_status_message('工具: 平移')
 
+    def set_measure_tool(self):
+        """测量工具"""
+        self.whiteboard.set_tool(self.whiteboard.canvas.Tool.MEASURE)
+        self.show_status_message('工具: 测量')
+
     def zoom_to_page(self):
         """页面范围"""
         self.whiteboard.canvas.zoom_to_page()
@@ -2097,6 +3347,61 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
 
+    def toggle_sys_toolbar(self):
+        """切换系统工具栏显示"""
+        if hasattr(self, 'toolbar1'):
+            self.toolbar1.setVisible(self.view_sys_toolbar.isChecked())
+
+    def toggle_status_bar(self):
+        """切换系统状态栏显示"""
+        if self.statusBar():
+            self.statusBar().setVisible(self.view_status_bar.isChecked())
+
+    def toggle_draw_toolbar(self):
+        """切换绘制工具栏显示"""
+        if hasattr(self, 'left_toolbar'):
+            self.left_toolbar.setVisible(self.view_draw_toolbar.isChecked())
+
+    def toggle_cut_prop_bar(self):
+        """切换切割属性栏显示"""
+        # 目前属性栏在toolbar3中，暂时控制toolbar3
+        if hasattr(self, 'toolbar3'):
+            self.toolbar3.setVisible(self.view_cut_prop_bar.isChecked())
+
+    def toggle_align_toolbar(self):
+        """切换对齐工具栏显示"""
+        # 目前对齐栏也在toolbar3中，暂时控制toolbar3
+        if hasattr(self, 'toolbar3'):
+            self.toolbar3.setVisible(self.view_align_toolbar.isChecked())
+
+    def toggle_color_toolbar(self):
+        """切换颜色工具栏显示"""
+        if hasattr(self, 'color_bar'):
+            self.color_bar.setVisible(self.view_color_toolbar.isChecked())
+
+    def toggle_sys_workspace(self):
+        """切换系统工作区显示"""
+        if hasattr(self, 'whiteboard'):
+            self.whiteboard.setVisible(self.view_sys_workspace.isChecked())
+
+    def toggle_process_ctrl_bar(self):
+        """切换加工控制栏显示"""
+        if hasattr(self, 'right_panel'):
+            self.right_panel.setVisible(self.view_process_ctrl_bar.isChecked())
+
+    def toggle_add_toolbar(self):
+        """切换附加工具栏显示"""
+        if hasattr(self, 'toolbar2'):
+            self.toolbar2.setVisible(self.view_add_toolbar.isChecked())
+
+    def toggle_process_toolbar(self):
+        """切换处理工具栏显示"""
+        pass
+
+    def toggle_canvas_toolbar(self):
+        """切换画布工具栏显示"""
+        pass
+
     def set_lead_line(self):
         """设置引入引出线"""
         # 检查是否有选中对象
@@ -2165,9 +3470,12 @@ class MainWindow(QMainWindow):
             # 获取图层数据
             layer_data = self.right_panel.layer_data
             
+            # 获取激光头位置
+            laser_pos = self.whiteboard.canvas.get_laser_start_point()
+            
             # 延迟弹出，避免事件冲突
             def open_dlg():
-                dlg = PreviewDialog(valid_items, (work_w, work_h), layer_data, self)
+                dlg = PreviewDialog(valid_items, (work_w, work_h), layer_data, self, laser_pos=laser_pos)
                 # dlg.showFullScreen() # 移除全屏
                 dlg.exec_()
                 
@@ -2176,6 +3484,25 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error showing preview: {e}")
             self.show_status_message(f"预览出错: {e}")
+
+    def open_system_settings(self):
+        """打开系统设置对话框"""
+        dialog = SystemSettingsDialog(self)
+        
+        # Load current settings from whiteboard
+        if hasattr(self, 'whiteboard'):
+            current_settings = self.whiteboard.get_interface_config()
+            dialog.load_interface_settings(current_settings)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            # Apply Interface settings to whiteboard
+            try:
+                if hasattr(dialog, 'get_interface_settings'):
+                    ifsettings = dialog.get_interface_settings()
+                    if hasattr(self, 'whiteboard'):
+                        self.whiteboard.update_interface_config(ifsettings)
+            except Exception as e:
+                print(f"Error applying settings: {e}")
 
     # 工具选择方法
     def select_pen(self):
@@ -2270,6 +3597,22 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.logger.error(f'精确旋转失败: {e}', exc_info=True)
                 QMessageBox.warning(self, '旋转失败', f'精确旋转失败: {e}')
+
+    def show_help_docs(self):
+        """显示帮助文档"""
+        QMessageBox.information(self, "帮助文档", "使用说明书正在编制中。\n快捷键: F1")
+
+    def show_logs(self):
+        """显示日志"""
+        # 简单的日志查看实现
+        log_path = 'app.log'
+        if os.path.exists(log_path):
+            try:
+                os.startfile(log_path)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开日志文件: {e}")
+        else:
+             QMessageBox.information(self, "日志", "当前未生成日志文件。")
 
     def show_about(self):
         """显示关于对话框"""

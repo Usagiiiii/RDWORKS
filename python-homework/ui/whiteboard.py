@@ -9,7 +9,8 @@ import logging
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsScene,
                              QGraphicsView, QGraphicsPixmapItem, QGraphicsItem,
-                             QGraphicsTextItem, QInputDialog, QMessageBox, QGraphicsRectItem)
+                             QGraphicsTextItem, QInputDialog, QMessageBox, QGraphicsRectItem,
+                             QDialog)
 from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF
 from PyQt5.QtGui import (QPainter, QPen, QColor, QPixmap, QBrush, QFont,
                          QPainterPath, QWheelEvent, QTransform, QMouseEvent,
@@ -20,7 +21,7 @@ from typing import List, Tuple, Optional
 from edit.commands import AddItemCommand
 from edit.edit_manager import EditManager
 from my_io.gcode.gcode_exporter import Point
-from ui.graphics_items import EditablePathItem, EditableEllipseItem
+from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -29,6 +30,8 @@ Pt = Tuple[float, float]
 Path = List[Pt]
 
 from PyQt5.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QPointF, QLineF
+
+LAYER_COLOR_ROLE = Qt.UserRole + 100
 
 class PathPreviewItem(QGraphicsItem):
     """显示切割路径预览的项"""
@@ -170,8 +173,13 @@ class ScaleHandle(QGraphicsRectItem):
         self._start_pos = None
         self._initial_rect = rect
         self._initial_states = []
+        self._initial_item_pos = {}
 
     def _update_cursor(self):
+        if getattr(self.canvas, 'disable_stretch', False):
+            self.setCursor(Qt.SizeAllCursor)
+            return
+
         cursors = {
             'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
             'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
@@ -184,8 +192,13 @@ class ScaleHandle(QGraphicsRectItem):
         if event.button() == Qt.LeftButton:
             self._dragging = True
             self._start_pos = event.scenePos()
+            self._is_move_mode = getattr(self.canvas, 'disable_stretch', False)
+            
             self._initial_states = []
+            self._initial_item_pos = {}
+            
             for item in self.canvas.get_selected_items():
+                self._initial_item_pos[id(item)] = item.pos()
                 if isinstance(item, EditablePathItem):
                     self._initial_states.append(('path', item, item.points()))
                 else:
@@ -197,57 +210,55 @@ class ScaleHandle(QGraphicsRectItem):
     def mouseMoveEvent(self, event):
         if self._dragging:
             cur_pos = event.scenePos()
-            
-            # 计算新的包围盒
-            rect = QRectF(self._initial_rect)
             dx = cur_pos.x() - self._start_pos.x()
             dy = cur_pos.y() - self._start_pos.y()
-
-            # 按住Shift进行等比缩放
-            keep_aspect = (event.modifiers() & Qt.ShiftModifier)
-
-            if self.pos_type == 'tl':
-                if keep_aspect:
-                    # 简单处理：取dx和dy中较大的变化，或者投影到对角线
-                    pass # 暂略，先实现自由缩放
-                rect.setTopLeft(rect.topLeft() + QPointF(dx, dy))
-            elif self.pos_type == 'tr':
-                rect.setTopRight(rect.topRight() + QPointF(dx, dy))
-            elif self.pos_type == 'bl':
-                rect.setBottomLeft(rect.bottomLeft() + QPointF(dx, dy))
-            elif self.pos_type == 'br':
-                rect.setBottomRight(rect.bottomRight() + QPointF(dx, dy))
-            elif self.pos_type == 'tc':
-                rect.setTop(rect.top() + dy)
-            elif self.pos_type == 'bc':
-                rect.setBottom(rect.bottom() + dy)
-            elif self.pos_type == 'ml':
-                rect.setLeft(rect.left() + dx)
-            elif self.pos_type == 'mr':
-                rect.setRight(rect.right() + dx)
-
-            # 避免翻转或零尺寸
-            if rect.width() < 1.0: rect.setWidth(1.0)
-            if rect.height() < 1.0: rect.setHeight(1.0)
-
-            # 计算缩放比例
-            sx = rect.width() / self._initial_rect.width() if self._initial_rect.width() > 0 else 1.0
-            sy = rect.height() / self._initial_rect.height() if self._initial_rect.height() > 0 else 1.0
-
-            # 如果是等比缩放，修正sx, sy
-            if keep_aspect:
-                if self.pos_type in ['tl', 'tr', 'bl', 'br']:
-                    s = max(abs(sx), abs(sy))
-                    sx = s if sx > 0 else -s
-                    sy = s if sy > 0 else -s
-                # 对于边上的点，通常Shift不强制等比，或者只影响另一边？
-                # 常见逻辑：角点按Shift等比，边点按Shift可能无效或对称缩放。这里只处理角点。
-
-            # 应用缩放
-            self._apply_scale(sx, sy, rect)
             
-            # 更新所有手柄位置和包围盒显示
-            self.canvas.update_scale_handles(rect)
+            if getattr(self, '_is_move_mode', False):
+                # 移动模式
+                for item in self.canvas.get_selected_items():
+                    if id(item) in self._initial_item_pos:
+                        item.setPos(self._initial_item_pos[id(item)] + QPointF(dx, dy))
+                
+                # 更新手柄位置
+                new_rect = self._initial_rect.translated(dx, dy)
+                self.canvas.update_scale_handles(new_rect)
+            else:
+                # 缩放模式
+                rect = QRectF(self._initial_rect)
+
+                # 按住Shift进行等比缩放
+                keep_aspect = (event.modifiers() & Qt.ShiftModifier)
+
+                if self.pos_type == 'tl':
+                    rect.setTopLeft(rect.topLeft() + QPointF(dx, dy))
+                elif self.pos_type == 'tr':
+                    rect.setTopRight(rect.topRight() + QPointF(dx, dy))
+                elif self.pos_type == 'bl':
+                    rect.setBottomLeft(rect.bottomLeft() + QPointF(dx, dy))
+                elif self.pos_type == 'br':
+                    rect.setBottomRight(rect.bottomRight() + QPointF(dx, dy))
+                elif self.pos_type == 'tc':
+                    rect.setTop(rect.top() + dy)
+                elif self.pos_type == 'bc':
+                    rect.setBottom(rect.bottom() + dy)
+                elif self.pos_type == 'ml':
+                    rect.setLeft(rect.left() + dx)
+                elif self.pos_type == 'mr':
+                    rect.setRight(rect.right() + dx)
+
+                # 避免翻转或零尺寸
+                if rect.width() < 1.0: rect.setWidth(1.0)
+                if rect.height() < 1.0: rect.setHeight(1.0)
+
+                # 计算缩放比例
+                sx = rect.width() / self._initial_rect.width() if self._initial_rect.width() > 0 else 1.0
+                sy = rect.height() / self._initial_rect.height() if self._initial_rect.height() > 0 else 1.0
+
+                # 应用缩放
+                self._apply_scale(sx, sy, rect)
+                
+                # 更新所有手柄位置和包围盒显示
+                self.canvas.update_scale_handles(rect)
 
         else:
             super().mouseMoveEvent(event)
@@ -255,28 +266,36 @@ class ScaleHandle(QGraphicsRectItem):
     def mouseReleaseEvent(self, event):
         if self._dragging:
             self._dragging = False
-            # 记录到撤销栈
-            # 构建最终状态
-            final_states = []
-            for item in self.canvas.get_selected_items():
-                if isinstance(item, EditablePathItem):
-                    final_states.append(('path', item, self._initial_states[0][2], item.points())) # 注意这里索引不对，需匹配
-                    # 修正：需要根据item找到对应的initial state
-                else:
-                    final_states.append(('transform', item, item.transform(), item.transform())) # 同样需修正
             
-            # 重新构建匹配的 states list
-            states = []
-            for i, (typ, item, old_state) in enumerate(self._initial_states):
-                if typ == 'path':
-                    states.append(('path', item, old_state, item.points()))
-                else:
-                    states.append(('transform', item, old_state, item.transform()))
-            
-            if states:
-                from edit.commands import ScaleCommand
-                cmd = ScaleCommand(self.canvas, states)
-                self.canvas.edit_manager.push_undo(cmd)
+            if getattr(self, '_is_move_mode', False):
+                # 移动模式提交
+                dx = event.scenePos().x() - self._start_pos.x()
+                dy = event.scenePos().y() - self._start_pos.y()
+                
+                if abs(dx) > 1e-4 or abs(dy) > 1e-4:
+                    from edit.commands import MoveItemsCommand
+                    items = self.canvas.get_selected_items()
+                    # 还原位置，由Command执行
+                    for item in items:
+                        if id(item) in self._initial_item_pos:
+                            item.setPos(self._initial_item_pos[id(item)])
+                            
+                    cmd = MoveItemsCommand(self.canvas, items, dx, dy)
+                    self.canvas.edit_manager.push_undo(cmd)
+            else:
+                # 缩放模式提交
+                # 记录到撤销栈
+                states = []
+                for i, (typ, item, old_state) in enumerate(self._initial_states):
+                    if typ == 'path':
+                        states.append(('path', item, old_state, item.points()))
+                    else:
+                        states.append(('transform', item, old_state, item.transform()))
+                
+                if states:
+                    from edit.commands import ScaleCommand
+                    cmd = ScaleCommand(self.canvas, states)
+                    self.canvas.edit_manager.push_undo(cmd)
 
         super().mouseReleaseEvent(event)
 
@@ -378,7 +397,7 @@ class RotateHandle(QGraphicsEllipseItem):
                         br = it.sceneBoundingRect()
                         cx = br.center().x(); cy = br.center().y()
                     tracking.append(('path', it, old, (cx, cy)))
-                elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem)):
+                elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
                     oldt = it.transform()
                     try:
                         br = it.sceneBoundingRect()
@@ -644,6 +663,7 @@ class RotateHandle(QGraphicsEllipseItem):
 class GridCanvas(QGraphicsView):
     headMoved = pyqtSignal(float, float)
     view_changed = pyqtSignal(float, QPoint)  # 缩放比例、偏移量信号（用于标尺联动）
+    measurementChanged = pyqtSignal(str) # 测量结果信号
 
     class Tool:
         SELECT = 0
@@ -667,6 +687,7 @@ class GridCanvas(QGraphicsView):
         DRAW_CIRCLE = 18  # 新增圆形绘制工具
         ROTATE = 19  # 旋转工具（鼠标拖拽或角度输入）
         BOX_ZOOM = 20  # 框选缩放工具
+        MEASURE = 21   # 测量工具
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -687,7 +708,8 @@ class GridCanvas(QGraphicsView):
         self._bitmap_count = 0
         self._work_w = 600.0
         self._work_h = 400.0
-        self._draw_workarea()
+        self._measuring_start = None  # QPointF
+        self._measuring_current = None # QPointF
         self._tool = self.Tool.SELECT
         # 旋转交互状态
         self._rotate_tracking = None  # list of tuples (typ, item, old_state, pivot)
@@ -695,6 +717,9 @@ class GridCanvas(QGraphicsView):
         self._drawing_pts: Path = []
         self._drawing_tmp: Optional[QGraphicsPathItem] = None
         self._current_color = QColor(0, 0, 0)  # 默认黑色
+        self._origin_location = 1  # 1:TL, 2:TR, 3:BL, 4:BR
+        self._laser_pos_anchor = 1 # 1-9
+        self._laser_pos_relative = False # Default unchecked based on usual software, but user asked to implement check box.
 
         # 定位点相关属性 - 使用新的管理器
         from my_io.fiducial.fiducial_manager import FiducialManager
@@ -702,12 +727,47 @@ class GridCanvas(QGraphicsView):
 
         # -------------------------- 新增：初始化编辑管理器 --------------------------
         self.edit_manager = EditManager(self)
+        # -------------------------- Interface Settings --------------------------
+        self.grid_enabled = True
+        self.grid_spacing = 50.0
+        self.color_background = QColor("white")
+        self.color_workspace = QColor("white") # Default area color usually white? User said Black in screenshot?
+        # Wait, if Workspace is Black, you can't see black lines. 
+        # But let's follow the screenshot default if provided.
+        # I'll default to decent values and let settings override.
+        self.color_grid = QColor("gray")
+        
+        # Connect to settings later or apply default
+        # ------------------------------------------------------------------------
+
         # 连接场景的选中状态变化信号 → 通知EditManager更新可用性
         self.scene.selectionChanged.connect(self._on_selection_changed)
         # 旋转把手（场景中的 QGraphicsItem），根据选中项显示/隐藏
         self._rotate_handle = None
 
-    def align_origin_top_left(self):
+        # 测量工具相关
+        self._measuring_start = None  # QPointF
+        self._measuring_current = None # QPointF
+
+        # "Background" -> The entire drawing area (View Background).
+        self.color_background = QColor("white") 
+        # "Workspace" -> The canvas boundary (Rectangle Border).
+        self.color_workspace = QColor("black") 
+        # "Grid" -> Grid lines.
+        self.color_grid = QColor("gray")
+        
+        self.grid_spacing = 20.0 # Default based on request
+        
+        # New Settings Defaults
+        self.nudge_dist = 1.0
+        self.big_nudge_scale = 10.0
+        self.rotate_angle = 1.0
+        self.disable_stretch = False
+        self.paste_settings = {"offset_enable": True, "x": 0.0, "y": 0.0}
+        self.last_mouse_scene_pos = QPointF(0, 0)
+        
+        self._draw_workarea()
+        self._tool = self.Tool.SELECT
         """将场景坐标 (0,0) 对齐到视窗左上角（使工作区角为 (0,0)）。"""
         try:
             # 获取当前缩放
@@ -730,12 +790,107 @@ class GridCanvas(QGraphicsView):
         except Exception:
             pass
 
+    def set_laser_head_config(self, anchor: int, relative: bool):
+        """设置激光头位置配置"""
+        self._laser_pos_anchor = anchor
+        self._laser_pos_relative = relative
+
+    def get_laser_head_config(self):
+        return getattr(self, '_laser_pos_anchor', 1), getattr(self, '_laser_pos_relative', False)
+
+    def set_pen_offset_config(self, pen_off, l2_off, proc_off):
+        """
+        设置偏移参数
+        pen_off: (x, y)
+        l2_off: (enabled, x, y)
+        proc_off: (enabled, x, y)
+        """
+        self._pen_offset = pen_off
+        self._laser2_offset = l2_off
+        self._process_offset = proc_off
+
+    def get_pen_offset_config(self):
+        return (
+            getattr(self, '_pen_offset', (0.0, 0.0)),
+            getattr(self, '_laser2_offset', (False, 0.0, 0.0)),
+            getattr(self, '_process_offset', (False, 0.0, 0.0))
+        )
+
+    def get_laser_start_point(self) -> QPointF:
+        """获取激光头起始位置（场景坐标）"""
+        anchor = getattr(self, '_laser_pos_anchor', 1)
+        relative = getattr(self, '_laser_pos_relative', False)
+        
+        rect = QRectF()
+        if relative:
+            # 相对页面 (Work Area)
+            rect = QRectF(0, 0, self._work_w, self._work_h)
+        else:
+            # 相对数据 (Bounds of all items)
+            # 获取所有用户数据项的包围盒
+            items = self.scene.items()
+            valid_items = []
+            
+            from ui.graphics_items import EditablePathItem, EditableEllipseItem
+            from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
+            
+            for item in items:
+                if item.isVisible() and item.parentItem() is None and item.zValue() < 9000:
+                    if isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                         valid_items.append(item)
+            
+            if not valid_items:
+                rect = QRectF(0, 0, 0, 0)
+            else:
+                br = QRectF()
+                first = True
+                for item in valid_items:
+                    r = item.sceneBoundingRect()
+                    if first:
+                        br = r
+                        first = False
+                    else:
+                        br = br.united(r)
+                rect = br
+
+        # Calculate point based on anchor (1-9)
+        # 1 2 3
+        # 4 5 6
+        # 7 8 9
+        x, y = 0.0, 0.0
+        if anchor in [1, 4, 7]: # Left
+            x = rect.left()
+        elif anchor in [2, 5, 8]: # Center
+            x = rect.center().x()
+        elif anchor in [3, 6, 9]: # Right
+            x = rect.right()
+            
+        if anchor in [1, 2, 3]: # Top
+            y = rect.top()
+        elif anchor in [4, 5, 6]: # Middle
+            y = rect.center().y()
+        elif anchor in [7, 8, 9]: # Bottom
+            y = rect.bottom()
+            
+        return QPointF(x, y)
+
     # -------------------------- 新增：选中状态变化处理 --------------------------
     def _on_selection_changed(self):
         """当画布选中项变化时，通知EditManager"""
+        # logging.info(f"Selection changed. Count: {len(self.scene.selectedItems())}")
         has_selection = len(self.get_selected_items()) > 0
         self.edit_manager.set_has_selection(has_selection)
         
+        # 如果当前是节点编辑工具，根据选中状态切换节点显示
+        if self._tool == self.Tool.NODE_EDIT:
+            sel = set(self.scene.selectedItems())
+            # 遍历所有可编辑项，选中则启用节点编辑，未选中则禁用
+            for it in self.all_paths():
+                should_enable = it in sel
+                # 减少不必要的调用
+                if getattr(it, '_node_edit_enabled', False) != should_enable:
+                    it.enable_node_edit(should_enable)
+
         # 清除缩放手柄（如果存在）
         self.clear_scale_handles()
 
@@ -775,6 +930,172 @@ class GridCanvas(QGraphicsView):
         except Exception:
             pass
 
+    def apply_interface_settings(self, settings):
+        self.grid_enabled = settings.get("grid_enabled", True)
+        self.grid_spacing = float(settings.get("grid_spacing", 20.0))
+        
+        if "color_background" in settings:
+            bg_color = settings["color_background"]
+            self.color_background = bg_color
+            self.setBackgroundBrush(QBrush(bg_color))
+            
+        if "color_workspace" in settings:
+            self.color_workspace = settings["color_workspace"]
+        
+        if "color_grid" in settings:
+            self.color_grid = settings["color_grid"]
+            
+        # New Settings
+        self.nudge_dist = float(settings.get("nudge_distance", 1.0))
+        self.big_nudge_scale = float(settings.get("big_nudge_scale", 10.0))
+        self.rotate_angle = float(settings.get("rotate_angle", 1.0))
+        self.disable_stretch = settings.get("disable_stretch", False)
+        
+        self.paste_settings = {
+             "offset_enable": settings.get("paste_offset_enable", False),
+             "x": float(settings.get("paste_x", 0.0)),
+             "y": float(settings.get("paste_y", 0.0))
+        }
+        # Log settings are not used by Canvas but stored to return them back
+        self.log_settings = {
+            "enabled": settings.get("log_enabled", False),
+            "operator": settings.get("log_operator", "Normal operator"),
+            "area": settings.get("log_area", "A"),
+            "path": settings.get("log_path", r"C:\RDWorksV8\Log\\")
+        }
+        
+        self._draw_workarea()
+
+    def get_interface_settings(self):
+        log = getattr(self, "log_settings", {})
+        return {
+             "grid_enabled": self.grid_enabled,
+             "grid_spacing": self.grid_spacing,
+             "color_background": self.color_background,
+             "color_workspace": self.color_workspace,
+             "color_grid": self.color_grid,
+             "nudge_distance": self.nudge_dist,
+             "big_nudge_scale": self.big_nudge_scale,
+             "rotate_angle": self.rotate_angle,
+             "disable_stretch": self.disable_stretch,
+             "paste_offset_enable": self.paste_settings["offset_enable"],
+             "paste_x": self.paste_settings["x"],
+             "paste_y": self.paste_settings["y"],
+             "log_enabled": log.get("enabled", False),
+             "log_operator": log.get("operator", "Normal operator"),
+             "log_area": log.get("area", "A"),
+             "log_path": log.get("path", r"C:\RDWorksV8\Log\\")
+        }
+
+    def keyPressEvent(self, event):
+        # Handle Nudge
+        if self.scene.selectedItems() and not event.isAutoRepeat():
+             step = self.nudge_dist
+             if event.modifiers() & Qt.ShiftModifier:
+                 step *= self.big_nudge_scale
+             
+             dx, dy = 0.0, 0.0
+             key = event.key()
+             if key == Qt.Key_Left:
+                 dx = -step
+             elif key == Qt.Key_Right:
+                 dx = step
+             elif key == Qt.Key_Up:
+                 dy = -step
+             elif key == Qt.Key_Down:
+                 dy = step
+             
+             if dx != 0 or dy != 0:
+                 from edit.commands import MoveItemsCommand
+                 items_states = []
+                 for item in self.get_selected_items():
+                     items_states.append(('pos', item, item.pos(), item.pos() + QPointF(dx, dy)))
+                 
+                 if items_states:
+                     cmd = MoveItemsCommand(self, items_states)
+                     cmd.redo()
+                     self.edit_manager.push_undo(cmd)
+                 event.accept()
+                 return
+
+        # Handle Rotate (Comma/Period for CCW/CW)
+        if self.scene.selectedItems():
+             angle = 0.0
+             if event.key() == Qt.Key_Comma: # <
+                 angle = -self.rotate_angle
+             elif event.key() == Qt.Key_Period: # >
+                 angle = self.rotate_angle
+             
+             if angle != 0:
+                 from edit.commands import RotateCommand
+                 # Calculate global center
+                 sel = self.get_selected_items()
+                 if not sel: 
+                     super().keyPressEvent(event)
+                     return
+                 
+                 min_x, min_y = float('inf'), float('inf')
+                 max_x, max_y = float('-inf'), float('-inf')
+                 valid_bounds = False
+                 for it in sel:
+                     try:
+                        br = it.sceneBoundingRect()
+                        min_x = min(min_x, br.left())
+                        min_y = min(min_y, br.top())
+                        max_x = max(max_x, br.right())
+                        max_y = max(max_y, br.bottom())
+                        valid_bounds = True
+                     except: pass
+                     
+                 if not valid_bounds:
+                     super().keyPressEvent(event)
+                     return
+                 
+                 cx = (min_x + max_x) / 2
+                 cy = (min_y + max_y) / 2
+                 
+                 items_states = []
+                 cos_a = math.cos(math.radians(angle))
+                 sin_a = math.sin(math.radians(angle))
+                 
+                 for it in sel:
+                     if isinstance(it, EditablePathItem):
+                         old_pts = it.points()
+                         new_pts = []
+                         for (x, y) in old_pts:
+                             # Rotate around (cx, cy)
+                             dx_ = x - cx
+                             dy_ = y - cy
+                             nx = cx + dx_ * cos_a - dy_ * sin_a
+                             ny = cy + dx_ * sin_a + dy_ * cos_a
+                             new_pts.append((nx, ny))
+                         items_states.append(('path', it, old_pts, new_pts))
+                     else:
+                         # Handle Transform items
+                         old_t = it.transform()
+                         t = QTransform()
+                         t.translate(cx, cy)
+                         t.rotate(angle)
+                         t.translate(-cx, -cy)
+                         # P_new = P_local * (Old * Rot) = (P_local * Old) * Rot = P_global * Rot
+                         # Correct order for Qt Transform multiplication (Post-multiplication?)
+                         # Qt docs: A * B means apply A then B? 
+                         # Actually `new_t = old_t * t` applies old_t (Local->Global) then t (Global Rotate). Correct.
+                         items_states.append(('transform', it, old_t, old_t * t))
+                 
+                 if items_states:
+                     cmd = RotateCommand(self, items_states)
+                     cmd.redo()
+                     self.edit_manager.push_undo(cmd)
+                 event.accept()
+                 return
+        
+        super().keyPressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.last_mouse_scene_pos = self.mapToScene(event.pos())
+        super().mouseMoveEvent(event)
+
     # -------------------------- 新增：供EditManager调用的接口 --------------------------
     def get_selected_items(self) -> List[QGraphicsItem]:
         """获取所有选中的图形项（排除定位点和工作区网格）"""
@@ -790,7 +1111,7 @@ class GridCanvas(QGraphicsView):
         return [
             item for item in self.scene.selectedItems()
             if item not in exclude_items  # 不处理网格和定位点
-               and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem))  # 处理路径、图片和文字
+               and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem))  # 处理路径、图片和文字
         ]
 
     def select_all_items(self):
@@ -805,7 +1126,7 @@ class GridCanvas(QGraphicsView):
 
         for item in self.scene.items():
             # 选中路径、图片和文字项
-            if item not in exclude_items and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+            if item not in exclude_items and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
                 item.setSelected(True)
 
     # --- 定位点相关方法（更新为使用命令模式）---
@@ -869,27 +1190,95 @@ class GridCanvas(QGraphicsView):
         offset = QPoint(int(-scene_top_left.x() * zoom), int(-scene_top_left.y() * zoom))
         self.view_changed.emit(zoom, offset)
 
+    def _get_black_arrow_cursor(self):
+        """生成一个黑色箭头光标"""
+        if hasattr(self, '_cached_black_arrow_cursor'):
+            return self._cached_black_arrow_cursor
+            
+        # 绘制一个黑色箭头
+        from PyQt5.QtGui import QPixmap, QPainter, QPolygon, QPen, QBrush, QColor, QCursor
+        from PyQt5.QtCore import QPoint
+        
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(QColor(0, 0, 0, 0)) # 透明背景
+        
+        painter = QPainter(pixmap)
+        
+        # 箭头多边形 (样式模仿标准光标但填充黑色)
+        points = QPolygon([
+            QPoint(0, 0),    # 顶点
+            QPoint(0, 20),   
+            QPoint(5, 15),
+            QPoint(9, 24),   # 尾巴左
+            QPoint(12, 23),  # 尾巴末端
+            QPoint(8, 14),   # 尾巴右
+            QPoint(15, 14)
+        ])
+        
+        # 绘制黑色填充，白色描边（以便在黑色背景也能看见）
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(1)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(0, 0, 0)))
+        painter.drawPolygon(points)
+        
+        painter.end()
+        
+        # 热点在顶端 (0, 0)
+        self._cached_black_arrow_cursor = QCursor(pixmap, 0, 0)
+        return self._cached_black_arrow_cursor
+
     # --- 工具设置方法 ---
     def set_tool(self, t: int):
         """设置当前工具"""
         old_tool = self._tool
         self._tool = t
 
+        if old_tool == self.Tool.MEASURE:
+            self._measuring_start = None
+            self._measuring_current = None
+            # self.measurementChanged.emit("")  # 保持上次测量结果显示
+            self.scene.update()
+
         # 退出节点编辑模式
         if old_tool == self.Tool.NODE_EDIT:
             for it in self.all_paths():
                 it.enable_node_edit(False)
+            # 恢复默认光标
+            self.viewport().unsetCursor()
+        
+        # 退出删除模式
+        if old_tool == self.Tool.DELETE:
+            self.viewport().unsetCursor()
 
         # 进入节点编辑模式
         if t == self.Tool.NODE_EDIT:
             for it in self.selected_paths():
                 it.enable_node_edit(True)
+            # 设置黑色光标
+            self.viewport().setCursor(self._get_black_arrow_cursor())
 
-        # 设置拖动模式
+        # 设置拖动模式和交互模式
         if t == self.Tool.PAN:
             self.setDragMode(QGraphicsView.ScrollHandDrag)
-        else:
+            self.setInteractive(False)  # 禁用与图形项的交互（解决平移时误选误动图形的问题）
+            
+        elif t in (self.Tool.SELECT, self.Tool.NODE_EDIT):
+            # 选择和节点编辑模式，启用框选和交互
             self.setDragMode(QGraphicsView.RubberBandDrag)
+            self.setInteractive(True)
+            if t != self.Tool.NODE_EDIT:
+                self.viewport().unsetCursor()
+        
+        else:
+            # 其他所有工具（主要是绘图、测量、删除），禁用交互，避免误选误动
+            # 包括: DRAW_..., MEASURE, DELETE, H_MIRROR, V_MIRROR 等
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setInteractive(False)
+            
+            # 统一设置光标为十字，表示正在进行操作
+            self.viewport().setCursor(Qt.CrossCursor)
 
         # 清除临时绘图状态
         self._clear_drawing_state()
@@ -914,23 +1303,218 @@ class GridCanvas(QGraphicsView):
         except Exception:
             pass
 
+    def apply_interface_settings(self, settings):
+        """Apply settings from SystemSettingsDialog"""
+        if not settings: return
+        
+        self.grid_enabled = settings.get("grid_enabled", True)
+        self.grid_spacing = settings.get("grid_spacing", 20.0)
+        self.grid_line_width = settings.get("grid_line_width", 1)
+        
+        # Keyboard Interactions
+        self.nudge_dist = settings.get("nudge_distance", 1.0)
+        self.big_nudge_scale = settings.get("big_nudge_scale", 10.0)
+        self.rotate_angle = settings.get("rotate_angle", 1.0)
+        
+        # UI Behavior
+        self.disable_stretch = settings.get("disable_stretch", False)
+        
+        # Paste Settings
+        self.paste_settings = {
+            "offset_enable": settings.get("paste_offset_enable", True),
+            "x": settings.get("paste_x", 0.0),
+            "y": settings.get("paste_y", 0.0)
+        }
+        
+        # Log Settings
+        self.log_settings = {
+            "enabled": settings.get("log_enabled", False),
+            "operator": settings.get("log_operator", ""),
+            "area": settings.get("log_area", ""),
+            "path": settings.get("log_path", "")
+        }
+        
+        # User Definition Mapping:
+        # "Background" -> The entire drawing area base color.
+        # "Workspace" -> The canvas boundary (Rectangle Border).
+        # "Grid" -> Grid lines.
+
+        # 1. Background (View Background)
+        bg = settings.get("color_background")
+        if isinstance(bg, QColor) and bg.isValid():
+            self.color_background = bg
+        
+        # 2. Workspace (Border Color)
+        wk = settings.get("color_workspace")
+        if isinstance(wk, QColor) and wk.isValid():
+            self.color_workspace = wk
+            
+        # 3. Grid
+        gd = settings.get("color_grid")
+        if isinstance(gd, QColor) and gd.isValid():
+            self.color_grid = gd
+        
+        self._draw_workarea()
+
+    def get_interface_settings(self):
+        """Get current settings"""
+        return {
+            "grid_enabled": self.grid_enabled,
+            "grid_spacing": self.grid_spacing,
+            "grid_line_width": getattr(self, "grid_line_width", 1),
+            "nudge_distance": getattr(self, "nudge_dist", 1.0),
+            "big_nudge_scale": getattr(self, "big_nudge_scale", 10.0),
+            "rotate_angle": getattr(self, "rotate_angle", 1.0),
+            "disable_stretch": getattr(self, "disable_stretch", False),
+            "paste_offset_enable": getattr(self, "paste_settings", {}).get("offset_enable", True),
+            "paste_x": getattr(self, "paste_settings", {}).get("x", 0.0),
+            "paste_y": getattr(self, "paste_settings", {}).get("y", 0.0),
+            "log_enabled": getattr(self, "log_settings", {}).get("enabled", True),
+            "log_operator": getattr(self, "log_settings", {}).get("operator", "Normal operator"),
+            "log_area": getattr(self, "log_settings", {}).get("area", "A"),
+            "log_path": getattr(self, "log_settings", {}).get("path", r"C:\RDWorksV8\Log\\"),
+            "color_background": getattr(self, 'color_background', QColor("white")),
+            "color_workspace": getattr(self, 'color_workspace', QColor("black")),
+            "color_grid": getattr(self, 'color_grid', QColor("gray"))
+        }
+
     def _draw_workarea(self):
-        pen = QPen(QColor(200, 200, 200))
+        # Remove old work item if exists (and grid lines)
+        if hasattr(self, '_workarea_items'):
+            for item in self._workarea_items:
+                try:
+                    self.scene.removeItem(item)
+                except: pass
+        self._workarea_items = []
+
+        # Defaults
+        if not hasattr(self, 'color_background'): self.color_background = QColor("white")
+        if not hasattr(self, 'color_workspace'): self.color_workspace = QColor("black") 
+        if not hasattr(self, 'color_grid'): self.color_grid = QColor("gray") # Default Grid Color
+        
+        # Apply View Background
+        self.setBackgroundBrush(QBrush(self.color_background))
+
+        # Workspace Rect (The Boundary)
+        # User defined "Workspace" as the boundary color.
+        pen = QPen(self.color_workspace) 
         pen.setCosmetic(True)
+        # Fill with White color explicitly to match the "Paper" metaphor on top of Background
+        brush = QBrush(QColor("white"))
+        
         rect = QRectF(0, 0, self._work_w, self._work_h)
-        self._work_item = self.scene.addRect(rect, pen)
-        step = 10.0
-        thin = QPen(QColor(220, 220, 220))
-        thin.setCosmetic(True)
-        thick = QPen(QColor(200, 200, 200))
-        thick.setCosmetic(True)
-        thick.setWidth(0)
-        for x in range(0, int(self._work_w) + 1, int(step)):
-            pen = thick if x % 50 == 0 else thin
-            self.scene.addLine(x, 0, x, self._work_h, pen)
-        for y in range(0, int(self._work_h) + 1, int(step)):
-            pen = thick if y % 50 == 0 else thin
-            self.scene.addLine(0, y, self._work_w, y, pen)
+        self._work_item = self.scene.addRect(rect, pen, brush)
+        self._work_item.setZValue(-100) # Put at bottom
+        self._workarea_items.append(self._work_item)
+        
+        if self.grid_enabled:
+            step = float(self.grid_spacing)
+            if step <= 0: step = 20.0
+            
+            thin = QPen(self.color_grid)
+            thin.setCosmetic(True)
+            thin.setWidthF(0.5) # Thin lines
+            
+            # X lines
+            for x in range(0, int(self._work_w) + 1, int(step)):
+                line = self.scene.addLine(x, 0, x, self._work_h, thin)
+                line.setZValue(-99)
+                self._workarea_items.append(line)
+                
+            # Y lines
+            for y in range(0, int(self._work_h) + 1, int(step)):
+                line = self.scene.addLine(0, y, self._work_w, y, thin)
+                line.setZValue(-99)
+                self._workarea_items.append(line)
+
+        # --- Direction Indicator (Origin) ---
+        # Determine origin pos and direction
+        w, h = self._work_w, self._work_h
+        loc = getattr(self, '_origin_location', 1)
+        
+        ox, oy = 0.0, 0.0
+        dx_x, dx_y = 1.0, 0.0 # X Axis direction vector
+        dy_x, dy_y = 0.0, 1.0 # Y Axis direction vector
+        
+        if loc == 2: # TR
+            ox = w
+            dx_x = -1.0
+        elif loc == 3: # BL
+            oy = h
+            dy_y = -1.0
+        elif loc == 4: # BR
+            ox = w
+            oy = h
+            dx_x = -1.0
+            dy_y = -1.0
+            
+        # Red Square at origin
+        marker_size = 6.0
+        marker = self.scene.addRect(ox - marker_size/2, oy - marker_size/2, marker_size, marker_size)
+        marker.setPen(QPen(Qt.NoPen))
+        marker.setBrush(QBrush(QColor("red")))
+        marker.setZValue(100)
+        self._workarea_items.append(marker)
+        
+        # Blue Arrows
+        arrow_len = 30.0
+        arrow_head_size = 5.0
+        arrow_pen = QPen(QColor("blue"))
+        arrow_pen.setWidth(2)
+        arrow_pen.setCosmetic(True)
+
+        # X-Axis Arrow
+        end_x = ox + dx_x * arrow_len
+        end_y = oy + dx_y * arrow_len
+        line_x = self.scene.addLine(ox, oy, end_x, end_y, arrow_pen)
+        line_x.setZValue(100)
+        self._workarea_items.append(line_x)
+        
+        # X-Axis Head
+        # Rotate logic for arrow head
+        angle_x = math.atan2(dx_y, dx_x)
+        p1_x = QPointF(end_x, end_y)
+        # Using rotation matrix concept roughly
+        # p2 = p1 - (head_size) rotated by +ang +/- delta
+        # Simplified: Just rotate local points
+        def make_head(tip, angle):
+             p_back = tip - QPointF(math.cos(angle)*arrow_head_size, math.sin(angle)*arrow_head_size)
+             p_left = p_back + QPointF(math.cos(angle+math.pi/2)*arrow_head_size/2, math.sin(angle+math.pi/2)*arrow_head_size/2)
+             p_right = p_back + QPointF(math.cos(angle-math.pi/2)*arrow_head_size/2, math.sin(angle-math.pi/2)*arrow_head_size/2)
+             return QPolygonF([tip, p_right, p_left])
+
+        poly_x = make_head(p1_x, angle_x)
+        item_poly_x = self.scene.addPolygon(poly_x, QPen(Qt.NoPen), QBrush(QColor("blue")))
+        item_poly_x.setZValue(100)
+        self._workarea_items.append(item_poly_x)
+
+        # Y-Axis Arrow
+        end_yx = ox + dy_x * arrow_len
+        end_yy = oy + dy_y * arrow_len
+        line_y = self.scene.addLine(ox, oy, end_yx, end_yy, arrow_pen)
+        line_y.setZValue(100)
+        self._workarea_items.append(line_y)
+
+        # Y-Axis Head
+        angle_y = math.atan2(dy_y, dy_x)
+        p1_y = QPointF(end_yx, end_yy)
+        poly_y = make_head(p1_y, angle_y)
+        item_poly_y = self.scene.addPolygon(poly_y, QPen(Qt.NoPen), QBrush(QColor("blue")))
+        item_poly_y.setZValue(100)
+        self._workarea_items.append(item_poly_y)
+
+    def set_work_size(self, w: float, h: float):
+        """设置工作区尺寸"""
+        self._work_w = float(w)
+        self._work_h = float(h)
+        self._draw_workarea()
+        self.scene.update()
+
+    def set_origin_location(self, loc: int):
+        """设置原点位置 1:TL, 2:TR, 3:BL, 4:BR"""
+        self._origin_location = int(loc)
+        self._draw_workarea()
+        self.scene.update()
 
     # --- 绘图方法 ---
     def add_polyline(self, points, color=None):
@@ -1015,6 +1599,31 @@ class GridCanvas(QGraphicsView):
         self.edit_manager.push_undo(cmd)
         return item
 
+    def add_advanced_text(self, x, y, data):
+        try:
+            from ui.graphics_items import TextGraphicsItem
+            text = data['text']
+            settings = data
+            item = TextGraphicsItem(text, settings)
+            item.setPos(x, y)
+            
+            color = self._current_color
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            pen.setWidthF(1.0)
+            item.setPen(pen)
+            
+            self.scene.addItem(item)
+            
+            cmd = AddItemCommand(self, item)
+            self.edit_manager.push_undo(cmd)
+            return item
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self.parent(), "Error", f"Failed to create text: {str(e)}")
+            return None
+
     def add_grid(self, x: float, y: float, cols: int, rows: int, col_spacing: float, row_spacing: float, color=None):
         """添加网格"""
         if color is None:
@@ -1032,7 +1641,7 @@ class GridCanvas(QGraphicsView):
         return items
 
     # -------------------------- 修改：添加图片方法（支持选中 + 命令模式） --------------------------
-    def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0, width_mm: float = None, height_mm: float = None):
+    def add_image(self, qpixmap: QPixmap, x: float = 0.0, y: float = 0.0, width_mm: float = None, height_mm: float = None, layer_color: QColor = None):
         # ========== 1. 计算图片尺寸和缩放比例 ==========
         # 获取工作区域尺寸
         work_area_width = self._work_w
@@ -1123,6 +1732,9 @@ class GridCanvas(QGraphicsView):
         item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
         item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
 
+        if layer_color:
+            item.setData(LAYER_COLOR_ROLE, layer_color)
+
         # 应用缩放转换（像素到毫米）
         s = 25.4 / 96.0  # 96dpi → 毫米的缩放系数
         # 移除 Y 轴翻转，使用正比例
@@ -1193,10 +1805,11 @@ class GridCanvas(QGraphicsView):
         return item
 
     def all_paths(self) -> List[EditablePathItem]:
-        return [it for it in self.scene.items() if isinstance(it, EditablePathItem)]
+        # Return all editable items (Paths and Ellipses)
+        return [it for it in self.scene.items() if hasattr(it, 'enable_node_edit')]
 
     def selected_paths(self) -> List[EditablePathItem]:
-        return [it for it in self.scene.selectedItems() if isinstance(it, EditablePathItem)]
+        return [it for it in self.scene.selectedItems() if hasattr(it, 'enable_node_edit')]
 
     def fit_all(self):
         logger.info("执行fit_all：调整视图至所有内容可见")
@@ -1216,7 +1829,11 @@ class GridCanvas(QGraphicsView):
             
         travels = []
         markers = []
-        last_end_point = None
+        
+        # Start from Laser Head
+        start_pt = self.get_laser_start_point()
+        markers.append(start_pt) # Laser Head Marker
+        last_end_point = start_pt
         
         for item in items:
             # 获取项的路径
@@ -1238,8 +1855,8 @@ class GridCanvas(QGraphicsView):
             start_scene = item.mapToScene(start_local)
             end_scene = item.mapToScene(end_local)
             
-            # 添加起点标记
-            markers.append(start_scene)
+            # 添加起点标记 (User requested to remove green squares on graphics, except laser head)
+            # markers.append(start_scene) 
             
             # 如果有上一个项，添加空移路径
             if last_end_point is not None:
@@ -1535,8 +2152,24 @@ class GridCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, e: QMouseEvent):
         pos = self.mapToScene(e.pos())
-        # 发送信号，注意转换为 float
+        
+        # 始终发送坐标信号，确保坐标信息一直显示
         self.headMoved.emit(float(pos.x()), float(pos.y()))
+        
+        if self._tool == self.Tool.MEASURE:
+            self._measuring_current = pos
+            if self._measuring_start:
+                # 计算并通知测量信息
+                dx = pos.x() - self._measuring_start.x()
+                dy = pos.y() - self._measuring_start.y()
+                # 按照用户习惯，宽高为正值
+                w = abs(dx)
+                h = abs(dy)
+                self.measurementChanged.emit(f"W: {w:.2f} mm  H: {h:.2f} mm")
+                self.scene.update()
+            return
+
+        # 实时更新缩放手柄位置（如果存在且正在拖动选中项）
 
         # 实时更新缩放手柄位置（如果存在且正在拖动选中项）
         if self._tool == self.Tool.SELECT and hasattr(self, '_scale_handles') and self._scale_handles:
@@ -1715,7 +2348,7 @@ class GridCanvas(QGraphicsView):
     def leaveEvent(self, event):
         """鼠标离开画布事件"""
         # 发送特殊值表示离开
-        self.headMoved.emit(float('inf'), float('inf'))
+        # self.headMoved.emit(float('inf'), float('inf')) # 不清除坐标显示
         super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1732,6 +2365,10 @@ class GridCanvas(QGraphicsView):
 
     def show_scale_handles(self):
         """显示缩放手柄"""
+        # Removing disable_stretch check - handles needed for move mode too
+        # if getattr(self, 'disable_stretch', False):
+        #     return
+
         self.clear_scale_handles()
         
         sel = self.get_selected_items()
@@ -1798,6 +2435,24 @@ class GridCanvas(QGraphicsView):
             if handle.pos_type in positions:
                 handle.setPos(positions[handle.pos_type])
 
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        
+        # 绘制测量工具的临时矩形
+        if self._tool == self.Tool.MEASURE and self._measuring_start and self._measuring_current:
+            start = self._measuring_start
+            curr = self._measuring_current
+            
+            r = QRectF(start, curr).normalized()
+            
+            # 绘制半透明蓝色填充和虚线边框
+            pen = QPen(QColor(0, 120, 255))
+            pen.setStyle(Qt.DashLine)
+            pen.setWidth(0) # Cosmetic pen
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(0, 120, 255, 40)))
+            painter.drawRect(r)
+
     def clear_scale_handles(self):
         """清除缩放手柄"""
         if hasattr(self, '_scale_handles'):
@@ -1812,6 +2467,14 @@ class GridCanvas(QGraphicsView):
     # --- 鼠标事件处理 ---
     def mousePressEvent(self, e: QMouseEvent):
         """鼠标按下事件处理"""
+        # Shift多选支持 Hack：如果当前是选择工具或节点编辑工具且按住了Shift，模拟Ctrl的效果以实现多选
+        # (QGraphicsView默认Ctrl+Click为多选Toggle，Shift+Click为RangeSelection或无特殊处理)
+        if (self._tool == self.Tool.SELECT or self._tool == self.Tool.NODE_EDIT) and (e.modifiers() & Qt.ShiftModifier):
+             # 创建一个新的事件，将ShiftModifier替换为ControlModifier
+             new_modifiers = (e.modifiers() & ~Qt.ShiftModifier) | Qt.ControlModifier
+             e = QMouseEvent(e.type(), e.localPos(), e.windowPos(), e.screenPos(),
+                             e.button(), e.buttons(), new_modifiers, e.source())
+
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
 
@@ -1824,7 +2487,7 @@ class GridCanvas(QGraphicsView):
                         from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
                         if isinstance(it, EditablePathItem):
                             self._move_tracking.append(('path', it, it.points()))
-                        elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem)):
+                        elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
                             # 保存 transform 与 pos
                             self._move_tracking.append(('transform', it, it.transform()))
                         else:
@@ -1839,6 +2502,35 @@ class GridCanvas(QGraphicsView):
             self._move_tracking = []
 
         if e.button() == Qt.LeftButton:
+            if self._tool == self.Tool.DELETE:
+                # 获取视图坐标下的 Item（最上层）
+                item = self.itemAt(e.pos())
+                if item:
+                    # 过滤掉不需要删除的辅助对象
+                    is_helper = False
+                    if hasattr(self, '_workarea_items') and (item in self._workarea_items):
+                        is_helper = True
+                    elif isinstance(item, (ScaleHandle, _DragHandle, PathPreviewItem)):
+                        is_helper = True
+                    
+                    if not is_helper:
+                        from edit.commands import DeleteItemsCommand
+                        # 执行删除命令（支持撤销）
+                        cmd = DeleteItemsCommand(self, [item])
+                        # 必须手动执行redo来说明操作已发生（EditManager不会自动执行）
+                        cmd.redo()
+                        self.edit_manager.push_undo(cmd)
+                        # 清除可能记录的移动跟踪，防止释放鼠标时产生移动操作
+                        self._move_tracking = []
+                        # 阻断后续默认处理（如选择变更等）
+                        return
+
+            if self._tool == self.Tool.MEASURE:
+                self._measuring_start = pos
+                self._measuring_current = pos
+                self.scene.update()
+                return
+
             # 旋转工具：开始旋转交互（仅当至少选中一项时）
             if self._tool == self.Tool.ROTATE:
                 try:
@@ -1862,7 +2554,7 @@ class GridCanvas(QGraphicsView):
                                         br = it.sceneBoundingRect()
                                         cx = br.center().x(); cy = br.center().y()
                                     tracking.append(('path', it, old, (cx, cy)))
-                                elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem)):
+                                elif isinstance(it, (QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
                                     oldt = it.transform()
                                     try:
                                         br = it.sceneBoundingRect()
@@ -1976,9 +2668,11 @@ class GridCanvas(QGraphicsView):
                 self.add_point(x, y)
 
             elif self._tool == self.Tool.DRAW_TEXT:
-                text, ok = QInputDialog.getText(self, "输入文字", "请输入文字内容:")
-                if ok and text:
-                    self.add_text(x, y, text)
+                from ui.text_dialog import TextDialog
+                dlg = TextDialog(self, initial_text="")
+                if dlg.exec_() == QDialog.Accepted:
+                    data = dlg.get_data()
+                    self.add_advanced_text(x, y, data)
 
             elif self._tool == self.Tool.DRAW_GRID:
                 # 弹出对话框获取网格参数
@@ -2112,6 +2806,14 @@ class GridCanvas(QGraphicsView):
     def mouseReleaseEvent(self, e: QMouseEvent):
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
+
+        if self._tool == self.Tool.MEASURE:
+            # 测量结束，清除状态
+            self._measuring_start = None
+            self._measuring_current = None
+            # self.measurementChanged.emit("") # 保持显示
+            self.scene.update()
+            return
 
         if e.button() == Qt.LeftButton:
             if self._tool == self.Tool.DRAW_RECT and self._drawing_pts:
@@ -2407,6 +3109,8 @@ class RulerWidget(QWidget):
         self.orientation = orientation
         self.zoom = 1.0
         self.offset = 0
+        self.origin_location = 1 # 1:TL, 2:TR, 3:BL, 4:BR
+        self.canvas_size = 1000.0
 
         if orientation == 'horizontal':
             self.setFixedHeight(30)
@@ -2416,6 +3120,12 @@ class RulerWidget(QWidget):
             self.setMinimumHeight(100)
 
         self.setStyleSheet("background-color: #f0f0f0;")
+
+    def update_settings(self, loc, size):
+        """更新设置（原点位置，画布大小）"""
+        self.origin_location = int(loc)
+        self.canvas_size = float(size)
+        self.update()
 
     def set_zoom(self, zoom):
         """设置缩放比例"""
@@ -2477,7 +3187,11 @@ class RulerWidget(QWidget):
                 # 主刻度线
                 painter.drawLine(int(screen_x), height - 10, int(screen_x), height)
                 # 标签
-                label = str(int(tick_value))
+                label_val = tick_value
+                if self.origin_location in [2, 4]: # TR or BR, X inverted
+                     label_val = self.canvas_size - tick_value
+                
+                label = str(int(label_val))
                 painter.drawText(int(screen_x) + 2, height - 15, label)
                 # 次刻度
                 for i in range(1, 5):
@@ -2532,7 +3246,11 @@ class RulerWidget(QWidget):
                 painter.translate(width - 15, int(screen_y) - 2)
                 painter.rotate(-90)
                 # 显示刻度值
-                label = str(int(tick_value))
+                label_val = tick_value
+                if self.origin_location in [3, 4]: # BL or BR, Y inverted
+                     label_val = self.canvas_size - tick_value
+
+                label = str(int(label_val))
                 painter.drawText(0, 0, label)
                 painter.restore()
                 
@@ -2595,6 +3313,33 @@ class WhiteboardWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.init_ui()
+
+    def set_work_size(self, w: float, h: float):
+        if self.canvas:
+            self.canvas.set_work_size(w, h)
+            # update rulers
+            loc = self.canvas._origin_location if hasattr(self.canvas, '_origin_location') else 1
+            self.h_ruler.update_settings(loc, w)
+            self.v_ruler.update_settings(loc, h)
+
+    def set_origin_location(self, loc):
+        if self.canvas:
+            self.canvas.set_origin_location(loc)
+            w = self.canvas._work_w
+            h = self.canvas._work_h
+            self.h_ruler.update_settings(loc, w)
+            self.v_ruler.update_settings(loc, h)
+
+    def update_interface_config(self, config):
+        """Update interface config (grid, colors)"""
+        if self.canvas:
+            self.canvas.apply_interface_settings(config)
+            
+    def get_interface_config(self):
+        """Get current interface config"""
+        if self.canvas:
+            return self.canvas.get_interface_settings()
+        return {}
 
     def init_ui(self):
         """初始化用户界面"""
@@ -2744,6 +3489,73 @@ class WhiteboardWidget(QWidget):
         """全选（转发给EditManager）"""
         self.canvas.edit_manager.select_all()
         logger.info("执行全选操作")
+
+    def dock_to_center(self):
+        """将选中图形移动到画布工作区中心"""
+        items = self.canvas.get_selected_items()
+        if not items:
+            return
+            
+        # 1. 计算所有选中项的联合包围盒
+        bbox = QRectF()
+        valid = False
+        for it in items:
+            try:
+                # 使用 sceneBoundingRect 获取绝对坐标下的包围盒
+                if not valid:
+                    bbox = it.sceneBoundingRect()
+                    valid = True
+                else:
+                    bbox = bbox.united(it.sceneBoundingRect())
+            except Exception:
+                pass
+        
+        if not valid:
+            return
+            
+        # 2. 计算中心点偏移量
+        # 画布工作区中心
+        target_cx = self.canvas._work_w / 2
+        target_cy = self.canvas._work_h / 2
+        
+        # 当前选中项中心
+        curr_cx = bbox.center().x()
+        curr_cy = bbox.center().y()
+        
+        dx = target_cx - curr_cx
+        dy = target_cy - curr_cy
+        
+        if abs(dx) < 1e-4 and abs(dy) < 1e-4:
+            return # 已经在中心
+            
+        # 3. 构造批量移动命令
+        items_states = []
+        for it in items:
+            try:
+                if isinstance(it, EditablePathItem):
+                    # 对于路径，修改点坐标
+                    old_pts = it.points()
+                    new_pts = [(p[0] + dx, p[1] + dy) for p in old_pts]
+                    items_states.append(('path', it, old_pts, new_pts))
+                    # 立即应用视觉更新
+                    it.set_points(new_pts)
+                else:
+                    # 对于其他图形（文本、图片等），修改 Pos
+                    old_pos = it.pos()
+                    new_pos = QPointF(old_pos.x() + dx, old_pos.y() + dy)
+                    items_states.append(('pos', it, old_pos, new_pos))
+                    it.setPos(new_pos)
+            except Exception:
+                pass
+                
+        if items_states:
+            from edit.commands import MoveItemsCommand
+            # 记录到撤销栈（因为已经手动执行了 set_points/setPos，这里只记录不执行）
+            # 注意：如果 EditManager 在 push_undo 时不执行 redo，且 MoveItemsCommand 的 undo 逻辑正确，那就没问题。
+            # 通常 push_undo 意味着 "command has already been executed, just push to stack"
+            cmd = MoveItemsCommand(self.canvas, items_states)
+            self.canvas.edit_manager.push_undo(cmd)
+            self.canvas.scene.update()
 
     def zoom_in(self):
         self.canvas.zoom_in()

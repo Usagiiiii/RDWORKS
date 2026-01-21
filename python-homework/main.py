@@ -26,6 +26,7 @@ if 'QT_QPA_PLATFORM_PLUGIN_PATH' not in os.environ:
       break
 
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QTranslator, QLibraryInfo
 from ui.main_window import MainWindow
 
 
@@ -37,6 +38,28 @@ def main():
     for path in sys.path:
       print(f"- {path}")
     app = QApplication(sys.argv)
+
+    # 加载 Qt 中文翻译
+    translator = QTranslator()
+    
+    # 尝试查找翻译文件的路径列表
+    translation_paths = [
+        QLibraryInfo.location(QLibraryInfo.TranslationsPath),
+        os.path.join(sys.prefix, 'Lib', 'site-packages', 'PyQt5', 'Qt5', 'translations'),
+        os.path.join(sys.prefix, 'Lib', 'site-packages', 'PyQt5', 'Qt', 'translations'),
+    ]
+    
+    for path in translation_paths:
+        if path and os.path.exists(path):
+            # 优先尝试 qt_zh_CN
+            if translator.load("qt_zh_CN", path):
+                app.installTranslator(translator)
+                break
+            # 其次尝试 qtbase_zh_CN
+            elif translator.load("qtbase_zh_CN", path):
+                app.installTranslator(translator)
+                break
+
     app.setStyle('Fusion')  # 使用Fusion样式，更现代
     
     # 创建主窗口
@@ -48,4 +71,64 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

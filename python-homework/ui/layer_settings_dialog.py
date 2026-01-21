@@ -370,10 +370,10 @@ class LayerSettingsDialog(QDialog):
         self.lbl_layer_color.setStyleSheet("background-color: black; border: 1px solid gray;")
         mid_layout.addWidget(self.lbl_layer_color, 0, 1, 1, 2)
         
-        # 是否输出
-        mid_layout.addWidget(QLabel("是否输出:"), 1, 0)
-        self.combo_output = self.create_combobox(["是", "否"])
-        mid_layout.addWidget(self.combo_output, 1, 1, 1, 2)
+        # 是否输出 (已移除)
+        # mid_layout.addWidget(QLabel("是否输出:"), 1, 0)
+        # self.combo_output = self.create_combobox(["是", "否"])
+        # mid_layout.addWidget(self.combo_output, 1, 1, 1, 2)
         
         # 速度
         mid_layout.addWidget(QLabel("速度(mm/s):"), 2, 0)
@@ -382,6 +382,7 @@ class LayerSettingsDialog(QDialog):
         self.spin_speed.setDecimals(2)
         mid_layout.addWidget(self.spin_speed, 2, 1)
         self.chk_speed_default = QCheckBox("默认")
+        self.chk_speed_default.toggled.connect(self.on_speed_default_toggled)
         mid_layout.addWidget(self.chk_speed_default, 2, 2)
         
         # 重复加工次数
@@ -566,6 +567,9 @@ class LayerSettingsDialog(QDialog):
     def create_combobox(self, items):
         combo = QComboBox()
         combo.setView(QListView()) # 解决遮挡问题
+        combo.setMaxVisibleItems(10)
+        combo.setEditable(True)
+        combo.lineEdit().setReadOnly(True)
         combo.addItems(items)
         return combo
 
@@ -586,6 +590,13 @@ class LayerSettingsDialog(QDialog):
         self.lbl_scan_interval.setVisible(is_scan)
         self.spin_scan_interval.setVisible(is_scan)
 
+    def on_speed_default_toggled(self, checked):
+        if checked:
+            self.spin_speed.setValue(100.00)
+            self.spin_speed.setEnabled(False)
+        else:
+            self.spin_speed.setEnabled(True)
+
     def load_params(self):
         if not self.current_params:
             return
@@ -593,8 +604,16 @@ class LayerSettingsDialog(QDialog):
         p = self.current_params
         self.lbl_layer_color.setStyleSheet(f"background-color: {self.current_hex_color}; border: 1px solid gray;")
         
-        self.combo_output.setCurrentIndex(0 if p.is_output else 1)
-        self.spin_speed.setValue(p.speed)
+        # self.combo_output.setCurrentIndex(0 if p.is_output else 1)
+        
+        # Speed Default Logic
+        is_default = getattr(p, 'is_speed_default', False)
+        self.chk_speed_default.setChecked(is_default)
+        self.on_speed_default_toggled(is_default)
+        
+        if not is_default:
+            self.spin_speed.setValue(p.speed)
+            
         self.spin_repeat.setValue(getattr(p, 'repeat_count', 1))
         self.combo_mode.setCurrentText(p.mode)
         
@@ -607,11 +626,13 @@ class LayerSettingsDialog(QDialog):
         
         # 加载功率 (目前只支持第一路，后续可扩展)
         if self.power_rows:
+            # Laser 1
             self.power_rows[0][1].setValue(p.min_power)
             self.power_rows[0][2].setValue(p.max_power)
-            # 第二路示例
-            self.power_rows[1][1].setValue(0.0)
-            self.power_rows[1][2].setValue(0.0)
+            
+            # Laser 2
+            self.power_rows[1][1].setValue(getattr(p, 'min_power_2', 30.0))
+            self.power_rows[1][2].setValue(getattr(p, 'max_power_2', 30.0))
         
         self.spin_seal.setValue(getattr(p, 'seal_gap', 0.0))
         self.spin_on_delay.setValue(getattr(p, 'laser_on_delay', 0))
@@ -630,7 +651,9 @@ class LayerSettingsDialog(QDialog):
             return
             
         p = self.current_params
-        p.is_output = (self.combo_output.currentIndex() == 0)
+        # p.is_output = (self.combo_output.currentIndex() == 0)
+        
+        p.is_speed_default = self.chk_speed_default.isChecked()
         p.speed = self.spin_speed.value()
         p.repeat_count = self.spin_repeat.value()
         p.mode = self.combo_mode.currentText()
@@ -642,8 +665,13 @@ class LayerSettingsDialog(QDialog):
         p.is_blowing = (self.combo_blowing.currentIndex() == 0)
         
         if self.power_rows:
+            # Laser 1
             p.min_power = self.power_rows[0][1].value()
             p.max_power = self.power_rows[0][2].value()
+            
+            # Laser 2
+            p.min_power_2 = self.power_rows[1][1].value()
+            p.max_power_2 = self.power_rows[1][2].value()
         
         p.seal_gap = self.spin_seal.value()
         p.laser_on_delay = self.spin_on_delay.value()

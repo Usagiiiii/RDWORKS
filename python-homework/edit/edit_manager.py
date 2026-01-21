@@ -5,10 +5,8 @@ from PyQt5.QtGui import QTransform
 from typing import List, Any
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
-
-from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand
-from ui.graphics_items import EditablePathItem
-
+from ui.graphics_items import EditablePathItem, EditableEllipseItem
+from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand, MacroCommand
 
 class EditManager(QObject):
     # 信号：通知界面更新菜单项可用性
@@ -172,6 +170,7 @@ class EditManager(QObject):
             # 剪切逻辑：暂存选中项 → 删除 → 入撤销栈
             selected = self.canvas.get_selected_items()
             if selected:
+                self.clipboard = selected
                 cmd = DeleteItemsCommand(self.canvas, selected)
                 # 先执行删除操作，再将命令记录到历史
                 cmd.redo()
@@ -183,13 +182,104 @@ class EditManager(QObject):
             self.clipboard = self.canvas.get_selected_items()
 
     def paste(self):
-        # 粘贴逻辑：从剪贴板恢复图形 → 入撤销栈
+        # 粘贴逻辑：从剪贴板创建副本 → 入撤销栈
         if hasattr(self, 'clipboard') and self.clipboard:
+            # 清除当前选中，以便选中新粘贴的图形
+            if self.canvas.scene:
+                for item in self.canvas.scene.selectedItems():
+                    item.setSelected(False)
+
+            # Determine offset
+            settings = getattr(self.canvas, 'paste_settings', {})
+            offset_enable = settings.get('offset_enable', False) # Default to Offset Copy? 
+            # Note: The checkbox screenshot 1 says "Offset Copy" checked, X:0, Y:0.
+            # If checked, use X/Y. If unchecked ("Paste at mouse cursor"), use mouse offset.
+            
+            dx, dy = 10.0, 10.0 # Fallback
+            
+            if offset_enable:
+                 dx = settings.get('x', 0.0)
+                 dy = settings.get('y', 0.0)
+            else:
+                 # Paste at mouse cursor
+                 # Calculate center of clipboard items
+                 min_x, min_y = float('inf'), float('inf')
+                 max_x, max_y = float('-inf'), float('-inf')
+                 valid_clip = False
+                 for item in self.clipboard:
+                     try:
+                         br = item.sceneBoundingRect()
+                         min_x = min(min_x, br.left())
+                         min_y = min(min_y, br.top())
+                         max_x = max(max_x, br.right())
+                         max_y = max(max_y, br.bottom())
+                         valid_clip = True
+                     except:
+                         pass
+                 
+                 if valid_clip:
+                     center_x = (min_x + max_x) / 2
+                     center_y = (min_y + max_y) / 2
+                     
+                     # Target position: Mouse Position
+                     # self.canvas.last_mouse_scene_pos should be available
+                     mouse_pos = getattr(self.canvas, 'last_mouse_scene_pos', None)
+                     if mouse_pos:
+                         dx = mouse_pos.x() - center_x
+                         dy = mouse_pos.y() - center_y
+
             for item in self.clipboard:
-                cmd = AddItemCommand(self.canvas, item)
-                # 先执行添加，再记录历史
-                cmd.redo()
-                self.push_undo(cmd)
+                new_item = self._clone_item(item)
+                if new_item:
+                    # Apply calculated offset (either Explicit X/Y or Mouse-Center delta)
+                    # Note: _clone_item creates item at ORIGINAL position of source item.
+                    # So moving by dx, dy does the right thing.
+                    
+                    # However, if using fixed offset X/Y (e.g. 0,0), does user mean 0 offset from original?
+                    # "Offset Copy X:0 Y:0" implies paste at EXACT same position.
+                    # Yes.
+                    
+                    new_item.moveBy(dx, dy)
+                    new_item.setSelected(True)
+                    
+                    cmd = AddItemCommand(self.canvas, new_item)
+                    cmd.redo()
+                    self.push_undo(cmd)
+
+    def _clone_item(self, item):
+        """创建图形项的深拷贝"""
+        new_item = None
+        
+        if isinstance(item, EditablePathItem):
+            # 复制路径点和属性
+            pts = [pt for pt in item._points] # deep copy of points list
+            # color check
+            color = item._color if hasattr(item, '_color') else item.pen().color()
+            smooth = item._smooth
+            new_item = EditablePathItem(pts, color, smooth)
+            
+        elif isinstance(item, EditableEllipseItem):
+            rect = item.rect()
+            cx = rect.center().x()
+            cy = rect.center().y()
+            rx = rect.width() / 2
+            ry = rect.height() / 2
+            color = item._color if hasattr(item, '_color') else item.pen().color()
+            new_item = EditableEllipseItem(cx, cy, rx, ry, color)
+            
+        elif isinstance(item, QGraphicsPixmapItem):
+            new_item = QGraphicsPixmapItem(item.pixmap())
+            
+        # 复制通用变换属性
+        if new_item:
+            new_item.setPos(item.pos())
+            new_item.setRotation(item.rotation())
+            new_item.setScale(item.scale())
+            new_item.setZValue(item.zValue())
+            if not item.transform().isIdentity():
+                new_item.setTransform(item.transform())
+                
+        return new_item
 
     def delete(self):
         if self.has_selection:
