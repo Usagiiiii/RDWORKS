@@ -757,3 +757,4 @@ class MacroCommand(Command):
         for cmd in self.commands:
             cmd.redo()
 
+

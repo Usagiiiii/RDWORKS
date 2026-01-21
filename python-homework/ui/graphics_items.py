@@ -4,9 +4,11 @@
 图形项定义 - 避免循环导入
 """
 
+
 from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent, QFont, QTransform, QFontMetrics, QFontDatabase, QFontMetricsF
+
 import math
 import traceback
 
@@ -24,7 +26,12 @@ class EditablePathItem(QGraphicsPathItem):
 
         self._handles = []
         self._color = color
+
+        self._smooth = smooth
+        self._straight_close = False # 新增：是否使用直线强制闭合
+
         self._orig_color = color # 备份原始颜色
+
         # 标记当前是否处于节点编辑模式
         self._node_edit_enabled = False
         # 节点编辑状态变量
@@ -68,29 +75,77 @@ class EditablePathItem(QGraphicsPathItem):
                  path.moveTo(self._points[0][0], self._points[0][1])
         else:
             pts = [(float(x), float(y)) for (x, y) in self._points]
-            path.moveTo(pts[0][0], pts[0][1])
-            ext = [pts[0]] + pts + [pts[-1]] # Catmull-Rom Padding
+
             
-            for i in range(target_len):
-                # Segment i connects pts[i] to pts[i+1]
-                is_curve = self._segment_types[i]
-                if not is_curve:
-                    path.lineTo(pts[i+1][0], pts[i+1][1])
-                elif i in self._control_points:
-                     # Explicit Bezier Control Points
-                     cp1, cp2 = self._control_points[i]
-                     path.cubicTo(cp1[0], cp1[1], cp2[0], cp2[1], pts[i+1][0], pts[i+1][1])
-                else:
-                     # Catmull-Rom logic (Fallback or Smooth Auto)
-                     p0 = ext[i]
-                     p1 = ext[i+1] # pts[i]
-                     p2 = ext[i+2] # pts[i+1]
-                     p3 = ext[i+3]
-                     cp1x = p1[0] + (p2[0] - p0[0]) / 6.0
-                     cp1y = p1[1] + (p2[1] - p0[1]) / 6.0
-                     cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
-                     cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
-                     path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
+            # 检查是否开启了“直线闭合”模式
+            use_straight_close = getattr(self, '_straight_close', False)
+closed_pt = None
+original_pts = pts.copy()  # 保存原始点集，用于后续恢复
+
+# 如果开启了直线闭合，且确实是闭合形状（首尾距离极小），且点数足够多
+if use_straight_close and len(pts) > 2:
+    # 检查首尾是否重合（距离小于极小值）
+    dx = pts[0][0] - pts[-1][0]
+    dy = pts[0][1] - pts[-1][1]
+    if math.hypot(dx, dy) < 1e-9:
+        closed_pt = pts[-1]
+        pts = pts[:-1]  # 暂时移除闭合点，保留尖角
+        
+        # 适配点集变化：同步更新分段相关属性（避免索引错位）
+        if hasattr(self, '_segment_types') and len(self._segment_types) > 0:
+            self._segment_types = self._segment_types[:-1]  # 分段数减少1
+        if hasattr(self, '_control_points') and len(self._control_points) > 0:
+            # 移除最后一个分段的自定义控制点（仅保留有效索引）
+            self._control_points = {k: v for k, v in self._control_points.items() if k < len(pts)-1}
+
+# ====================== 保留右侧核心：分段类型控制 ======================
+if len(pts) < 2:
+    # 点数不足，无法绘制（边界保护）
+    pass
+else:
+    path.moveTo(pts[0][0], pts[0][1])
+    # Catmull-Rom 扩展点（兼容分段遍历，统一索引逻辑）
+    ext = [pts[0]] + pts + [pts[-1]]
+    # 统一分段数：点数-1（n个点对应n-1个分段），兼容target_len
+    target_len = len(pts) - 1
+
+    for i in range(target_len):
+        # 1. 获取当前分段类型（兼容边界：避免索引越界）
+        is_curve = True  # 默认是曲线
+        if hasattr(self, '_segment_types') and i < len(self._segment_types):
+            is_curve = self._segment_types[i]
+        
+        if not is_curve:
+            # 分段类型：直线段
+            path.lineTo(pts[i+1][0], pts[i+1][1])
+        
+        elif hasattr(self, '_control_points') and i in self._control_points:
+            # 分段类型：自定义贝塞尔曲线（显式控制点）
+            cp1, cp2 = self._control_points[i]
+            path.cubicTo(cp1[0], cp1[1], cp2[0], cp2[1], pts[i+1][0], pts[i+1][1])
+        
+        else:
+            # 分段类型：自动 Catmull-Rom 曲线（兜底逻辑）
+            # 索引保护：避免ext越界（核心修复冲突点）
+            p0 = ext[i] if i < len(ext) else pts[i]
+            p1 = ext[i+1] if (i+1) < len(ext) else pts[i]
+            p2 = ext[i+2] if (i+2) < len(ext) else pts[i+1]
+            p3 = ext[i+3] if (i+3) < len(ext) else pts[i+1]
+            
+            # Catmull-Rom 转贝塞尔曲线的核心计算（保留原公式）
+            cp1x = p1[0] + (p2[0] - p0[0]) / 6.0
+            cp1y = p1[1] + (p2[1] - p0[1]) / 6.0
+            cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
+            cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
+            
+            path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
+
+# ====================== 保留左侧核心：直线闭合处理 ======================
+if closed_pt:
+    # 用直线连接回闭合点，完成闭合（保留尖角）
+    path.lineTo(closed_pt[0], closed_pt[1])
+    # 恢复原始点集（避免影响后续逻辑）
+    pts = original_pts
 
         self.setPath(path)
         
@@ -940,6 +995,12 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         self._update_pen()
         self.setFlags(QGraphicsEllipseItem.ItemIsSelectable | QGraphicsEllipseItem.ItemIsMovable)
         
+
+        # 节点编辑相关
+        self._node_edit_enabled = False
+        self._handles = []
+        self._move_orig_rect = None
+
     def setPen(self, pen):
         # 只有在非节点编辑模式下才更新颜色
         if not getattr(self, '_node_edit_enabled', False):
@@ -968,8 +1029,12 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         return self._color
 
     def enable_node_edit(self, on: bool):
+
+        """切换节点编辑模式"""
+
         self._node_edit_enabled = bool(on)
         self._update_pen()
+
         if on:
             self._rebuild_handles()
         else:
@@ -982,70 +1047,91 @@ class EditableEllipseItem(QGraphicsEllipseItem):
             h.setParentItem(None)
         self._handles.clear()
 
+        
     def _rebuild_handles(self):
-        self._clear_handles()
-        rect = self.rect()
-        c = rect.center()
-        rx = rect.width() / 2
-        ry = rect.height() / 2
-        
-        # 4个节点：上、右、下、左
-        pts = [
-            QPointF(c.x(), c.y() - ry), # Top
-            QPointF(c.x() + rx, c.y()), # Right
-            QPointF(c.x(), c.y() + ry), # Bottom
-            QPointF(c.x() - rx, c.y())  # Left
-        ]
-        
-        for idx, pt in enumerate(pts):
-            h = _DragHandle(self, idx, pt.x(), pt.y())
-            self._handles.append(h)
+    self._clear_handles()
+    rect = self.rect()
+    c = rect.center()
+    rx = rect.width() / 2
+    ry = rect.height() / 2
+    
+    # 保留右侧：通过中心+半径计算句柄坐标（逻辑更严谨）
+    pts = [
+        QPointF(c.x(), c.y() - ry), # Top
+        QPointF(c.x() + rx, c.y()), # Right
+        QPointF(c.x(), c.y() + ry), # Bottom
+        QPointF(c.x() - rx, c.y())  # Left
+    ]
+    
+    # 统一句柄类：优先用 _DragHandle（右侧），若项目中是 _EllipseHandle 可替换
+    for idx, pt in enumerate(pts):
+        h = _DragHandle(self, idx, pt.x(), pt.y())
+        self._handles.append(h)
 
-    def _update_handles_positions(self):
-        if not self._handles: return
-        rect = self.rect()
-        c = rect.center()
-        rx = rect.width() / 2
-        ry = rect.height() / 2
-        pts = [
-            QPointF(c.x(), c.y() - ry),
-            QPointF(c.x() + rx, c.y()),
-            QPointF(c.x(), c.y() + ry),
-            QPointF(c.x() - rx, c.y()) 
-        ]
-        for idx, h in enumerate(self._handles):
-            if idx < len(pts):
-                h.setPos(pts[idx])
+def _update_handles_positions(self):
+    if not self._handles: return
+    rect = self.rect()
+    c = rect.center()
+    rx = rect.width() / 2
+    ry = rect.height() / 2
+    pts = [
+        QPointF(c.x(), c.y() - ry),
+        QPointF(c.x() + rx, c.y()),
+        QPointF(c.x(), c.y() + ry),
+        QPointF(c.x() - rx, c.y()) 
+    ]
+    # 保留右侧：索引越界保护 + 中心+半径计算位置
+    for idx, h in enumerate(self._handles):
+        if idx < len(pts):
+            h.setPos(pts[idx])
 
-    def update_point(self, idx, x, y):
-        # x, y 是场景坐标
-        local_pos = self.mapFromScene(QPointF(x, y))
-        lx, ly = local_pos.x(), local_pos.y()
-        
-        rect = self.rect()
-        c = rect.center()
-        rx = rect.width() / 2
-        ry = rect.height() / 2
-        
-        # 保持中心不变，只改变半径
-        if idx == 0: # Top
-            new_ry = abs(c.y() - ly)
-            if new_ry < 0.1: new_ry = 0.1
-            self.setRect(c.x() - rx, c.y() - new_ry, 2*rx, 2*new_ry)
-        elif idx == 1: # Right
-            new_rx = abs(lx - c.x())
-            if new_rx < 0.1: new_rx = 0.1
-            self.setRect(c.x() - new_rx, c.y() - ry, 2*new_rx, 2*ry)
-        elif idx == 2: # Bottom
-            new_ry = abs(ly - c.y())
-            if new_ry < 0.1: new_ry = 0.1
-            self.setRect(c.x() - rx, c.y() - new_ry, 2*rx, 2*new_ry)
-        elif idx == 3: # Left
-            new_rx = abs(c.x() - lx)
-            if new_rx < 0.1: new_rx = 0.1
-            self.setRect(c.x() - new_rx, c.y() - ry, 2*new_rx, 2*ry)
-            
-        self._update_handles_positions()
+def update_handle(self, idx: int, x: float, y: float):
+    """
+    统一对外接口：兼容左侧命名+类型注解，实现右侧核心逻辑
+    :param idx: 句柄索引（0=上，1=右，2=下，3=左）
+    :param x: 场景坐标x
+    :param y: 场景坐标y
+    """
+    # 保留右侧：场景坐标转本地坐标（适配Qt图形场景体系）
+    local_pos = self.mapFromScene(QPointF(x, y))
+    lx, ly = local_pos.x(), local_pos.y()
+    
+    rect = self.rect()
+    c = rect.center()
+    rx = rect.width() / 2
+    ry = rect.height() / 2
+    
+    # 保留右侧：固定中心，只修改半径（符合椭圆调整直觉）
+    # 融合左侧：尺寸保护（取0.1更合理，兼容左侧1e-3的最小阈值）
+    min_size = 0.1
+    new_rect = QRectF(rect)
+    
+    if idx == 0: # Top
+        new_ry = abs(c.y() - ly)
+        new_ry = max(new_ry, min_size)  # 尺寸保护
+        new_rect.setRect(c.x() - rx, c.y() - new_ry, 2*rx, 2*new_ry)
+    elif idx == 1: # Right
+        new_rx = abs(lx - c.x())
+        new_rx = max(new_rx, min_size)  # 尺寸保护
+        new_rect.setRect(c.x() - new_rx, c.y() - ry, 2*new_rx, 2*ry)
+    elif idx == 2: # Bottom
+        new_ry = abs(ly - c.y())
+        new_ry = max(new_ry, min_size)  # 尺寸保护
+        new_rect.setRect(c.x() - rx, c.y() - new_ry, 2*rx, 2*new_ry)
+    elif idx == 3: # Left
+        new_rx = abs(c.x() - lx)
+        new_rx = max(new_rx, min_size)  # 尺寸保护
+        new_rect.setRect(c.x() - new_rx, c.y() - ry, 2*new_rx, 2*ry)
+    
+    # 保留左侧：normalized() 确保矩形有效（避免宽高为负）
+    self.setRect(new_rect.normalized())
+    self._update_handles_positions()
+
+# 兼容右侧的 update_point 命名（避免旧代码调用报错）
+def update_point(self, idx, x, y):
+    self.update_handle(idx, x, y)
+
+
 
     def get_params(self):
         """获取椭圆参数 (cx, cy, rx, ry) 场景坐标"""
@@ -1066,6 +1152,55 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         scale_y = math.sqrt(transform.m21()**2 + transform.m22()**2)
         
         return cx, cy, rx * scale_x, ry * scale_y
+
+
+class _EllipseHandle(QGraphicsEllipseItem):
+    def __init__(self, owner: EditableEllipseItem, idx: int, x: float, y: float):
+        r = 3.5
+        super().__init__(-r, -r, 2 * r, 2 * r, parent=owner)
+        self._owner = owner
+        self._idx = idx
+        pen = QPen(QColor(255, 100, 0)) # 橙色区分
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QBrush(QColor(255, 100, 0, 120)))
+        self.setZValue(10)
+        self.setFlags(QGraphicsEllipseItem.ItemIsSelectable)
+        
+        # 设置光标
+        if idx in (0, 2): # Top, Bottom
+            self.setCursor(Qt.SizeVerCursor)
+        elif idx in (1, 3): # Right, Left
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.setCursor(Qt.SizeAllCursor)
+            
+        self.setPos(x, y)
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        # 获取本地坐标 (因为是子项，mapToParent 即 mapToOwner)
+        pos = self.mapToParent(e.pos())
+        x, y = pos.x(), pos.y()
+        self._owner.update_handle(self._idx, x, y)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        try:
+            self._orig_rect = self._owner.rect()
+        except Exception:
+            self._orig_rect = None
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        try:
+            new_rect = self._owner.rect()
+            old_rect = getattr(self, '_orig_rect', None)
+            if old_rect is not None and new_rect != old_rect:
+                # 记录撤销逻辑（暂时跳过复杂 Command 实现）
+                pass
+        except Exception:
+            pass
+        event.accept()
+
 class TextGraphicsItem(QGraphicsPathItem):
     def __init__(self, text, settings, parent=None):
         super().__init__(parent)
@@ -1178,4 +1313,5 @@ class TextGraphicsItem(QGraphicsPathItem):
             import traceback
             traceback.print_exc()
             print(f"Error: {e}")
+
 
