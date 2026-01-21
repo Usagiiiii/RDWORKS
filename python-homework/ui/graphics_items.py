@@ -4,9 +4,9 @@
 图形项定义 - 避免循环导入
 """
 
-from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem
+from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem
 from PyQt5.QtCore import Qt, QPointF
-from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent
+from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent, QFont, QTransform, QFontMetrics, QFontDatabase, QFontMetricsF
 import math
 import traceback
 
@@ -120,6 +120,40 @@ class EditablePathItem(QGraphicsPathItem):
         # 只有在节点编辑模式开启时才显示/重建锚点句柄
         if getattr(self, '_node_edit_enabled', False):
             self._rebuild_handles()
+
+    def get_path_data(self):
+        """返回路径完整数据(点,段类型,控制点)"""
+        cp = {k: v for k, v in self._control_points.items()}
+        return (self._points[:], self._segment_types[:], cp)
+
+    def set_path_data(self, data):
+        """设置路径完整数据"""
+        pts, segs, cps = data
+        self._points = pts[:]
+        self._segment_types = segs[:]
+        self._control_points = {k: v for k, v in cps.items()}
+        self._update_path()
+        if getattr(self, '_node_edit_enabled', False):
+            self._rebuild_handles()
+
+    @staticmethod
+    def reverse_path_data(data):
+        """反转路径数据"""
+        pts, segs, cps = data
+        n = len(pts)
+        if n < 2:
+            return (pts[::-1], [], {})
+            
+        new_pts = pts[::-1]
+        new_segs = segs[::-1]
+        new_cps = {}
+        
+        max_seg_idx = n - 2
+        for k, (cp1, cp2) in cps.items():
+            new_k = max_seg_idx - k
+            new_cps[new_k] = (cp2, cp1)
+            
+        return (new_pts, new_segs, new_cps)
 
     def update_control_point(self, segment_index, which_cp, new_pos):
         """Update a specific control point (0=cp1, 1=cp2) for a segment"""
@@ -599,12 +633,26 @@ class EditablePathItem(QGraphicsPathItem):
         if k <= 0 or k >= n - 1:
             return # Cannot break at endpoints
             
-        points1 = self._points[:k+1]
-        points2 = self._points[k:] # Share the split point
+        # Split logic
+        # Data 1
+        pts1 = self._points[:k+1]
+        segs1 = self._segment_types[:k]
+        cp1 = {}
+        for i, val in self._control_points.items():
+            if i < k:
+                cp1[i] = val
         
-        self._execute_break(points1, points2)
+        # Data 2
+        pts2 = self._points[k:]
+        segs2 = self._segment_types[k:]
+        cp2 = {}
+        for i, val in self._control_points.items():
+            if i >= k:
+                cp2[i - k] = val
         
-    def _execute_break(self, points1, points2):
+        self._execute_break((pts1, segs1, cp1), (pts2, segs2, cp2))
+        
+    def _execute_break(self, data1, data2):
         try:
             views = self.scene().views()
             edit_mgr = None
@@ -617,9 +665,15 @@ class EditablePathItem(QGraphicsPathItem):
             
             if edit_mgr:
                 from edit.commands import BreakCurveCommand
-                cmd = BreakCurveCommand(canvas, self, points1, points2)
+                cmd = BreakCurveCommand(canvas, self, data1, data2)
                 cmd.redo() # Execute
                 edit_mgr.push_undo(cmd)
+                
+                # Update edit mode for original item (now shorter)
+                if getattr(self, '_node_edit_enabled', False):
+                    self._clear_handles()
+                    self._selected_handle_indices.clear()
+                    self._rebuild_handles()
         except Exception as e:
             print(f"Break curve error: {e}")
 
@@ -651,10 +705,21 @@ class EditablePathItem(QGraphicsPathItem):
                 # 将 Item 的位移应用到所有点上
                 dx, dy = current_pos.x(), current_pos.y()
                 self._points = [(p[0] + dx, p[1] + dy) for p in self._points]
+                
+                # 同时更新控制点，防止控制点错位
+                new_cps = {}
+                for k, (c1, c2) in self._control_points.items():
+                    new_c1 = (c1[0] + dx, c1[1] + dy)
+                    new_c2 = (c2[0] + dx, c2[1] + dy)
+                    new_cps[k] = (new_c1, new_c2)
+                self._control_points = new_cps
+                
                 # 重置 Item 位置为 (0, 0)
                 self.setPos(0, 0)
                 # 更新路径和句柄
                 self._update_path()
+                if getattr(self, '_node_edit_enabled', False):
+                     self._update_handles_positions()
 
             new_points = self.points()
             old_points = getattr(self, '_move_orig_points', None)
@@ -778,19 +843,13 @@ class _DragHandle(QGraphicsRectItem):
 
     def mouseMoveEvent(self, e: QMouseEvent):
         # 获取鼠标在场景中的位置
-        pos = self.mapToScene(e.pos())
-        x, y = pos.x(), pos.y()
+        scene_pos = self.mapToScene(e.pos())
+        # 转换为 Owner (PathItem) 的局部坐标，因为 update_point 需要局部坐标
+        local_pos = self._owner.mapFromScene(scene_pos)
+        x, y = local_pos.x(), local_pos.y()
         # 更新拥有者的点坐标
         self._owner.update_point(self._idx, x, y)
         # 手动更新句柄位置（因为没有设置 ItemIsMovable）
-        # 对于子项，需要转换回父坐标系来设置 Local Pos
-        # self._owner.update_point 应该已经更新了 underlying data
-        # 如果 _owner 是 PathItem, update_point 会调用 _update_path -> _update_handles_positions -> setPos
-        # 所以这里可能不需要手动 setPos，或者 setPos(mapFromScene(pos))
-        
-        # EditablePathItem updates handles in update_point -> _update_path -> _update_handles_positions
-        # So we don't need to do it here for PathItem.
-        # For EllipseItem, we should probably do similar.
         pass
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -1007,3 +1066,116 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         scale_y = math.sqrt(transform.m21()**2 + transform.m22()**2)
         
         return cx, cy, rx * scale_x, ry * scale_y
+class TextGraphicsItem(QGraphicsPathItem):
+    def __init__(self, text, settings, parent=None):
+        super().__init__(parent)
+        self.text_data = text
+        self.settings = settings
+        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsMovable)
+        self.rebuild_path()
+
+
+    def rebuild_path(self):
+        try:
+            txt = self.text_data
+            if not txt:
+                self.setPath(QPainterPath())
+                return
+
+            font_family = self.settings.get('font_family', 'Arial')
+            db = QFontDatabase()
+            
+            # Basic existence check
+            if font_family not in db.families():
+                font_family = 'Arial'
+
+            # Note: We removed the isSmoothlyScalable check as it was not reliable enough
+            # and sometimes false-positived on valid fonts, or ignored crashing fonts.
+            # Instead, we rely on QGraphicsSimpleTextItem's robust shape logic.
+
+            is_bold = self.settings.get('is_bold', False)
+            is_italic = self.settings.get('is_italic', False)
+            height_mm = self.settings.get('height', 10.0)
+            if height_mm <= 0.001: height_mm = 10.0
+
+            width_percent = self.settings.get('width_percent', 100) / 100.0
+            if width_percent <= 0.001: width_percent = 1.0
+            char_spacing = self.settings.get('char_spacing', 0.0)
+            line_spacing = self.settings.get('line_spacing', 0.0)
+
+            # Construct Font
+            font = QFont(font_family)
+            font.setBold(is_bold)
+            font.setItalic(is_italic)
+            
+            # Using a fixed pixel size for the "base" path generation.
+            # 48px is a safe balance between precision and stability
+            base_size = 48.0
+            font.setPixelSize(int(base_size))
+            
+            fm = QFontMetricsF(font)
+            # Safety checks for metrics
+            if fm.height() <= 0.001:
+                font.setPixelSize(12)
+                base_size = 12.0
+                fm = QFontMetricsF(font)
+
+            full_path = QPainterPath()
+            lines = txt.split('\n')
+            current_y = 0.0
+            
+            scale_factor = height_mm / base_size
+            scale_x = scale_factor * width_percent
+            scale_y = scale_factor
+
+            for line_str in lines:
+                if not line_str:
+                    current_y += fm.height() * scale_y + line_spacing
+                    continue
+                
+                # CRITICAL CHANGE: Use QGraphicsSimpleTextItem to generate path
+                # This bypasses direct QPainterPath.addText calls which can be fragile.
+                # QGraphicsSimpleTextItem.shape() usually handles platform specifics better.
+                
+                current_x_base = 0.0
+                spacing_base = char_spacing / scale_x if scale_x else 0
+                
+                line_base_path = QPainterPath()
+                
+                # current_x_base = 0.0
+                # spacing_base = char_spacing / scale_x if scale_x else 0
+                
+                line_base_path = QPainterPath()
+                
+                # Use addText to generate the actual glyph outlines (vectors)
+                # Ensure we handle potential errors or weird states
+                if abs(spacing_base) < 0.001:
+                    line_base_path.addText(0, 0, font, line_str)
+                else:
+                    for char in line_str:
+                        if not char: continue
+                        
+                        line_base_path.addText(current_x_base, 0, font, char)
+                        
+                        # Use QFontMetricsF for precision
+                        cw = fm.width(char)
+                        current_x_base += cw + spacing_base
+
+                # Transform line path to final world size
+                t_line = QTransform()
+                t_line.scale(scale_x, scale_y)
+                
+                path_final = t_line.map(line_base_path)
+                path_final.translate(0, current_y)
+                full_path.addPath(path_final)
+                
+                current_y += fm.height() * scale_y + line_spacing
+
+            self.prepareGeometryChange()
+            self.setPath(full_path)
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print(f"Error: {e}")
+

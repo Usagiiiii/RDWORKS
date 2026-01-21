@@ -87,8 +87,15 @@ class GCodeExporter:
         return self.gcode_lines
 
     def _get_fiducial_offset(self, canvas) -> Tuple[float, float]:
-        """获取定位点偏移量（如果存在定位点）"""
+        """获取原点偏移量（优先使用激光头位置，其次定位点）"""
         try:
+            # 1. 尝试获取激光头起始位置 (新的逻辑)
+            if hasattr(canvas, 'get_laser_start_point'):
+                pt = canvas.get_laser_start_point()
+                logger.info(f"使用激光头位置作为原点偏移: ({pt.x():.2f}, {pt.y():.2f})")
+                return (pt.x(), pt.y())
+
+            # 2. 回退到旧的定位点逻辑
             fiducial = canvas.get_fiducial()
             if fiducial:
                 point, shape = fiducial
@@ -99,7 +106,7 @@ class GCodeExporter:
                 logger.info("未检测到定位点，使用默认原点(0,0)")
                 return (0.0, 0.0)
         except Exception as e:
-            logger.warning(f"获取定位点失败: {e}, 使用默认原点")
+            logger.warning(f"获取原点偏移失败: {e}, 使用默认原点")
             return (0.0, 0.0)
 
     def _apply_fiducial_offset(self, point: Point, fiducial_offset: Tuple[float, float]) -> Point:

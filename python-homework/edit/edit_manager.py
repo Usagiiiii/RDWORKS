@@ -6,7 +6,7 @@ from typing import List, Any
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
 from ui.graphics_items import EditablePathItem, EditableEllipseItem
-from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand
+from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand, MacroCommand
 
 class EditManager(QObject):
     # 信号：通知界面更新菜单项可用性
@@ -189,13 +189,57 @@ class EditManager(QObject):
                 for item in self.canvas.scene.selectedItems():
                     item.setSelected(False)
 
+            # Determine offset
+            settings = getattr(self.canvas, 'paste_settings', {})
+            offset_enable = settings.get('offset_enable', False) # Default to Offset Copy? 
+            # Note: The checkbox screenshot 1 says "Offset Copy" checked, X:0, Y:0.
+            # If checked, use X/Y. If unchecked ("Paste at mouse cursor"), use mouse offset.
+            
+            dx, dy = 10.0, 10.0 # Fallback
+            
+            if offset_enable:
+                 dx = settings.get('x', 0.0)
+                 dy = settings.get('y', 0.0)
+            else:
+                 # Paste at mouse cursor
+                 # Calculate center of clipboard items
+                 min_x, min_y = float('inf'), float('inf')
+                 max_x, max_y = float('-inf'), float('-inf')
+                 valid_clip = False
+                 for item in self.clipboard:
+                     try:
+                         br = item.sceneBoundingRect()
+                         min_x = min(min_x, br.left())
+                         min_y = min(min_y, br.top())
+                         max_x = max(max_x, br.right())
+                         max_y = max(max_y, br.bottom())
+                         valid_clip = True
+                     except:
+                         pass
+                 
+                 if valid_clip:
+                     center_x = (min_x + max_x) / 2
+                     center_y = (min_y + max_y) / 2
+                     
+                     # Target position: Mouse Position
+                     # self.canvas.last_mouse_scene_pos should be available
+                     mouse_pos = getattr(self.canvas, 'last_mouse_scene_pos', None)
+                     if mouse_pos:
+                         dx = mouse_pos.x() - center_x
+                         dy = mouse_pos.y() - center_y
+
             for item in self.clipboard:
                 new_item = self._clone_item(item)
                 if new_item:
-                    # 偏移一点位置，以便区分 (在原位置基础上 +10, +10)
-                    # 注意：如果多次粘贴，每次基于剪贴板里的原始位置偏移
-                    # 若要实现连续粘贴递增偏移，需要记录粘贴次数，这里暂简单处理
-                    new_item.moveBy(10, 10)
+                    # Apply calculated offset (either Explicit X/Y or Mouse-Center delta)
+                    # Note: _clone_item creates item at ORIGINAL position of source item.
+                    # So moving by dx, dy does the right thing.
+                    
+                    # However, if using fixed offset X/Y (e.g. 0,0), does user mean 0 offset from original?
+                    # "Offset Copy X:0 Y:0" implies paste at EXACT same position.
+                    # Yes.
+                    
+                    new_item.moveBy(dx, dy)
                     new_item.setSelected(True)
                     
                     cmd = AddItemCommand(self.canvas, new_item)

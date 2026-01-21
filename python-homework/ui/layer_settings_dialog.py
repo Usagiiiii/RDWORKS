@@ -567,6 +567,9 @@ class LayerSettingsDialog(QDialog):
     def create_combobox(self, items):
         combo = QComboBox()
         combo.setView(QListView()) # 解决遮挡问题
+        combo.setMaxVisibleItems(10)
+        combo.setEditable(True)
+        combo.lineEdit().setReadOnly(True)
         combo.addItems(items)
         return combo
 

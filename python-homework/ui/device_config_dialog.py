@@ -46,6 +46,7 @@ class PortSettingDialog(QDialog):
         usb_settings_layout.addWidget(QLabel("端口号:"))
         self.port_combo = QComboBox()
         self.port_combo.setView(QListView()) # 解决遮挡问题
+        self.port_combo.setMaxVisibleItems(10)
         self.port_combo.setEditable(True)
         self.port_combo.lineEdit().setReadOnly(True)
         self.port_combo.setStyleSheet("QComboBox { background-color: #ffffff; }")
