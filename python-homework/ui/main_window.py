@@ -11,7 +11,7 @@ from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence, QColor, QPalette
 from PyQt5.QtWidgets import (QMainWindow, QAction, QToolBar, QHBoxLayout, QWidget, QLabel, QFileDialog, QMessageBox,
-                             QLineEdit, QGraphicsPixmapItem)
+                             QLineEdit, QGraphicsPixmapItem, QDialog)
 
 from my_io.importers.supported_filter import SUPPORTED_FILTER
 from ui.left_toolbar import LeftToolbar
@@ -24,6 +24,11 @@ from ui.whiteboard import Path
 from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
 from ui.lead_line_dialog import LeadLineDialog
 from ui.preview_dialog import PreviewDialog
+from ui.smooth_curve_dialog import SmoothCurveSimpleDialog, SmoothCurveCustomDialog, chaikin_smooth
+from ui.auto_close_dialog import AutoCloseDialog
+from ui.data_check_dialog import DataCheckDialog
+from ui.bitmap_process_dialog import BitmapProcessDialog
+from ui.graphics_items import EditablePathItem
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -478,16 +483,16 @@ class MainWindow(QMainWindow):
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column2.png', '', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '测量工具', self.open_file))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column4.png', 'Mark点定位', self.save_file))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '曲线平滑', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '曲线平滑', self.show_smooth_curve_dialog))
         toolbar2.addSeparator()
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column6.png', '位图处理', None))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column7.png', '曲线自动闭合', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column6.png', '位图处理', self.show_bitmap_process_dialog))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column7.png', '曲线自动闭合', self.show_auto_close_dialog))
         toolbar2.addSeparator()
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column8.png', '切割优化', self.zoom_in))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column9.png', '合并相连线', self.zoom_out))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column10.png', '删除重线', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column11.png', '平行线', self.zoom_reset))
-        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column12.png', '数据检查', None))
+        toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column12.png', '数据检查', self.show_data_check_dialog))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column13.png', '拍照', None))
         toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column14.png', '框选提边', None))
         toolbar2.addSeparator()
@@ -885,6 +890,200 @@ class MainWindow(QMainWindow):
             self.show_status_message('已创建新RLD文件')
             self.logger.info("创建新RLD文件")
 
+    def show_smooth_curve_dialog(self):
+        """显示曲线平滑对话框"""
+        # 获取当前选中的项
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先选择要平滑的曲线")
+            return
+            
+        # 过滤出可以平滑的项 (EditablePathItem)
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        
+        if not target_items:
+            QMessageBox.warning(self, "提示", "所选对象不支持曲线平滑")
+            return
+            
+        # 如果选中多个，只处理第一个，或者提示不支持多选（简单起见，处理第一个）
+        if len(target_items) > 1:
+            QMessageBox.information(self, "提示", "检测到多个对象，将仅对第一个选中的曲线进行平滑处理")
+            
+        target_item = target_items[0]
+        original_points = target_item.points()
+        
+        # 弹出简单设置对话框
+        dlg = SmoothCurveSimpleDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            level = dlg.get_level()
+            
+            new_points = original_points[:]
+            
+            if level == "自定义":
+                # 弹出自定义对话框
+                custom_dlg = SmoothCurveCustomDialog(original_points, self)
+                if custom_dlg.exec_() == QDialog.Accepted:
+                    new_points, smooth_fit = custom_dlg.get_result()
+                    # 记录撤销操作状态（如果实现了撤销系统）
+                    # self.whiteboard.push_undo_stack() 
+                    
+                    # 应用更改
+                    target_item.set_points(new_points)
+                    target_item._smooth = smooth_fit
+                    target_item._update_path()
+            else:
+                # 预设级别
+                iterations = 0
+                if level == "低":
+                    iterations = 1
+                elif level == "中":
+                    iterations = 2
+                elif level == "高":
+                    iterations = 3
+                
+                if iterations > 0:
+                    new_points = chaikin_smooth(original_points, iterations)
+                    
+                # 简单模式下默认开启拟合平滑
+                target_item.set_points(new_points)
+                target_item._smooth = True
+                target_item._update_path()
+
+    def show_auto_close_dialog(self):
+        """显示曲线自动闭合对话框"""
+        # 获取选中项
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先选择要闭合的曲线")
+            return
+            
+        # 过滤EditablePathItem
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        if not target_items:
+            QMessageBox.warning(self, "提示", "所选对象不支持自动闭合")
+            return
+
+        # 弹出对话框
+        dlg = AutoCloseDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            tolerance, force_close = dlg.get_values()
+            
+            # 处理选中的曲线
+            count = 0
+            for item in target_items:
+                points = item.points()
+                if len(points) < 2:
+                    continue
+                    
+                start_pt = points[0]
+                end_pt = points[-1]
+                
+                # 计算首尾距离
+                import math
+                dist = math.hypot(end_pt[0] - start_pt[0], end_pt[1] - start_pt[1])
+                
+                closed = False
+                if dist <= tolerance:
+                    # 在容差范围内，直接闭合（将最后一个点设为第一个点，或连接首尾）
+                    # 对于Path来说，通常意味着首尾点重合
+                    # 如果已经是闭合的（points[0] == points[-1]），不需要处理
+                    if dist > 1e-9: # 不完全重合但小于容差
+                        # 移动终点到起点
+                        points[-1] = start_pt
+                        closed = True
+                elif force_close:
+                    # 强制闭合：添加一条线段回到起点
+                    # 设置直线闭合标志，让底层绘图逻辑知道最后一段应该画直线且保持尖角
+                    if getattr(item, '_smooth', False):
+                        item._straight_close = True
+                        
+                    points.append(start_pt)
+                    closed = True
+                
+                if closed:
+                    item.set_points(points)
+                    count += 1
+            
+            if count > 0:
+                self.show_status_message(f"已自动闭合 {count} 条曲线")
+            else:
+                self.show_status_message("没有曲线需要闭合")
+
+    def show_data_check_dialog(self):
+        """显示数据检查对话框"""
+        dlg = DataCheckDialog(self.whiteboard.canvas, self)
+        dlg.exec_()
+
+    def show_bitmap_process_dialog(self):
+        """显示位图处理对话框"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先选择一张图片")
+            return
+            
+        # 查找图片项 (QGraphicsPixmapItem)
+        target_item = None
+        for item in selected_items:
+            if isinstance(item, QtWidgets.QGraphicsPixmapItem):
+                target_item = item
+                break
+                
+        if not target_item:
+            QMessageBox.warning(self, "提示", "所选对象不是图片")
+            return
+            
+        dlg = BitmapProcessDialog(target_item, self)
+        if dlg.exec_() == QDialog.Accepted:
+            # 应用更改回画布
+            processed_img = dlg.get_processed_image()
+            
+            # Convert PIL Image back to QPixmap
+            if processed_img.mode == "RGB":
+                r, g, b = processed_img.split()
+                processed_img = Image.merge("RGB", (r, g, b))
+                fmt = QtGui.QImage.Format_RGB888
+            elif processed_img.mode == "RGBA":
+                r, g, b, a = processed_img.split()
+                processed_img = Image.merge("RGBA", (r, g, b, a))
+                fmt = QtGui.QImage.Format_ARGB32
+            elif processed_img.mode == "L":
+                processed_img = processed_img.convert("RGBA")
+                fmt = QtGui.QImage.Format_ARGB32
+            elif processed_img.mode == "1":
+                processed_img = processed_img.convert("RGBA")
+                fmt = QtGui.QImage.Format_ARGB32
+                
+            im_data = processed_img.tobytes("raw", "BGRA" if fmt == QtGui.QImage.Format_ARGB32 else "RGB")
+            qim = QtGui.QImage(im_data, processed_img.width, processed_img.height, fmt)
+            pix = QtGui.QPixmap.fromImage(qim)
+            
+            target_item.setPixmap(pix)
+            
+            # 处理提取的轮廓
+            if hasattr(dlg, 'extracted_contours') and dlg.extracted_contours:
+                img_pos = target_item.pos()
+                scale_x = target_item.transform().m11()
+                scale_y = target_item.transform().m22()
+                
+                # 转换轮廓坐标到场景坐标
+                scene_contours = []
+                for contour in dlg.extracted_contours:
+                    scene_pts = []
+                    for x, y in contour:
+                        # 转换：图片局部像素 -> 场景坐标
+                        # 图片可能被缩放和平移
+                        sx = x * scale_x + img_pos.x()
+                        sy = y * scale_y + img_pos.y()
+                        scene_pts.append((sx, sy))
+                    scene_contours.append(scene_pts)
+                
+                # 添加到画布
+                for pts in scene_contours:
+                    if len(pts) > 1:
+                        self.whiteboard.canvas.add_polyline(pts, color=QtGui.QColor(0, 0, 0)) # 黑色线条
+                        
+                self.show_status_message(f"已生成 {len(scene_contours)} 条轮廓路径")
+            
     def open_file(self):
         """打开RLD文件"""
         from my_io.RLD.init_rld import RLDFileHandler

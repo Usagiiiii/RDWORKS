@@ -5,7 +5,7 @@
 """
 
 from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent
 import math
 
@@ -17,6 +17,7 @@ class EditablePathItem(QGraphicsPathItem):
         self._handles = []
         self._color = color
         self._smooth = smooth
+        self._straight_close = False # 新增：是否使用直线强制闭合
         # 标记当前是否处于节点编辑模式
         self._node_edit_enabled = False
         self._update_path()
@@ -40,6 +41,21 @@ class EditablePathItem(QGraphicsPathItem):
                 path.lineTo(x, y)
         else:
             pts = [(float(x), float(y)) for (x, y) in self._points]
+            
+            # 检查是否开启了“直线闭合”模式
+            use_straight_close = getattr(self, '_straight_close', False)
+            closed_pt = None
+            
+            # 如果开启了直线闭合，且确实是闭合形状（首尾距离极小），
+            # 且点数足够多，则把最后一段单独处理
+            if use_straight_close and len(pts) > 2:
+                # 检查首尾是否重合
+                dx = pts[0][0] - pts[-1][0]
+                dy = pts[0][1] - pts[-1][1]
+                if math.hypot(dx, dy) < 1e-9:
+                    closed_pt = pts[-1]
+                    pts = pts[:-1] # 暂时移除闭合点，让前面的部分作为开口曲线绘制（保留尖角）
+            
             n = len(pts)
             if n == 2:
                 path.moveTo(pts[0][0], pts[0][1])
@@ -57,6 +73,11 @@ class EditablePathItem(QGraphicsPathItem):
                     cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
                     cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
                     path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
+            
+            # 如果之前分离了闭合点，现在用直线连接回去
+            if closed_pt:
+                path.lineTo(closed_pt[0], closed_pt[1])
+                
         self.setPath(path)
         pen = QPen(self._color)
         pen.setCosmetic(True)
@@ -249,6 +270,11 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         self._update_pen()
         self.setFlags(QGraphicsEllipseItem.ItemIsSelectable | QGraphicsEllipseItem.ItemIsMovable)
         
+        # 节点编辑相关
+        self._node_edit_enabled = False
+        self._handles = []
+        self._move_orig_rect = None
+        
     # 移除 type() 重写，避免潜在冲突，使用 isinstance 即可
 
     def setPen(self, pen):
@@ -267,6 +293,71 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         
     def color(self):
         return self._color
+
+    def enable_node_edit(self, on: bool):
+        """切换节点编辑模式"""
+        self._node_edit_enabled = bool(on)
+        if on:
+            self._rebuild_handles()
+        else:
+            self._clear_handles()
+            
+    def _clear_handles(self):
+        for h in self._handles:
+            if h.scene():
+                h.scene().removeItem(h)
+            h.setParentItem(None)
+        self._handles.clear()
+        
+    def _rebuild_handles(self):
+        self._clear_handles()
+        rect = self.rect()
+        # 创建4个控制点：上、下、左、右
+        # 索引定义：0:Top, 1:Right, 2:Bottom, 3:Left
+        # 注意：这里我们使用本地坐标，因为句柄作为子项
+        
+        # Top
+        self._handles.append(_EllipseHandle(self, 0, rect.center().x(), rect.top()))
+        # Right
+        self._handles.append(_EllipseHandle(self, 1, rect.right(), rect.center().y()))
+        # Bottom
+        self._handles.append(_EllipseHandle(self, 2, rect.center().x(), rect.bottom()))
+        # Left
+        self._handles.append(_EllipseHandle(self, 3, rect.left(), rect.center().y()))
+        
+    def update_handle(self, idx: int, x: float, y: float):
+        """更新椭圆形状根据句柄移动"""
+        rect = self.rect()
+        new_rect = QRectF(rect)
+        
+        if idx == 0: # Top
+            new_rect.setTop(y)
+        elif idx == 1: # Right
+            new_rect.setRight(x)
+        elif idx == 2: # Bottom
+            new_rect.setBottom(y)
+        elif idx == 3: # Left
+            new_rect.setLeft(x)
+            
+        # 保持有效的矩形
+        if new_rect.width() < 1e-3: new_rect.setWidth(1e-3)
+        if new_rect.height() < 1e-3: new_rect.setHeight(1e-3)
+            
+        self.setRect(new_rect.normalized())
+        # 更新其他句柄位置
+        self._update_handles_positions()
+        
+    def _update_handles_positions(self):
+        if not self._handles: return
+        rect = self.rect()
+        # Top
+        self._handles[0].setPos(rect.center().x(), rect.top())
+        # Right
+        self._handles[1].setPos(rect.right(), rect.center().y())
+        # Bottom
+        self._handles[2].setPos(rect.center().x(), rect.bottom())
+        # Left
+        self._handles[3].setPos(rect.left(), rect.center().y())
 
     # 移除 points 方法，避免潜在的递归或性能问题
     # GCodeExporter 已更新为不依赖此方法
@@ -297,3 +388,50 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         scale_y = math.sqrt(transform.m21()**2 + transform.m22()**2)
         
         return cx, cy, rx * scale_x, ry * scale_y
+
+class _EllipseHandle(QGraphicsEllipseItem):
+    def __init__(self, owner: EditableEllipseItem, idx: int, x: float, y: float):
+        r = 3.5
+        super().__init__(-r, -r, 2 * r, 2 * r, parent=owner)
+        self._owner = owner
+        self._idx = idx
+        pen = QPen(QColor(255, 100, 0)) # 橙色区分
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QBrush(QColor(255, 100, 0, 120)))
+        self.setZValue(10)
+        self.setFlags(QGraphicsEllipseItem.ItemIsSelectable)
+        
+        # 设置光标
+        if idx in (0, 2): # Top, Bottom
+            self.setCursor(Qt.SizeVerCursor)
+        elif idx in (1, 3): # Right, Left
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.setCursor(Qt.SizeAllCursor)
+            
+        self.setPos(x, y)
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        # 获取本地坐标 (因为是子项，mapToParent 即 mapToOwner)
+        pos = self.mapToParent(e.pos())
+        x, y = pos.x(), pos.y()
+        self._owner.update_handle(self._idx, x, y)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        try:
+            self._orig_rect = self._owner.rect()
+        except Exception:
+            self._orig_rect = None
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        try:
+            new_rect = self._owner.rect()
+            old_rect = getattr(self, '_orig_rect', None)
+            if old_rect is not None and new_rect != old_rect:
+                # 记录撤销逻辑（暂时跳过复杂 Command 实现）
+                pass
+        except Exception:
+            pass
+        event.accept()
