@@ -749,6 +749,10 @@ class GridCanvas(QGraphicsView):
         self._measuring_start = None  # QPointF
         self._measuring_current = None # QPointF
 
+        # Panning state
+        self._panning = False
+        self._pan_start_pos = QPoint()
+
         # "Background" -> The entire drawing area (View Background).
         self.color_background = QColor("white") 
         # "Workspace" -> The canvas boundary (Rectangle Border).
@@ -1261,8 +1265,10 @@ class GridCanvas(QGraphicsView):
 
         # 设置拖动模式和交互模式
         if t == self.Tool.PAN:
-            self.setDragMode(QGraphicsView.ScrollHandDrag)
-            self.setInteractive(False)  # 禁用与图形项的交互（解决平移时误选误动图形的问题）
+            # Custom panning implementation to allow panning even if fits in view
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setInteractive(True)  # Enable interactive to receive mouse events, but handled manually
+            self.viewport().setCursor(Qt.OpenHandCursor)
             
         elif t in (self.Tool.SELECT, self.Tool.NODE_EDIT):
             # 选择和节点编辑模式，启用框选和交互
@@ -1707,21 +1713,9 @@ class GridCanvas(QGraphicsView):
             img_x = scene_center_x - new_width_mm / 2
             img_y = scene_center_y - new_height_mm / 2
 
-        # ========== 3. 添加图片到画布（以灰度显示） ==========
-        # 将缩放后的 QPixmap 转为灰度 QImage，再转回 QPixmap 以显示为灰度图
-        try:
-            qim = scaled_pixmap.toImage()
-            gray = qim.convertToFormat(QImage.Format_Grayscale8)
-            # 保留 alpha 通道（如果存在）
-            try:
-                if qim.hasAlphaChannel():
-                    alpha = qim.alphaChannel()
-                    gray.setAlphaChannel(alpha)
-            except Exception:
-                pass
-            disp_pix = QPixmap.fromImage(gray)
-        except Exception:
-            disp_pix = scaled_pixmap
+        # ========== 3. 添加图片到画布 ==========
+        # 修复：不再强制转为灰度图显示，保持原色
+        disp_pix = scaled_pixmap
 
         item = QGraphicsPixmapItem(disp_pix)
         # 设置图片位置（精确居中）
@@ -2151,6 +2145,15 @@ class GridCanvas(QGraphicsView):
                 pass
 
     def mouseMoveEvent(self, e: QMouseEvent):
+        # Handle Custom Pan
+        if self._tool == self.Tool.PAN and self._panning:
+            delta = e.pos() - self._pan_start_pos
+            self._pan_start_pos = e.pos()
+            self.setTransformationAnchor(QGraphicsView.NoAnchor)
+            self.translate(delta.x(), delta.y())
+            self._emit_view_changed()
+            return
+
         pos = self.mapToScene(e.pos())
         
         # 始终发送坐标信号，确保坐标信息一直显示
@@ -2474,6 +2477,14 @@ class GridCanvas(QGraphicsView):
              new_modifiers = (e.modifiers() & ~Qt.ShiftModifier) | Qt.ControlModifier
              e = QMouseEvent(e.type(), e.localPos(), e.windowPos(), e.screenPos(),
                              e.button(), e.buttons(), new_modifiers, e.source())
+
+        # Handle Custom Pan
+        if self._tool == self.Tool.PAN and e.button() == Qt.LeftButton:
+            self._panning = True
+            self._pan_start_pos = e.pos()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
 
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
@@ -2804,6 +2815,13 @@ class GridCanvas(QGraphicsView):
             item.setTransform(transform)
 
     def mouseReleaseEvent(self, e: QMouseEvent):
+        # Handle Custom Pan
+        if self._tool == self.Tool.PAN and self._panning:
+            self._panning = False
+            self.viewport().setCursor(Qt.OpenHandCursor)
+            e.accept()
+            return
+
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
 

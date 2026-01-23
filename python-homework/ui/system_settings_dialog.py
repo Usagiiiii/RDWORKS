@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QSize, QEvent
 from PyQt5.QtGui import QIcon, QColor
+from ui.import_advanced_dialog import AdvancedImportDialog
 
 class CustomColorDialog(QColorDialog):
     def __init__(self, initial=Qt.white, parent=None, title="Color"):
@@ -171,6 +172,10 @@ class SystemSettingsDialog(QDialog):
         self.setWindowTitle("参数设置")
         self.resize(780, 580)
         self.init_ui()
+
+    def on_imp_adv_clicked(self):
+        dlg = AdvancedImportDialog(self)
+        dlg.exec_()
 
     def init_ui(self):
         # Main Layout
@@ -913,6 +918,7 @@ class SystemSettingsDialog(QDialog):
         self.btn_imp_adv = QPushButton("...")
         self.chk_imp_adv.toggled.connect(self.btn_imp_adv.setEnabled)
         self.btn_imp_adv.setEnabled(False)
+        self.btn_imp_adv.clicked.connect(self.on_imp_adv_clicked)
         gl_handle.addWidget(self.chk_imp_adv, 4, 0)
         gl_handle.addWidget(self.btn_imp_adv, 4, 2)
         
