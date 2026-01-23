@@ -14,11 +14,24 @@ from utils.tool_utils import _check_conversion_tool
 logger = logging.getLogger(__name__)
 
 def pil_to_qpixmap(im: Image.Image) -> QPixmap:
-    """将PIL图像转换为QPixmap"""
-    im = im.convert("RGBA")
-    w, h = im.size
-    data = im.tobytes("raw", "RGBA")
-    qimg = QImage(data, w, h, w * 4, QImage.Format_RGBA8888)
+    """将PIL图像转换为QPixmap，修正后的版本支持多种模式，避免强制 RGBA 导致颜色失真"""
+    if im.mode == "RGB":
+        data = im.tobytes("raw", "RGB")
+        qimg = QImage(data, im.size[0], im.size[1], im.size[0] * 3, QImage.Format_RGB888)
+    elif im.mode == "RGBA":
+        data = im.tobytes("raw", "BGRA") # QImage Format_ARGB32 expects BGRA on little endian
+        qimg = QImage(data, im.size[0], im.size[1], im.size[0] * 4, QImage.Format_ARGB32)
+    elif im.mode == "L":
+        data = im.tobytes("raw", "L")
+        qimg = QImage(data, im.size[0], im.size[1], im.size[0], QImage.Format_Grayscale8)
+    else:
+        # Fallback to RGBA for other formats
+        im = im.convert("RGBA")
+        data = im.tobytes("raw", "BGRA")
+        qimg = QImage(data, im.size[0], im.size[1], im.size[0] * 4, QImage.Format_ARGB32)
+    
+    # Copy to ensure data persistence
+    qimg = qimg.copy()
     return QPixmap.fromImage(qimg)
 # ---- 工具函数：QImage -> PIL.Image（用于导出时从画布取图像） -------------------
 def qimage_to_pil(qimg: QtGui.QImage) -> Image.Image:

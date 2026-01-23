@@ -1,14 +1,39 @@
+import os
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QLabel, QCheckBox, QLineEdit, QGroupBox, QPushButton, 
                              QRadioButton, QButtonGroup, QWidget)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QIcon
+
+class ImageToggleButton(QPushButton):
+    def __init__(self, img_path1, img_path2, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.img1 = img_path1
+        self.img2 = img_path2
+        # Set initial icon
+        self.update_icon()
+        self.toggled.connect(self.update_icon)
+        self.setFixedSize(50, 30)
+        self.setIconSize(QSize(40, 25))
+
+    def update_icon(self, checked=None):
+        if self.isChecked():
+            if os.path.exists(self.img2):
+                self.setIcon(QIcon(self.img2))
+            else:
+                self.setText("State 2")
+        else:
+            if os.path.exists(self.img1):
+                self.setIcon(QIcon(self.img1))
+            else:
+                self.setText("State 1")
 
 class ExtensionDialog(QDialog):
     def __init__(self, parent=None, initial_data=None):
         super().__init__(parent)
         self.setWindowTitle("扩展")
-        self.setFixedSize(300, 350)
+        self.setFixedSize(360, 350)
         self.initial_data = initial_data or {}
         self.setup_ui()
         self.load_data()
@@ -28,11 +53,9 @@ class ExtensionDialog(QDialog):
         self.edit_y_count.setText(str(data.get("y_count", "1")))
         self.edit_y_spacing.setText(str(data.get("y_spacing", "0")))
         
-        direction = data.get("direction", "x_priority")
-        if direction == "x_priority":
-            self.btn_dir_x.setChecked(True)
-        else:
-            self.btn_dir_y.setChecked(True)
+        # Load button states if saved
+        self.btn_x_type.setChecked(data.get("x_type_state", False))
+        self.btn_y_type.setChecked(data.get("y_type_state", False))
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -63,11 +86,21 @@ class ExtensionDialog(QDialog):
         array_layout.addWidget(QLabel("个数"), 0, 1)
         array_layout.addWidget(QLabel("间隔"), 0, 2)
         
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
         # Row X
         self.lbl_x = QLabel("X:")
         self.lbl_x.setStyleSheet("color: blue")
         self.edit_x_count = QLineEdit("1")
         self.edit_x_spacing = QLineEdit("10")
+        
+        # Button 1 for X row (11.png / 12.png)
+        img11 = os.path.join(base_path, "11.png")
+        img12 = os.path.join(base_path, "12.png")
+        self.btn_x_type = ImageToggleButton(img11, img12)
+        # Adjust size to match screenshot 1 style (more square, side-by-side)
+        self.btn_x_type.setFixedSize(38, 38)
+        self.btn_x_type.setIconSize(QSize(32, 32))
         
         array_layout.addWidget(self.lbl_x, 1, 0)
         array_layout.addWidget(self.edit_x_count, 1, 1)
@@ -79,46 +112,22 @@ class ExtensionDialog(QDialog):
         self.edit_y_count = QLineEdit("1")
         self.edit_y_spacing = QLineEdit("10")
         
+        # Button 2 for Y row (13.png / 14.png)
+        img13 = os.path.join(base_path, "13.png")
+        img14 = os.path.join(base_path, "14.png")
+        self.btn_y_type = ImageToggleButton(img13, img14)
+        self.btn_y_type.setFixedSize(38, 38)
+        self.btn_y_type.setIconSize(QSize(32, 32))
+
         array_layout.addWidget(self.lbl_y, 2, 0)
         array_layout.addWidget(self.edit_y_count, 2, 1)
         array_layout.addWidget(self.edit_y_spacing, 2, 2)
         
-        # Direction Buttons (Icons simulated with text/style for now, or custom paint)
-        # 1. X Priority (Vertical bars, green arrow right)
-        # 2. Y Priority / Snake (Horizontal bars, blue arrows)
-        
-        # Since we don't have the exact icons, we will create simple push buttons 
-        # that toggle state, or use radio buttons styled as icons. 
-        # For simplicity, let's make them buttons that look checkable.
-        
-        btn_layout = QVBoxLayout()
-        self.btn_dir_x = QPushButton()
-        self.btn_dir_x.setCheckable(True)
-        self.btn_dir_x.setChecked(True)
-        self.btn_dir_x.setFixedSize(40, 30)
-        # Custom painting or stylesheet to simulate the icon simply
-        self.btn_dir_x.setStyleSheet("""
-            QPushButton { background-color: #f0f0f0; border: 1px solid #999; }
-            QPushButton:checked { background-color: #ddd; border: 2px solid #555; }
-        """)
-        # We can set an icon if we had one, or text "||->"
-        self.btn_dir_x.setText("|||->") 
-
-        self.btn_dir_y = QPushButton()
-        self.btn_dir_y.setCheckable(True)
-        self.btn_dir_y.setFixedSize(40, 30)
-        self.btn_dir_y.setStyleSheet(self.btn_dir_x.styleSheet())
-        self.btn_dir_y.setText("==\nv")
-        
-        # Exclusive check
-        self.btn_group = QButtonGroup(self)
-        self.btn_group.addButton(self.btn_dir_x)
-        self.btn_group.addButton(self.btn_dir_y)
-        
-        btn_layout.addWidget(self.btn_dir_x)
-        btn_layout.addWidget(self.btn_dir_y)
-        
-        array_layout.addLayout(btn_layout, 1, 3, 2, 1)
+        # Add buttons to the right, spanning 2 rows
+        # Btn X at Col 3
+        array_layout.addWidget(self.btn_x_type, 1, 3, 2, 1, Qt.AlignHCenter)
+        # Btn Y at Col 4
+        array_layout.addWidget(self.btn_y_type, 1, 4, 2, 1, Qt.AlignHCenter)
         
         main_layout.addWidget(self.group_array)
         
@@ -151,5 +160,6 @@ class ExtensionDialog(QDialog):
             "x_spacing": self.edit_x_spacing.text(),
             "y_count": self.edit_y_count.text(),
             "y_spacing": self.edit_y_spacing.text(),
-            "direction": "x_priority" if self.btn_dir_x.isChecked() else "y_priority" # Simply mapping
+            "x_type_state": self.btn_x_type.isChecked(),
+            "y_type_state": self.btn_y_type.isChecked()
         }

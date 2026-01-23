@@ -79,73 +79,73 @@ class EditablePathItem(QGraphicsPathItem):
             
             # 检查是否开启了“直线闭合”模式
             use_straight_close = getattr(self, '_straight_close', False)
-closed_pt = None
-original_pts = pts.copy()  # 保存原始点集，用于后续恢复
+            closed_pt = None
+            original_pts = pts.copy()  # 保存原始点集，用于后续恢复
 
-# 如果开启了直线闭合，且确实是闭合形状（首尾距离极小），且点数足够多
-if use_straight_close and len(pts) > 2:
-    # 检查首尾是否重合（距离小于极小值）
-    dx = pts[0][0] - pts[-1][0]
-    dy = pts[0][1] - pts[-1][1]
-    if math.hypot(dx, dy) < 1e-9:
-        closed_pt = pts[-1]
-        pts = pts[:-1]  # 暂时移除闭合点，保留尖角
-        
-        # 适配点集变化：同步更新分段相关属性（避免索引错位）
-        if hasattr(self, '_segment_types') and len(self._segment_types) > 0:
-            self._segment_types = self._segment_types[:-1]  # 分段数减少1
-        if hasattr(self, '_control_points') and len(self._control_points) > 0:
-            # 移除最后一个分段的自定义控制点（仅保留有效索引）
-            self._control_points = {k: v for k, v in self._control_points.items() if k < len(pts)-1}
+            # 如果开启了直线闭合，且确实是闭合形状（首尾距离极小），且点数足够多
+            if use_straight_close and len(pts) > 2:
+                # 检查首尾是否重合（距离小于极小值）
+                dx = pts[0][0] - pts[-1][0]
+                dy = pts[0][1] - pts[-1][1]
+                if math.hypot(dx, dy) < 1e-9:
+                    closed_pt = pts[-1]
+                    pts = pts[:-1]  # 暂时移除闭合点，保留尖角
+                    
+                    # 适配点集变化：同步更新分段相关属性（避免索引错位）
+                    if hasattr(self, '_segment_types') and len(self._segment_types) > 0:
+                        self._segment_types = self._segment_types[:-1]  # 分段数减少1
+                    if hasattr(self, '_control_points') and len(self._control_points) > 0:
+                        # 移除最后一个分段的自定义控制点（仅保留有效索引）
+                        self._control_points = {k: v for k, v in self._control_points.items() if k < len(pts)-1}
 
-# ====================== 保留右侧核心：分段类型控制 ======================
-if len(pts) < 2:
-    # 点数不足，无法绘制（边界保护）
-    pass
-else:
-    path.moveTo(pts[0][0], pts[0][1])
-    # Catmull-Rom 扩展点（兼容分段遍历，统一索引逻辑）
-    ext = [pts[0]] + pts + [pts[-1]]
-    # 统一分段数：点数-1（n个点对应n-1个分段），兼容target_len
-    target_len = len(pts) - 1
+            # ====================== 保留右侧核心：分段类型控制 ======================
+            if len(pts) < 2:
+                # 点数不足，无法绘制（边界保护）
+                pass
+            else:
+                path.moveTo(pts[0][0], pts[0][1])
+                # Catmull-Rom 扩展点（兼容分段遍历，统一索引逻辑）
+                ext = [pts[0]] + pts + [pts[-1]]
+                # 统一分段数：点数-1（n个点对应n-1个分段），兼容target_len
+                target_len = len(pts) - 1
 
-    for i in range(target_len):
-        # 1. 获取当前分段类型（兼容边界：避免索引越界）
-        is_curve = True  # 默认是曲线
-        if hasattr(self, '_segment_types') and i < len(self._segment_types):
-            is_curve = self._segment_types[i]
-        
-        if not is_curve:
-            # 分段类型：直线段
-            path.lineTo(pts[i+1][0], pts[i+1][1])
-        
-        elif hasattr(self, '_control_points') and i in self._control_points:
-            # 分段类型：自定义贝塞尔曲线（显式控制点）
-            cp1, cp2 = self._control_points[i]
-            path.cubicTo(cp1[0], cp1[1], cp2[0], cp2[1], pts[i+1][0], pts[i+1][1])
-        
-        else:
-            # 分段类型：自动 Catmull-Rom 曲线（兜底逻辑）
-            # 索引保护：避免ext越界（核心修复冲突点）
-            p0 = ext[i] if i < len(ext) else pts[i]
-            p1 = ext[i+1] if (i+1) < len(ext) else pts[i]
-            p2 = ext[i+2] if (i+2) < len(ext) else pts[i+1]
-            p3 = ext[i+3] if (i+3) < len(ext) else pts[i+1]
-            
-            # Catmull-Rom 转贝塞尔曲线的核心计算（保留原公式）
-            cp1x = p1[0] + (p2[0] - p0[0]) / 6.0
-            cp1y = p1[1] + (p2[1] - p0[1]) / 6.0
-            cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
-            cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
-            
-            path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
+                for i in range(target_len):
+                    # 1. 获取当前分段类型（兼容边界：避免索引越界）
+                    is_curve = True  # 默认是曲线
+                    if hasattr(self, '_segment_types') and i < len(self._segment_types):
+                        is_curve = self._segment_types[i]
+                    
+                    if not is_curve:
+                        # 分段类型：直线段
+                        path.lineTo(pts[i+1][0], pts[i+1][1])
+                    
+                    elif hasattr(self, '_control_points') and i in self._control_points:
+                        # 分段类型：自定义贝塞尔曲线（显式控制点）
+                        cp1, cp2 = self._control_points[i]
+                        path.cubicTo(cp1[0], cp1[1], cp2[0], cp2[1], pts[i+1][0], pts[i+1][1])
+                    
+                    else:
+                        # 分段类型：自动 Catmull-Rom 曲线（兜底逻辑）
+                        # 索引保护：避免ext越界（核心修复冲突点）
+                        p0 = ext[i] if i < len(ext) else pts[i]
+                        p1 = ext[i+1] if (i+1) < len(ext) else pts[i]
+                        p2 = ext[i+2] if (i+2) < len(ext) else pts[i+1]
+                        p3 = ext[i+3] if (i+3) < len(ext) else pts[i+1]
+                        
+                        # Catmull-Rom 转贝塞尔曲线的核心计算（保留原公式）
+                        cp1x = p1[0] + (p2[0] - p0[0]) / 6.0
+                        cp1y = p1[1] + (p2[1] - p0[1]) / 6.0
+                        cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
+                        cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
+                        
+                        path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1])
 
-# ====================== 保留左侧核心：直线闭合处理 ======================
-if closed_pt:
-    # 用直线连接回闭合点，完成闭合（保留尖角）
-    path.lineTo(closed_pt[0], closed_pt[1])
-    # 恢复原始点集（避免影响后续逻辑）
-    pts = original_pts
+            # ====================== 保留左侧核心：直线闭合处理 ======================
+            if closed_pt:
+                # 用直线连接回闭合点，完成闭合（保留尖角）
+                path.lineTo(closed_pt[0], closed_pt[1])
+                # 恢复原始点集（避免影响后续逻辑）
+                pts = original_pts
 
         self.setPath(path)
         
@@ -1049,24 +1049,24 @@ class EditableEllipseItem(QGraphicsEllipseItem):
 
         
     def _rebuild_handles(self):
-    self._clear_handles()
-    rect = self.rect()
-    c = rect.center()
-    rx = rect.width() / 2
-    ry = rect.height() / 2
-    
-    # 保留右侧：通过中心+半径计算句柄坐标（逻辑更严谨）
-    pts = [
-        QPointF(c.x(), c.y() - ry), # Top
-        QPointF(c.x() + rx, c.y()), # Right
-        QPointF(c.x(), c.y() + ry), # Bottom
-        QPointF(c.x() - rx, c.y())  # Left
-    ]
-    
-    # 统一句柄类：优先用 _DragHandle（右侧），若项目中是 _EllipseHandle 可替换
-    for idx, pt in enumerate(pts):
-        h = _DragHandle(self, idx, pt.x(), pt.y())
-        self._handles.append(h)
+        self._clear_handles()
+        rect = self.rect()
+        c = rect.center()
+        rx = rect.width() / 2
+        ry = rect.height() / 2
+        
+        # 保留右侧：通过中心+半径计算句柄坐标（逻辑更严谨）
+        pts = [
+            QPointF(c.x(), c.y() - ry), # Top
+            QPointF(c.x() + rx, c.y()), # Right
+            QPointF(c.x(), c.y() + ry), # Bottom
+            QPointF(c.x() - rx, c.y())  # Left
+        ]
+        
+        # 统一句柄类：优先用 _DragHandle（右侧），若项目中是 _EllipseHandle 可替换
+        for idx, pt in enumerate(pts):
+            h = _DragHandle(self, idx, pt.x(), pt.y())
+            self._handles.append(h)
 
 def _update_handles_positions(self):
     if not self._handles: return
