@@ -626,8 +626,6 @@ class ChangeColorCommand(QUndoCommand):
             except Exception:
                 pass
         self.canvas.scene.update()
-
-
 class BreakCurveCommand(Command):
     """打断曲线命令"""
     def __init__(self, canvas, original_item, data1, data2):
@@ -789,5 +787,35 @@ class SmoothItemCommand(Command):
         self.item.set_path_data(self.old_data)
         self.item._smooth = self.old_smooth
         self.item._update_path()
+        if getattr(self.item, '_node_edit_enabled', False):
+            self.item._rebuild_handles()
 
-
+class FilletCommand(Command):
+    """Command for applying fillet to path"""
+    def __init__(self, item, old_points, new_points):
+        self.item = item
+        self.old_points = old_points
+        self.new_points = new_points
+        self.old_data = item.get_path_data()
+        self.desc = "倒圆角"
+    
+    def redo(self):
+        """应用倒圆角"""
+        self.item.set_points(self.new_points)
+        # 更新段类型（倒圆角后可能需要重新计算）
+        count = len(self.new_points)
+        seg_len = max(0, count - 1)
+        # 保持原有的段类型设置，或者设置为直线段
+        self.item._segment_types = [0] * seg_len  # 0表示直线段
+        # 清除控制点
+        self.item._control_points = {}
+        self.item._update_path()
+        if getattr(self.item, '_node_edit_enabled', False):
+            self.item._rebuild_handles()
+    
+    def undo(self):
+        """撤销倒圆角"""
+        self.item.set_path_data(self.old_data)
+        self.item._update_path()
+        if getattr(self.item, '_node_edit_enabled', False):
+            self.item._rebuild_handles()

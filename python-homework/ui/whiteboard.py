@@ -1339,28 +1339,6 @@ class GridCanvas(QGraphicsView):
             "area": settings.get("log_area", ""),
             "path": settings.get("log_path", "")
         }
-        
-        # User Definition Mapping:
-        # "Background" -> The entire drawing area base color.
-        # "Workspace" -> The canvas boundary (Rectangle Border).
-        # "Grid" -> Grid lines.
-
-        # 1. Background (View Background)
-        bg = settings.get("color_background")
-        if isinstance(bg, QColor) and bg.isValid():
-            self.color_background = bg
-        
-        # 2. Workspace (Border Color)
-        wk = settings.get("color_workspace")
-        if isinstance(wk, QColor) and wk.isValid():
-            self.color_workspace = wk
-            
-        # 3. Grid
-        gd = settings.get("color_grid")
-        if isinstance(gd, QColor) and gd.isValid():
-            self.color_grid = gd
-        
-        self._draw_workarea()
 
     def get_interface_settings(self):
         """Get current settings"""

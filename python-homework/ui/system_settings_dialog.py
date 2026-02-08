@@ -6,11 +6,109 @@ from PyQt5.QtWidgets import (
     QWidget, QGroupBox, QLabel, QLineEdit, QCheckBox, QComboBox,
     QRadioButton, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QGridLayout, QFormLayout, QFrame, QButtonGroup, QAbstractItemView,
-    QColorDialog, QFileDialog
+    QColorDialog, QFileDialog, QMessageBox
 )
 from PyQt5.QtCore import Qt, QSize, QEvent
 from PyQt5.QtGui import QIcon, QColor
 from ui.import_advanced_dialog import AdvancedImportDialog
+
+class ScanBacklashInputDialog(QDialog):
+    """扫描反向间隙输入对话框"""
+    def __init__(self, parent=None, speed="0", backlash="0", offset="0"):
+        super().__init__(parent)
+        self.setWindowTitle("扫描(反向间隙)")
+        self.setModal(True)
+        self.resize(300, 150)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # 速度输入
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel("速度(mm/s):"))
+        self.speed_edit = QLineEdit(speed)
+        self.speed_edit.setAlignment(Qt.AlignRight)
+        self.speed_edit.setMinimumWidth(150)
+        speed_layout.addWidget(self.speed_edit)
+        speed_layout.addStretch()
+        layout.addLayout(speed_layout)
+        
+        # 反向间隙输入
+        backlash_layout = QHBoxLayout()
+        backlash_layout.addWidget(QLabel("反向间隙:"))
+        self.backlash_edit = QLineEdit(backlash)
+        self.backlash_edit.setAlignment(Qt.AlignRight)
+        self.backlash_edit.setMinimumWidth(150)
+        backlash_layout.addWidget(self.backlash_edit)
+        backlash_layout.addStretch()
+        layout.addLayout(backlash_layout)
+        
+        # 偏移补偿输入
+        offset_layout = QHBoxLayout()
+        offset_layout.addWidget(QLabel("偏移补偿:"))
+        self.offset_edit = QLineEdit(offset)
+        self.offset_edit.setAlignment(Qt.AlignRight)
+        self.offset_edit.setMinimumWidth(150)
+        offset_layout.addWidget(self.offset_edit)
+        offset_layout.addStretch()
+        layout.addLayout(offset_layout)
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        btn_ok.clicked.connect(self.validate_and_accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+    
+    def validate_and_accept(self):
+        """验证输入并接受"""
+        # 验证速度值
+        speed_str = self.speed_edit.text().strip()
+        if not speed_str:
+            QMessageBox.warning(self, "错误", "请输入速度值")
+            return
+        
+        try:
+            speed_val = float(speed_str)
+            if speed_val < 0:
+                QMessageBox.warning(self, "错误", "速度值不能为负数")
+                return
+        except ValueError:
+            QMessageBox.warning(self, "错误", "速度值格式错误，请输入数字")
+            return
+        
+        # 验证反向间隙值
+        backlash_str = self.backlash_edit.text().strip()
+        if backlash_str:
+            try:
+                float(backlash_str)
+            except ValueError:
+                QMessageBox.warning(self, "错误", "反向间隙值格式错误，请输入数字")
+                return
+        
+        # 验证偏移补偿值
+        offset_str = self.offset_edit.text().strip()
+        if offset_str:
+            try:
+                float(offset_str)
+            except ValueError:
+                QMessageBox.warning(self, "错误", "偏移补偿值格式错误，请输入数字")
+                return
+        
+        self.accept()
+    
+    def get_values(self):
+        """获取输入的值"""
+        return {
+            'speed': self.speed_edit.text().strip(),
+            'backlash': self.backlash_edit.text().strip(),
+            'offset': self.offset_edit.text().strip()
+        }
 
 class CustomColorDialog(QColorDialog):
     def __init__(self, initial=Qt.white, parent=None, title="Color"):
@@ -338,6 +436,68 @@ class SystemSettingsDialog(QDialog):
                      
                      wb.canvas.export_settings = exp_settings
 
+                # Update Optimize Settings (including gap compensation)
+                if hasattr(self, 'chk_gap_compensation'):
+                    if not hasattr(wb.canvas, 'optimize_settings'):
+                        wb.canvas.optimize_settings = {}
+                    wb.canvas.optimize_settings['gap_compensation'] = self.chk_gap_compensation.isChecked()
+
+                # Update Scan Backlash Settings
+                if hasattr(self, 'chk_scan_backlash'):
+                    if not hasattr(wb.canvas, 'optimize_settings'):
+                        wb.canvas.optimize_settings = {}
+                    
+                    scan_backlash_config = {
+                        'enabled': self.chk_scan_backlash.isChecked(),
+                        'axis': 'X' if self.scan_backlash_rb_x.isChecked() else 'Y',
+                        'table_data': []
+                    }
+                    
+                    # 读取表格数据并验证
+                    table = self.scan_backlash_table
+                    table_data_list = []
+                    speeds_seen = set()
+                    
+                    for row in range(table.rowCount()):
+                        speed_item = table.item(row, 0)
+                        backlash_item = table.item(row, 1)
+                        offset_item = table.item(row, 2)
+                        
+                        if speed_item:
+                            try:
+                                speed = float(speed_item.text().strip() or 0)
+                                backlash = float(backlash_item.text().strip() or 0) if backlash_item else 0.0
+                                offset = float(offset_item.text().strip() or 0) if offset_item else 0.0
+                                
+                                # 验证速度值
+                                if speed < 0:
+                                    print(f"警告: 第 {row + 1} 行的速度值为负数，已跳过")
+                                    continue
+                                
+                                # 检查速度重复
+                                if speed in speeds_seen:
+                                    print(f"警告: 第 {row + 1} 行的速度值 {speed} 重复，已跳过")
+                                    continue
+                                
+                                speeds_seen.add(speed)
+                                
+                                # 只保存速度大于0的行
+                                if speed > 0:
+                                    table_data_list.append({
+                                        'speed': speed,
+                                        'backlash': backlash,
+                                        'offset': offset
+                                    })
+                            except ValueError as e:
+                                print(f"警告: 第 {row + 1} 行的数据格式错误: {e}")
+                                continue
+                    
+                    # 按速度排序
+                    table_data_list.sort(key=lambda x: x['speed'])
+                    scan_backlash_config['table_data'] = table_data_list
+                    
+                    wb.canvas.optimize_settings['scan_backlash'] = scan_backlash_config
+
         except Exception as e:
             print(f"Error saving page settings: {e}")
         super().accept()
@@ -643,6 +803,18 @@ class SystemSettingsDialog(QDialog):
         
         chk_resonance.toggled.connect(res_widget.setEnabled)
         
+        # 间隙补偿优化
+        chk_gap_compensation = QCheckBox("间隙补偿优化")
+        # 加载已保存的设置
+        try:
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                canvas = self.parent().whiteboard.canvas
+                if hasattr(canvas, 'optimize_settings') and 'gap_compensation' in canvas.optimize_settings:
+                    chk_gap_compensation.setChecked(canvas.optimize_settings['gap_compensation'])
+        except Exception:
+            pass
+        grid_cut.addWidget(chk_gap_compensation, 2, 0)
+        
         left_layout.addLayout(grid_cut)
         left_layout.addStretch()
 
@@ -667,7 +839,19 @@ class SystemSettingsDialog(QDialog):
         
         right_layout.addWidget(QCheckBox("启用主板补偿方式"))
         
+        # 扫描(反向间隙)
         chk_scan_backlash = QCheckBox("扫描(反向间隙)")
+        
+        # 加载已保存的设置
+        try:
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                canvas = self.parent().whiteboard.canvas
+                if hasattr(canvas, 'optimize_settings') and 'scan_backlash' in canvas.optimize_settings:
+                    config = canvas.optimize_settings['scan_backlash']
+                    chk_scan_backlash.setChecked(config.get('enabled', False))
+        except Exception:
+            pass
+        
         right_layout.addWidget(chk_scan_backlash)
         
         # Container for backlash settings to enable/disable
@@ -678,31 +862,297 @@ class SystemSettingsDialog(QDialog):
         # X/Y Radio
         hbox_xy = QHBoxLayout()
         rb_x = QRadioButton("X")
-        rb_x.setChecked(True)
+        rb_y = QRadioButton("Y")
+        
+        # 加载已保存的轴选择
+        try:
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                canvas = self.parent().whiteboard.canvas
+                if hasattr(canvas, 'optimize_settings') and 'scan_backlash' in canvas.optimize_settings:
+                    config = canvas.optimize_settings['scan_backlash']
+                    axis = config.get('axis', 'X')
+                    if axis == 'Y':
+                        rb_y.setChecked(True)
+                    else:
+                        rb_x.setChecked(True)
+                else:
+                    rb_x.setChecked(True)
+        except Exception:
+            rb_x.setChecked(True)
+        
         hbox_xy.addWidget(rb_x)
-        hbox_xy.addWidget(QRadioButton("Y"))
+        hbox_xy.addWidget(rb_y)
         hbox_xy.addStretch()
         backlash_layout.addLayout(hbox_xy)
         
         # Scan Table
-        table_scan = QTableWidget(5, 3)
+        table_scan = QTableWidget(0, 3)
         table_scan.setHorizontalHeaderLabels(["速度(mm/s)", "反向间隙(mm)", "偏移补偿"])
         table_scan.verticalHeader().setVisible(False)
+        table_scan.setAlternatingRowColors(True)
+        table_scan.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table_scan.setSelectionMode(QAbstractItemView.SingleSelection)
+        table_scan.setEditTriggers(QAbstractItemView.NoEditTriggers)  # 禁止直接编辑，通过对话框编辑
+        table_scan.setMinimumHeight(150)
+        
+        # 设置列宽
+        table_scan.setColumnWidth(0, 120)
+        table_scan.setColumnWidth(1, 120)
+        table_scan.setColumnWidth(2, 120)
+        
+        # 加载已保存的表格数据
+        try:
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                canvas = self.parent().whiteboard.canvas
+                if hasattr(canvas, 'optimize_settings') and 'scan_backlash' in canvas.optimize_settings:
+                    config = canvas.optimize_settings['scan_backlash']
+                    table_data = config.get('table_data', [])
+                    # 确保数据已排序
+                    sorted_data = sorted(table_data, key=lambda x: x.get('speed', 0))
+                    table_scan.setRowCount(len(sorted_data))
+                    for row, data in enumerate(sorted_data):
+                        speed_val = f"{data.get('speed', 0):.3f}"
+                        backlash_val = f"{data.get('backlash', 0):.3f}"
+                        offset_val = f"{data.get('offset', 0):.3f}"
+                        table_scan.setItem(row, 0, QTableWidgetItem(speed_val))
+                        table_scan.setItem(row, 1, QTableWidgetItem(backlash_val))
+                        table_scan.setItem(row, 2, QTableWidgetItem(offset_val))
+        except Exception:
+            pass
+        
         backlash_layout.addWidget(table_scan)
         
         # Buttons
         hbox_scan_btns = QHBoxLayout()
-        hbox_scan_btns.addWidget(QPushButton("增加..."))
-        hbox_scan_btns.addWidget(QPushButton("删除"))
-        hbox_scan_btns.addWidget(QPushButton("读"))
-        hbox_scan_btns.addWidget(QPushButton("写"))
+        btn_add = QPushButton("增加...")
+        btn_delete = QPushButton("删除")
+        btn_read = QPushButton("读")
+        btn_write = QPushButton("写")
+        
+        # 验证和格式化数值
+        def validate_and_format(value_str, default="0.000"):
+            """验证并格式化数值"""
+            try:
+                val = float(value_str.strip() if value_str.strip() else "0")
+                return f"{val:.3f}"
+            except ValueError:
+                return default
+        
+        # 检查速度是否重复
+        def check_speed_duplicate(speed_str, exclude_row=-1):
+            """检查速度值是否已存在"""
+            try:
+                speed_val = float(speed_str.strip() if speed_str.strip() else "0")
+                for row in range(table_scan.rowCount()):
+                    if row == exclude_row:
+                        continue
+                    item = table_scan.item(row, 0)
+                    if item:
+                        try:
+                            existing_speed = float(item.text().strip())
+                            if abs(existing_speed - speed_val) < 1e-6:
+                                return True
+                        except ValueError:
+                            pass
+            except ValueError:
+                pass
+            return False
+        
+        # 按速度排序表格
+        def sort_table_by_speed():
+            """按速度列对表格进行排序"""
+            rows = []
+            for row in range(table_scan.rowCount()):
+                speed_item = table_scan.item(row, 0)
+                backlash_item = table_scan.item(row, 1)
+                offset_item = table_scan.item(row, 2)
+                
+                speed_val = 0.0
+                try:
+                    if speed_item:
+                        speed_val = float(speed_item.text().strip() or "0")
+                except ValueError:
+                    pass
+                
+                rows.append({
+                    'speed': speed_val,
+                    'speed_text': speed_item.text() if speed_item else "0",
+                    'backlash_text': backlash_item.text() if backlash_item else "0",
+                    'offset_text': offset_item.text() if offset_item else "0"
+                })
+            
+            # 按速度排序
+            rows.sort(key=lambda x: x['speed'])
+            
+            # 清空表格并重新填充
+            table_scan.setRowCount(0)
+            for row_data in rows:
+                row = table_scan.rowCount()
+                table_scan.insertRow(row)
+                table_scan.setItem(row, 0, QTableWidgetItem(row_data['speed_text']))
+                table_scan.setItem(row, 1, QTableWidgetItem(row_data['backlash_text']))
+                table_scan.setItem(row, 2, QTableWidgetItem(row_data['offset_text']))
+        
+        # 增加行
+        def on_add_row():
+            dialog = ScanBacklashInputDialog(self, speed="0", backlash="0", offset="0")
+            if dialog.exec_() == QDialog.Accepted:
+                values = dialog.get_values()
+                speed_str = values['speed'] or "0"
+                
+                # 验证速度是否重复
+                if check_speed_duplicate(speed_str):
+                    QMessageBox.warning(self, "警告", f"速度值 {speed_str} 已存在，请使用不同的速度值")
+                    return
+                
+                # 验证并格式化数值
+                speed_formatted = validate_and_format(speed_str, "0.000")
+                backlash_formatted = validate_and_format(values['backlash'], "0.000")
+                offset_formatted = validate_and_format(values['offset'], "0.000")
+                
+                row = table_scan.rowCount()
+                table_scan.insertRow(row)
+                table_scan.setItem(row, 0, QTableWidgetItem(speed_formatted))
+                table_scan.setItem(row, 1, QTableWidgetItem(backlash_formatted))
+                table_scan.setItem(row, 2, QTableWidgetItem(offset_formatted))
+                
+                # 自动排序
+                sort_table_by_speed()
+        
+        # 编辑选中行
+        def on_edit_row():
+            current_row = table_scan.currentRow()
+            if current_row < 0:
+                QMessageBox.information(self, "提示", "请先选择要编辑的行")
+                return
+            
+            # 获取当前行的值
+            speed_item = table_scan.item(current_row, 0)
+            backlash_item = table_scan.item(current_row, 1)
+            offset_item = table_scan.item(current_row, 2)
+            
+            current_speed = speed_item.text() if speed_item else "0"
+            current_backlash = backlash_item.text() if backlash_item else "0"
+            current_offset = offset_item.text() if offset_item else "0"
+            
+            dialog = ScanBacklashInputDialog(self, speed=current_speed, backlash=current_backlash, offset=current_offset)
+            if dialog.exec_() == QDialog.Accepted:
+                values = dialog.get_values()
+                speed_str = values['speed'] or "0"
+                
+                # 验证速度是否重复（排除当前行）
+                if check_speed_duplicate(speed_str, exclude_row=current_row):
+                    QMessageBox.warning(self, "警告", f"速度值 {speed_str} 已存在，请使用不同的速度值")
+                    return
+                
+                # 验证并格式化数值
+                speed_formatted = validate_and_format(speed_str, "0.000")
+                backlash_formatted = validate_and_format(values['backlash'], "0.000")
+                offset_formatted = validate_and_format(values['offset'], "0.000")
+                
+                # 更新表格
+                table_scan.setItem(current_row, 0, QTableWidgetItem(speed_formatted))
+                table_scan.setItem(current_row, 1, QTableWidgetItem(backlash_formatted))
+                table_scan.setItem(current_row, 2, QTableWidgetItem(offset_formatted))
+                
+                # 自动排序
+                sort_table_by_speed()
+        
+        # 删除选中行
+        def on_delete_row():
+            current_row = table_scan.currentRow()
+            if current_row < 0:
+                QMessageBox.information(self, "提示", "请先选择要删除的行")
+                return
+            
+            reply = QMessageBox.question(self, "确认", "确定要删除选中的行吗？", 
+                                        QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                table_scan.removeRow(current_row)
+        
+        # 读参数（从设备读取，这里先实现为从保存的设置读取）
+        def on_read_params():
+            try:
+                if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                    canvas = self.parent().whiteboard.canvas
+                    if hasattr(canvas, 'optimize_settings') and 'scan_backlash' in canvas.optimize_settings:
+                        config = canvas.optimize_settings['scan_backlash']
+                        table_data = config.get('table_data', [])
+                        table_scan.setRowCount(len(table_data))
+                        for row, data in enumerate(table_data):
+                            speed_val = validate_and_format(str(data.get('speed', 0)), "0.000")
+                            backlash_val = validate_and_format(str(data.get('backlash', 0)), "0.000")
+                            offset_val = validate_and_format(str(data.get('offset', 0)), "0.000")
+                            table_scan.setItem(row, 0, QTableWidgetItem(speed_val))
+                            table_scan.setItem(row, 1, QTableWidgetItem(backlash_val))
+                            table_scan.setItem(row, 2, QTableWidgetItem(offset_val))
+                        # 读取后自动排序
+                        sort_table_by_speed()
+                        QMessageBox.information(self, "提示", "参数读取成功")
+                    else:
+                        QMessageBox.information(self, "提示", "没有保存的参数")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"读取参数失败: {str(e)}")
+        
+        # 写参数（写入设备，这里先实现为保存到设置）
+        def on_write_params():
+            # 验证表格数据
+            has_error = False
+            error_msg = ""
+            speeds = []
+            for row in range(table_scan.rowCount()):
+                speed_item = table_scan.item(row, 0)
+                if speed_item:
+                    try:
+                        speed_val = float(speed_item.text().strip() or "0")
+                        if speed_val < 0:
+                            has_error = True
+                            error_msg = f"第 {row + 1} 行的速度值不能为负数"
+                            break
+                        speeds.append(speed_val)
+                    except ValueError:
+                        has_error = True
+                        error_msg = f"第 {row + 1} 行的速度值格式错误"
+                        break
+            
+            if has_error:
+                QMessageBox.warning(self, "错误", error_msg)
+                return
+            
+            # 参数会在accept()时自动保存，这里只是提示
+            QMessageBox.information(self, "提示", "参数将在点击确定后保存")
+        
+        # 双击编辑
+        def on_table_double_clicked(item):
+            if item is not None:
+                on_edit_row()
+        
+        # 连接事件
+        table_scan.itemDoubleClicked.connect(on_table_double_clicked)
+        btn_add.clicked.connect(on_add_row)
+        btn_delete.clicked.connect(on_delete_row)
+        btn_read.clicked.connect(on_read_params)
+        btn_write.clicked.connect(on_write_params)
+        
+        hbox_scan_btns.addWidget(btn_add)
+        hbox_scan_btns.addWidget(btn_delete)
+        hbox_scan_btns.addWidget(btn_read)
+        hbox_scan_btns.addWidget(btn_write)
         backlash_layout.addLayout(hbox_scan_btns)
         
         right_layout.addWidget(backlash_widget)
-
+        
         # Logic: Disable backlash settings if not checked
-        backlash_widget.setEnabled(False) 
+        backlash_widget.setEnabled(chk_scan_backlash.isChecked())
         chk_scan_backlash.toggled.connect(backlash_widget.setEnabled)
+
+        # 保存控件引用，供 accept() 收集参数
+        self.chk_gap_compensation = chk_gap_compensation
+        self.chk_scan_backlash = chk_scan_backlash
+        self.scan_backlash_widget = backlash_widget
+        self.scan_backlash_table = table_scan
+        self.scan_backlash_rb_x = rb_x
+        self.scan_backlash_rb_y = rb_y
         
         btn_energy = QPushButton("能量映射")
         right_layout.addWidget(btn_energy)
