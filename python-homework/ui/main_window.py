@@ -2296,6 +2296,8 @@ class MainWindow(QMainWindow):
         
         commands = []
         filleted_count = 0
+        total_corners = 0
+        processed_corners = 0
         
         for item in all_items:
             try:
@@ -2303,13 +2305,33 @@ class MainWindow(QMainWindow):
                 if len(points) < 3:
                     continue
                 
+                # 统计角点数量
+                num_vertices = len(points)
+                # 检查是否闭合
+                is_closed = False
+                if num_vertices >= 3:
+                    import math
+                    dist_to_close = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                    is_closed = dist_to_close < 1e-6
+                
+                if is_closed:
+                    total_corners += num_vertices
+                else:
+                    total_corners += max(0, num_vertices - 2)  # 开放路径，首尾点不是角点
+                
                 new_points = self._fillet_path(points, radius, min_angle, max_angle)
                 if new_points and len(new_points) != len(points):
+                    # 计算实际处理的角点数量（通过点数变化估算）
+                    original_segments = len(points) - (0 if is_closed else 1)
+                    new_segments = len(new_points) - (0 if is_closed else 1)
+                    if new_segments > original_segments:
+                        processed_corners += (new_segments - original_segments) // 2  # 粗略估算
+                    
                     cmd = FilletCommand(item, points, new_points)
                     commands.append(cmd)
                     filleted_count += 1
             except Exception as e:
-                self.logger.error(f"Error applying auto fillet to item: {e}")
+                self.logger.error(f"Error applying auto fillet to item: {e}", exc_info=True)
                 continue
         
         if commands:
@@ -2323,7 +2345,7 @@ class MainWindow(QMainWindow):
                     macro_cmd.add_command(cmd)
                 macro_cmd.redo()
                 self.whiteboard.canvas.edit_manager.push_undo(macro_cmd)
-            QMessageBox.information(self, "成功", f"已对 {filleted_count} 条路径进行自动倒圆角处理")
+            QMessageBox.information(self, "成功", f"已对 {filleted_count} 条路径进行自动倒圆角处理\n总角点数: {total_corners}")
         else:
             QMessageBox.information(self, "提示", "没有找到可倒圆角的路径")
     
@@ -2353,22 +2375,29 @@ class MainWindow(QMainWindow):
         
         # 处理每个角点（对于闭合路径，处理所有点；对于开放路径，跳过首尾点）
         num_vertices = len(pts)
+        
+        # 对于闭合路径，处理所有点；对于开放路径，跳过首尾点
         if is_closed:
-            start_idx = 0
-            end_idx = num_vertices
+            # 闭合路径：处理所有点（包括最后一个点，它连接到第一个点）
+            vertex_indices = list(range(num_vertices))
+            # 对于闭合路径，不预先添加点，让第一个角点处理时决定起始点
         else:
-            start_idx = 1
-            end_idx = num_vertices - 1
+            # 开放路径：跳过首尾点（它们不是角点）
+            vertex_indices = list(range(1, num_vertices - 1))
             # 添加第一个点
             new_points.append(pts[0])
         
-        for i in range(start_idx, end_idx):
+        for i in vertex_indices:
             # 确定前一个点、当前点和后一个点
             if is_closed:
-                p0 = pts[(i - 1) % num_vertices]
+                # 闭合路径：使用模运算处理首尾连接
+                prev_idx = (i - 1) % num_vertices
+                next_idx = (i + 1) % num_vertices
+                p0 = pts[prev_idx]
                 p1 = pts[i]
-                p2 = pts[(i + 1) % num_vertices]
+                p2 = pts[next_idx]
             else:
+                # 开放路径：直接使用相邻索引
                 p0 = pts[i - 1]
                 p1 = pts[i]
                 p2 = pts[i + 1]
@@ -2398,16 +2427,48 @@ class MainWindow(QMainWindow):
             # 计算叉积以确定路径方向（用于确定圆弧方向）
             cross_product = u1[0] * u2[1] - u1[1] * u2[0]  # 2D叉积
             
-            # 检查夹角是否在范围内
-            if angle_deg < min_angle or angle_deg > max_angle:
+            # 计算内角（对于凸角，内角 = angle；对于凹角，内角 = 2π - angle）
+            # 通过叉积判断：如果叉积为正，路径是逆时针，内角就是angle；如果叉积为负，路径是顺时针，内角是2π - angle
+            # 但更简单的方法：内角就是两个向量之间的夹角，范围是[0, π]
+            # 对于倒圆角，我们通常处理的是内角小于180度的角（凸角）
+            inner_angle_deg = angle_deg  # 内角（0-180度）
+            
+            # 检查内角是否在范围内
+            # 注意：对于矩形等图形，所有角点都是90度，应该在0-180度范围内
+            if inner_angle_deg < min_angle or inner_angle_deg > max_angle:
+                # 角度不在范围内，保留原角点
+                # 对于闭合路径，需要确保角点之间的连接
+                if len(new_points) == 0:
+                    # 这是第一个角点，但角度不在范围内
+                    # 对于闭合路径，需要添加前一个点（最后一个点）作为起点
+                    if is_closed:
+                        prev_vertex_idx = (i - 1) % num_vertices
+                        prev_pt = pts[prev_vertex_idx]
+                        # 检查前一个角点是否被处理
+                        # 如果前一个角点没有被处理，它应该已经被添加为 p1
+                        # 但这里 new_points 是空的，说明前一个角点也没有被处理
+                        # 所以我们需要添加前一个点作为起点
+                        new_points.append(prev_pt)
+                new_points.append(p1)
+                continue
+            
+            # 对于接近180度的角（几乎直线），不进行倒圆角
+            # 但允许在max_angle范围内的角
+            if inner_angle_deg > 179.0 and max_angle < 179.0:
                 new_points.append(p1)
                 continue
             
             # 检查半径是否太大（不能超过线段长度）
             min_seg_len = min(len1, len2)
-            if radius > min_seg_len * 0.5:
+            # 确保半径不超过线段长度的45%，留出足够空间
+            max_radius = min_seg_len * 0.45
+            if radius > max_radius:
                 # 半径太大，使用最大允许值
-                radius_actual = min_seg_len * 0.5
+                radius_actual = max_radius
+                # 如果最大允许值太小，跳过这个角点
+                if radius_actual < 1e-6:
+                    new_points.append(p1)
+                    continue
             else:
                 radius_actual = radius
             
@@ -2438,25 +2499,52 @@ class MainWindow(QMainWindow):
             # 计算切点
             # 切点1：在p0->p1线段上，距离p1为dist1（向p0方向）
             dist1 = radius_actual / math.tan(half_angle)
-            if dist1 > len1 * 0.9:
-                dist1 = len1 * 0.9  # 限制在90%以内
+            # 确保切点不会超出线段范围
+            if dist1 > len1 * 0.85:
+                dist1 = len1 * 0.85  # 限制在85%以内，留出安全边距
+            if dist1 < 1e-6:
+                # 距离太小，跳过这个角点
+                new_points.append(p1)
+                continue
             # u1是从p1指向p0，所以p1 + u1 * dist1是从p1向p0方向移动
             t1 = (p1[0] + u1[0] * dist1, p1[1] + u1[1] * dist1)
             
             # 切点2：在p1->p2线段上，距离p1为dist2（向p2方向）
             dist2 = radius_actual / math.tan(half_angle)
-            if dist2 > len2 * 0.9:
-                dist2 = len2 * 0.9  # 限制在90%以内
+            # 确保切点不会超出线段范围
+            if dist2 > len2 * 0.85:
+                dist2 = len2 * 0.85  # 限制在85%以内，留出安全边距
+            if dist2 < 1e-6:
+                # 距离太小，跳过这个角点
+                new_points.append(p1)
+                continue
             # u2是从p1指向p2，所以p1 + u2 * dist2是从p1向p2方向移动
             t2 = (p1[0] + u2[0] * dist2, p1[1] + u2[1] * dist2)
             
             # 添加第一个切点（如果与上一个点不同）
             if len(new_points) == 0:
+                # 这是第一个被处理的角点
+                # 对于闭合路径，不需要添加最后一个点作为起点
+                # 让路径自然闭合，在处理完所有角点后检查
                 new_points.append(t1)
             else:
+                # 检查是否需要添加连接线段
                 last_pt = new_points[-1]
                 dist_to_last = math.sqrt((t1[0] - last_pt[0])**2 + (t1[1] - last_pt[1])**2)
                 if dist_to_last > 1e-6:
+                    # 对于闭合路径，如果上一个角点没有被处理，可能需要添加连接线段
+                    if is_closed:
+                        # 检查上一个角点（索引 i-1）是否被处理
+                        # 如果上一个角点没有被处理，它应该已经被添加为 p1
+                        # 但为了确保路径连续，我们需要检查是否需要添加中间点
+                        prev_vertex_idx = (i - 1) % num_vertices
+                        prev_vertex_pt = pts[prev_vertex_idx]
+                        dist_to_prev_vertex = math.sqrt((last_pt[0] - prev_vertex_pt[0])**2 + (last_pt[1] - prev_vertex_pt[1])**2)
+                        if dist_to_prev_vertex > 1e-6:
+                            # 上一个角点没有被处理，但 last_pt 不是 prev_vertex_pt
+                            # 这意味着上一个角点被处理了，但 t2 和当前 t1 之间有间隙
+                            # 这种情况不应该发生，但为了安全，我们直接添加 t1
+                            pass
                     new_points.append(t1)
             
             # 生成圆弧点
@@ -2495,16 +2583,39 @@ class MainWindow(QMainWindow):
             # 添加第二个切点
             new_points.append(t2)
         
-        # 对于非闭合路径，添加最后一个点
-        if not is_closed and len(pts) > 0:
-            last_pt = pts[-1]
+        # 处理路径的结束
+        if is_closed:
+            # 闭合路径：确保路径闭合
             if len(new_points) == 0:
-                new_points.append(last_pt)
-            else:
-                last_new_pt = new_points[-1]
-                dist_to_last = math.sqrt((last_new_pt[0] - last_pt[0])**2 + (last_new_pt[1] - last_pt[1])**2)
-                if dist_to_last > 1e-6:
+                # 如果没有角点被处理，返回原路径
+                return pts[:]
+            
+            # 对于闭合路径，路径应该自然闭合
+            # 检查最后一个点和第一个点是否接近
+            first_pt = new_points[0]
+            last_pt = new_points[-1]
+            dist_to_first = math.sqrt((last_pt[0] - first_pt[0])**2 + (last_pt[1] - first_pt[1])**2)
+            
+            # 如果距离很小，认为路径已经闭合
+            # 如果距离较大，可能需要添加连接点，但通常不应该发生
+            # 因为倒圆角后的路径应该通过圆弧自然闭合
+        else:
+            # 非闭合路径：添加最后一个点
+            if len(pts) > 0:
+                last_pt = pts[-1]
+                if len(new_points) == 0:
+                    # 如果没有角点被处理，添加起点和终点
+                    new_points.append(pts[0])
                     new_points.append(last_pt)
+                else:
+                    last_new_pt = new_points[-1]
+                    dist_to_last = math.sqrt((last_new_pt[0] - last_pt[0])**2 + (last_new_pt[1] - last_pt[1])**2)
+                    if dist_to_last > 1e-6:
+                        new_points.append(last_pt)
+        
+        # 确保至少有两个点
+        if len(new_points) < 2:
+            return pts[:]
         
         return new_points
     
