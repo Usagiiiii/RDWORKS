@@ -6,7 +6,7 @@
 
 import logging
 import os
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from PyQt5.QtCore import QPointF, Qt
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsPixmapItem
 from PyQt5.QtGui import QPixmap, QImage, QColor
@@ -35,6 +35,16 @@ class GCodeExporter:
         self.current_x = 0.0
         self.current_y = 0.0
         self.laser_on = False
+        # 按图层颜色存放的简化参数字典:
+        # key: '#RRGGBB'  value: {'seal_gap': float, 'laser_on_delay': int(ms), 'laser_off_delay': int(ms), 'mode': str}
+        self.layer_params: Dict[str, Dict[str, Any]] = {}
+        
+        # 反向间隙补偿配置
+        self.scan_backlash_config = None
+        self.user_backlash_x = 0.0  # 用户参数中的反向间隙X
+        self.user_backlash_y = 0.0  # 用户参数中的反向间隙Y
+        self.last_move_dir_x = None  # 上一次X方向移动方向：1=正向, -1=负向, None=未移动
+        self.last_move_dir_y = None  # 上一次Y方向移动方向
 
         # 修复配置参数
         self.config = {
@@ -49,14 +59,49 @@ class GCodeExporter:
             'min_segment_length': 0.5,  # 最小段长度（避免过短路径）
         }
 
+    # ------------------------------------------------------------------
+    # 外部配置接口
+    # ------------------------------------------------------------------
+
     def set_config(self, config: dict):
         """设置导出配置"""
         if config:
             self.config.update(config)
 
+    def set_layer_params(self, params: Dict[str, Dict[str, Any]]):
+        """
+        设置按颜色存放的图层参数（来自 UI 的 LayerParams 做了简化拷贝）
+        key 必须是大写 '#RRGGBB'
+        """
+        self.layer_params = params or {}
+
     def export_canvas(self, canvas, allowed_colors: List[str] = None) -> List[str]:
         """导出整个画布为G代码（支持定位点偏移）"""
         self.gcode_lines = []
+        
+        # 重置运动方向跟踪
+        self.last_move_dir_x = None
+        self.last_move_dir_y = None
+        
+        # 读取反向间隙补偿配置
+        try:
+            if hasattr(canvas, 'optimize_settings') and 'scan_backlash' in canvas.optimize_settings:
+                self.scan_backlash_config = canvas.optimize_settings['scan_backlash']
+            else:
+                self.scan_backlash_config = None
+            
+            # 读取用户参数中的反向间隙X和Y
+            if hasattr(canvas, 'optimize_settings') and 'user_backlash' in canvas.optimize_settings:
+                user_backlash = canvas.optimize_settings['user_backlash']
+                self.user_backlash_x = float(user_backlash.get('x', 0.0))
+                self.user_backlash_y = float(user_backlash.get('y', 0.0))
+            else:
+                self.user_backlash_x = 0.0
+                self.user_backlash_y = 0.0
+        except Exception:
+            self.scan_backlash_config = None
+            self.user_backlash_x = 0.0
+            self.user_backlash_y = 0.0
 
         try:
             # 检查是否存在定位点
@@ -125,10 +170,9 @@ class GCodeExporter:
                 if self._is_system_item(item, canvas):
                     continue
 
-                # 检查图层是否允许输出
+                # 检查图层是否允许输出，并记录颜色
+                item_color_hex = None
                 if allowed_colors is not None:
-                    item_color_hex = None
-                    
                     # 尝试从 data 获取
                     color_data = item.data(LAYER_COLOR_ROLE)
                     if color_data:
@@ -150,9 +194,25 @@ class GCodeExporter:
                     if item_color_hex and item_color_hex not in allowed_colors:
                         continue
 
+                # 如果没有限制 allowed_colors，也仍然尝试获取颜色，供后续按图层参数使用
+                if allowed_colors is None and item_color_hex is None:
+                    color_data = item.data(LAYER_COLOR_ROLE)
+                    if color_data:
+                        if isinstance(color_data, QColor):
+                            item_color_hex = color_data.name().upper()
+                        elif isinstance(color_data, str):
+                            item_color_hex = color_data.upper()
+                    elif hasattr(item, 'pen'):
+                        try:
+                            pen = item.pen()
+                            if pen and pen.color().isValid():
+                                item_color_hex = pen.color().name().upper()
+                        except Exception:
+                            pass
+
                 # 优先检查是否为椭圆/圆 (EditableEllipseItem)
                 if EditableEllipseItem and isinstance(item, EditableEllipseItem):
-                    items.append(('ellipse', item))
+                    items.append(('ellipse', item, item_color_hex))
                     continue
 
                 # 矢量路径项 (EditablePathItem 或其他具有 points 方法的项)
@@ -160,14 +220,14 @@ class GCodeExporter:
                     try:
                         points = item.points()
                         if points and len(points) >= 2:
-                            items.append(('vector', item))
+                            items.append(('vector', item, item_color_hex))
                     except Exception as e:
                         logger.warning(f"获取矢量路径点时出错: {e}")
 
                 # 位图项
                 elif isinstance(item, QGraphicsPixmapItem):
                     if not item.pixmap().isNull():
-                        items.append(('bitmap', item))
+                        items.append(('bitmap', item, item_color_hex))
 
         except Exception as e:
             logger.error(f"获取可导出项时出错: {e}")
@@ -188,19 +248,31 @@ class GCodeExporter:
     def _process_exportable_item(self, item_data, fiducial_offset: Tuple[float, float]):
         """处理可导出项（应用定位点偏移）"""
         try:
-            item_type, item = item_data
+            # item_data: (item_type, item, color_hex)
+            if len(item_data) == 3:
+                item_type, item, color_hex = item_data
+            else:
+                # 兼容旧格式 (item_type, item)
+                item_type, item = item_data
+                color_hex = None
 
             if item_type == 'vector':
-                self._process_vector_item(item, fiducial_offset)
+                self._process_vector_item(item, fiducial_offset, color_hex)
             elif item_type == 'ellipse':
-                self._process_ellipse_item(item, fiducial_offset)
+                self._process_ellipse_item(item, fiducial_offset, color_hex)
             elif item_type == 'bitmap':
                 self._process_bitmap_item(item, fiducial_offset)
 
         except Exception as e:
             logger.error(f"处理{item_type}项时出错: {e}")
 
-    def _process_vector_item(self, item, fiducial_offset: Tuple[float, float]):
+    def _get_layer_params_for_color(self, color_hex: Optional[str]) -> Optional[Dict[str, Any]]:
+        """根据颜色代码获取简化后的图层参数字典"""
+        if not color_hex:
+            return None
+        return self.layer_params.get(color_hex.upper())
+
+    def _process_vector_item(self, item, fiducial_offset: Tuple[float, float], color_hex: Optional[str]):
         """处理矢量路径项（应用定位点偏移）"""
         try:
             points = item.points()
@@ -208,11 +280,11 @@ class GCodeExporter:
                 # 应用定位点偏移
                 offset_points = [self._apply_fiducial_offset(pt, fiducial_offset) for pt in points]
                 logger.info(f"处理矢量路径，包含 {len(points)} 个点，应用定位点偏移")
-                self._process_polyline(offset_points)
+                self._process_polyline(offset_points, color_hex=color_hex)
         except Exception as e:
             logger.error(f"处理矢量项时出错: {e}")
 
-    def _process_ellipse_item(self, item, fiducial_offset: Tuple[float, float]):
+    def _process_ellipse_item(self, item, fiducial_offset: Tuple[float, float], color_hex: Optional[str]):
         """处理椭圆/圆项（使用G2/G3指令）"""
         try:
             cx, cy, rx, ry = item.get_params()
@@ -223,6 +295,7 @@ class GCodeExporter:
             # 检查是否为正圆（允许微小误差）
             if abs(rx - ry) < 1e-4:
                 logger.info(f"处理圆形: 圆心({offset_cx:.2f}, {offset_cy:.2f}), 半径 {rx:.2f}")
+                # 圆形暂时仍然使用 G2/G3，不做封口和延时的几何修改
                 self._generate_circle_gcode(offset_cx, offset_cy, rx)
             else:
                 # 椭圆仍然作为多段线处理，因为标准G代码不支持椭圆指令
@@ -251,7 +324,7 @@ class GCodeExporter:
 
                 if points and len(points) >= 2:
                     offset_points = [self._apply_fiducial_offset(pt, fiducial_offset) for pt in points]
-                    self._process_polyline(offset_points)
+                    self._process_polyline(offset_points, color_hex=color_hex)
                     
         except Exception as e:
             logger.error(f"处理椭圆项时出错: {e}")
@@ -505,25 +578,216 @@ class GCodeExporter:
 
         return total_length
 
-    def _process_polyline(self, points: List[Point]):
-        """处理折线路径"""
+    def _apply_seal_gap(self, points: List[Point], seal_gap: float) -> List[Point]:
+        """根据封口参数对首尾点做几何调整（正值多切，负值少切）"""
+        if len(points) < 2 or abs(seal_gap) < 1e-6:
+            return points[:]
+
+        pts = points[:]
+        g = float(seal_gap)
+
+        # 首段
+        x0, y0 = pts[0]
+        x1, y1 = pts[1]
+        dx0, dy0 = x1 - x0, y1 - y0
+        L0 = (dx0 * dx0 + dy0 * dy0) ** 0.5
+        if L0 > 1e-6:
+            ux0, uy0 = dx0 / L0, dy0 / L0
+            if g > 0:
+                # 多切：向首段反方向延长
+                pts[0] = (x0 - ux0 * g, y0 - uy0 * g)
+            else:
+                # 少切：沿首段方向前移
+                d = min(abs(g), max(L0 - 1e-6, 0.0))
+                pts[0] = (x0 + ux0 * d, y0 + uy0 * d)
+
+        # 末段
+        xn_1, yn_1 = pts[-2]
+        xn, yn = pts[-1]
+        dx1, dy1 = xn - xn_1, yn - yn_1
+        L1 = (dx1 * dx1 + dy1 * dy1) ** 0.5
+        if L1 > 1e-6:
+            ux1, uy1 = dx1 / L1, dy1 / L1
+            if g > 0:
+                # 多切：向末段方向延长
+                pts[-1] = (xn + ux1 * g, yn + uy1 * g)
+            else:
+                # 少切：沿末段反方向回缩
+                d = min(abs(g), max(L1 - 1e-6, 0.0))
+                pts[-1] = (xn - ux1 * d, yn - uy1 * d)
+
+        return pts
+
+    def _polyline_total_length(self, points: List[Point]) -> float:
+        L = 0.0
+        for i in range(1, len(points)):
+            x0, y0 = points[i - 1]
+            x1, y1 = points[i]
+            dx, dy = x1 - x0, y1 - y0
+            L += (dx * dx + dy * dy) ** 0.5
+        return L
+
+    def _process_polyline(self, points: List[Point], color_hex: Optional[str] = None):
+        """处理折线路径，支持封口以及激光开/关延时"""
         if len(points) < 2:
             return
 
+        # 获取图层参数
+        lp = self._get_layer_params_for_color(color_hex)
+        seal_gap = float(lp.get('seal_gap', 0.0)) if lp else 0.0
+        laser_on_delay_ms = int(lp.get('laser_on_delay', 0)) if lp else 0
+        laser_off_delay_ms = int(lp.get('laser_off_delay', 0)) if lp else 0
+
+        # 先应用封口几何调整
+        pts = self._apply_seal_gap(points, seal_gap)
+
+        # 计算总长度和进给速度（mm/s）
+        total_len = self._polyline_total_length(pts)
+        if total_len <= 1e-6:
+            return
+
+        feed_rate_mm_min = float(self.config.get('feed_rate', 1000.0))
+        v = max(feed_rate_mm_min / 60.0, 1e-6)  # mm/s，避免除零
+
+        # 处理激光开延时（负值 = 提前出光，正值 = 延后出光）
+        # 负值：在首段前再生成一段预切路径
+        if laser_on_delay_ms < 0:
+            adv_mm = abs(laser_on_delay_ms) / 1000.0 * v
+            if adv_mm > 1e-6 and len(pts) >= 2:
+                x0, y0 = pts[0]
+                x1, y1 = pts[1]
+                dx, dy = x1 - x0, y1 - y0
+                L0 = (dx * dx + dy * dy) ** 0.5
+                if L0 > 1e-6:
+                    d = min(adv_mm, max(L0 - 1e-6, 0.0))
+                    ux, uy = dx / L0, dy / L0
+                    pre_pt = (x0 - ux * d, y0 - uy * d)
+                    pts = [pre_pt] + pts
+                    total_len = self._polyline_total_length(pts)
+            # 预切模式下，后续按 0 延时处理（即一开始就出光）
+            laser_on_delay_mm = 0.0
+        else:
+            laser_on_delay_mm = laser_on_delay_ms / 1000.0 * v
+            # 如果延时时间超过总长度，截断到 90% 长度，避免整条路径都不出光
+            laser_on_delay_mm = min(laser_on_delay_mm, max(total_len * 0.9, 0.0))
+
+        # 激光关延时
+        if laser_off_delay_ms < 0:
+            # 负值：提前关光 => 计算在路径上的截止距离
+            off_early_mm = abs(laser_off_delay_ms) / 1000.0 * v
+            cut_stop_dist = max(total_len - off_early_mm, 0.0)
+        else:
+            # 非负：不提前关光，可能稍后延长路径
+            cut_stop_dist = total_len
+
         # 移动到起点
-        start_x, start_y = points[0]
+        start_x, start_y = pts[0]
         self._add_rapid_move(start_x, start_y)
 
-        # 开启激光
-        self._add_laser_on()
+        # 逐段生成路径，并在合适位置打开/关闭激光
+        acc = 0.0  # 已沿路径走过的长度
+        laser_on = False
+        laser_off_done = False
 
-        # 连续移动
-        for i in range(1, len(points)):
-            x, y = points[i]
-            self._add_linear_move(x, y)
+        # 预先计算延后关光对应的长度（用于稍后延长）
+        laser_off_delay_mm_pos = 0.0
+        if laser_off_delay_ms > 0:
+            laser_off_delay_mm_pos = laser_off_delay_ms / 1000.0 * v
 
-        # 关闭激光
-        self._add_laser_off()
+        last_dir = None  # 用于正延时关光时的末段延长
+
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            dx, dy = bx - ax, by - ay
+            seg_len = (dx * dx + dy * dy) ** 0.5
+            if seg_len <= 1e-9:
+                continue
+
+            # 当前段剩余部分的起点
+            cur_ax, cur_ay = ax, ay
+            remaining = seg_len
+
+            while remaining > 1e-9:
+                seg_start_len = acc
+                seg_end_len = acc + remaining
+
+                # 计算本段中可能发生的事件：开光 / 早关光
+                event_dist = None
+                event_type = None
+
+                # 延后开光：在第一次超过 laser_on_delay_mm 时出光
+                if (not laser_on) and laser_on_delay_mm > 0.0 and seg_start_len < laser_on_delay_mm <= seg_end_len:
+                    event_dist = laser_on_delay_mm
+                    event_type = 'on'
+
+                # 提前关光：在第一次超过 cut_stop_dist 时关光
+                if (not laser_off_done) and laser_off_delay_ms < 0 and seg_start_len < cut_stop_dist <= seg_end_len:
+                    # 与开光事件比较谁先发生
+                    if event_dist is None or cut_stop_dist < event_dist:
+                        event_dist = cut_stop_dist
+                        event_type = 'off'
+
+                if event_dist is None:
+                    # 本段内无事件，直接走到段终点
+                    if not laser_on and laser_on_delay_mm <= 0.0:
+                        # 无延后，且尚未开光 => 在首次需要切割时立即开光
+                        self._add_laser_on()
+                        laser_on = True
+
+                    self._add_linear_move(bx, by)
+                    last_dir = (dx / seg_len, dy / seg_len)
+                    acc += remaining
+                    remaining = 0.0
+                else:
+                    # 段内有事件，需要拆分
+                    dist_along = event_dist - seg_start_len  # 事件点距离当前小段起点的距离
+                    t = dist_along / remaining
+                    ex = cur_ax + (bx - cur_ax) * t
+                    ey = cur_ay + (by - cur_ay) * t
+
+                    # 先走到事件点
+                    if not (abs(ex - cur_ax) < 1e-9 and abs(ey - cur_ay) < 1e-9):
+                        if not laser_on and laser_on_delay_mm <= 0.0:
+                            self._add_laser_on()
+                            laser_on = True
+                        self._add_linear_move(ex, ey)
+                        last_seg_len = ((ex - cur_ax) ** 2 + (ey - cur_ay) ** 2) ** 0.5
+                        if last_seg_len > 1e-9:
+                            last_dir = ((ex - cur_ax) / last_seg_len, (ey - cur_ay) / last_seg_len)
+
+                    acc = event_dist
+
+                    # 在事件点切换激光状态
+                    if event_type == 'on':
+                        self._add_laser_on()
+                        laser_on = True
+                    elif event_type == 'off':
+                        self._add_laser_off()
+                        laser_off_done = True
+                        laser_on = False
+
+                    # 更新当前小段起点为事件点，继续检查本段剩余部分
+                    cur_ax, cur_ay = ex, ey
+                    remaining = seg_end_len - event_dist
+                    if remaining <= 1e-9:
+                        remaining = 0.0
+
+        # 处理正向关光延时（多切）
+        if not laser_off_done:
+            if laser_off_delay_mm_pos > 1e-6 and last_dir is not None:
+                # 在末端沿最后一段方向延长一小段
+                end_x, end_y = pts[-1]
+                ux, uy = last_dir
+                ext_x = end_x + ux * laser_off_delay_mm_pos
+                ext_y = end_y + uy * laser_off_delay_mm_pos
+                if not laser_on and (laser_on_delay_mm <= 0.0 or acc >= laser_on_delay_mm):
+                    self._add_laser_on()
+                    laser_on = True
+                self._add_linear_move(ext_x, ext_y)
+
+            # 正常关光
+            self._add_laser_off()
 
     def _add_header(self, fiducial_offset: Tuple[float, float]):
         """添加文件头（包含定位点信息）"""
@@ -600,19 +864,136 @@ class GCodeExporter:
         ]
         self.gcode_lines.extend(error_msg)
 
+    def _get_backlash_compensation(self, speed_mm_s: float, axis: str) -> float:
+        """
+        根据速度和轴获取反向间隙补偿值
+        axis: 'X' 或 'Y'
+        返回: 补偿值（mm），如果没有配置则返回0
+        """
+        if not self.scan_backlash_config or not self.scan_backlash_config.get('enabled', False):
+            return 0.0
+        
+        config_axis = self.scan_backlash_config.get('axis', 'X')
+        if axis != config_axis:
+            return 0.0
+        
+        table_data = self.scan_backlash_config.get('table_data', [])
+        if not table_data:
+            return 0.0
+        
+        # 查找速度对应的反向间隙值（使用最接近的速度）
+        best_match = None
+        min_diff = float('inf')
+        
+        for entry in table_data:
+            entry_speed = entry.get('speed', 0)
+            diff = abs(entry_speed - speed_mm_s)
+            if diff < min_diff:
+                min_diff = diff
+                best_match = entry
+        
+        if best_match:
+            backlash = best_match.get('backlash', 0.0)
+            offset = best_match.get('offset', 0.0)
+            return backlash + offset
+        
+        return 0.0
+
     def _add_rapid_move(self, x: float, y: float):
         """快速移动"""
         line = f"G00 X{x:.3f} Y{y:.3f}"
         self.gcode_lines.append(line)
         self.current_x = x
         self.current_y = y
+        # 快速移动不应用反向间隙补偿，重置方向跟踪
+        self.last_move_dir_x = None
+        self.last_move_dir_y = None
 
     def _add_linear_move(self, x: float, y: float):
-        """线性移动"""
+        """线性移动（应用反向间隙补偿）"""
+        dx = x - self.current_x
+        dy = y - self.current_y
+        
+        # 计算当前运动方向
+        dir_x = 0
+        dir_y = 0
+        if abs(dx) > 1e-6:
+            dir_x = 1 if dx > 0 else -1
+        if abs(dy) > 1e-6:
+            dir_y = 1 if dy > 0 else -1
+        
+        # 计算速度（mm/s）
+        feed_rate_mm_min = float(self.config.get('feed_rate', 1000.0))
+        speed_mm_s = feed_rate_mm_min / 60.0
+        
+        # 应用反向间隙补偿
+        compensation_x = 0.0
+        compensation_y = 0.0
+        
+        # 1. 扫描反向间隙补偿（基于速度表的动态补偿）
+        if self.scan_backlash_config and self.scan_backlash_config.get('enabled', False):
+            config_axis = self.scan_backlash_config.get('axis', 'X')
+            
+            # X轴方向改变时应用补偿
+            if config_axis == 'X' and self.last_move_dir_x is not None and dir_x != 0:
+                if dir_x != self.last_move_dir_x:
+                    compensation_x = self._get_backlash_compensation(speed_mm_s, 'X')
+                    if dir_x < 0:  # 反向移动，补偿取负
+                        compensation_x = -compensation_x
+            
+            # Y轴方向改变时应用补偿
+            if config_axis == 'Y' and self.last_move_dir_y is not None and dir_y != 0:
+                if dir_y != self.last_move_dir_y:
+                    compensation_y = self._get_backlash_compensation(speed_mm_s, 'Y')
+                    if dir_y < 0:  # 反向移动，补偿取负
+                        compensation_y = -compensation_y
+        
+        # 2. 用户参数中的反向间隙补偿（固定值补偿）
+        # X轴方向改变时应用固定补偿
+        if abs(self.user_backlash_x) > 1e-6 and self.last_move_dir_x is not None and dir_x != 0:
+            if dir_x != self.last_move_dir_x:
+                # 方向改变，应用固定补偿
+                user_comp_x = self.user_backlash_x
+                if dir_x < 0:  # 反向移动，补偿取负
+                    user_comp_x = -user_comp_x
+                compensation_x += user_comp_x
+        
+        # Y轴方向改变时应用固定补偿
+        if abs(self.user_backlash_y) > 1e-6 and self.last_move_dir_y is not None and dir_y != 0:
+            if dir_y != self.last_move_dir_y:
+                # 方向改变，应用固定补偿
+                user_comp_y = self.user_backlash_y
+                if dir_y < 0:  # 反向移动，补偿取负
+                    user_comp_y = -user_comp_y
+                compensation_y += user_comp_y
+        
+        # 如果有补偿，先移动到补偿位置
+        if abs(compensation_x) > 1e-6 or abs(compensation_y) > 1e-6:
+            comp_x = self.current_x + compensation_x
+            comp_y = self.current_y + compensation_y
+            line_comp = f"G01 X{comp_x:.3f} Y{comp_y:.3f} F{self.config['feed_rate']}"
+            # 添加补偿注释
+            comp_note = "; 反向间隙补偿"
+            if abs(compensation_x) > 1e-6:
+                comp_note += f" X:{compensation_x:.3f}"
+            if abs(compensation_y) > 1e-6:
+                comp_note += f" Y:{compensation_y:.3f}"
+            self.gcode_lines.append(comp_note)
+            self.gcode_lines.append(line_comp)
+            self.current_x = comp_x
+            self.current_y = comp_y
+        
+        # 移动到目标位置
         line = f"G01 X{x:.3f} Y{y:.3f} F{self.config['feed_rate']}"
         self.gcode_lines.append(line)
         self.current_x = x
         self.current_y = y
+        
+        # 更新方向跟踪
+        if dir_x != 0:
+            self.last_move_dir_x = dir_x
+        if dir_y != 0:
+            self.last_move_dir_y = dir_y
 
     def _add_laser_on(self):
         """开启激光"""
@@ -627,13 +1008,20 @@ class GCodeExporter:
         self.laser_on = False
 
 
-def export_to_nc(canvas, filename: str, config: dict = None, allowed_colors: List[str] = None) -> bool:
+def export_to_nc(canvas,
+                 filename: str,
+                 config: dict = None,
+                 allowed_colors: List[str] = None,
+                 layer_params: Dict[str, Dict[str, Any]] = None) -> bool:
     """导出画布为NC文件（支持定位点）"""
     try:
         exporter = GCodeExporter()
 
         if config:
             exporter.set_config(config)
+
+        if layer_params:
+            exporter.set_layer_params(layer_params)
 
         gcode_lines = exporter.export_canvas(canvas, allowed_colors)
 

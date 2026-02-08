@@ -30,6 +30,7 @@ from ui.smooth_curve_dialog import SmoothCurveSimpleDialog, SmoothCurveCustomDia
 from ui.auto_close_dialog import AutoCloseDialog
 from ui.data_check_dialog import DataCheckDialog
 from ui.bitmap_process_dialog import BitmapProcessDialog
+from ui.fillet_dialog import FilletDialog
 from ui.graphics_items import EditablePathItem
 from edit.commands import SmoothItemCommand
 
@@ -39,7 +40,7 @@ from utils.language_manager import language_manager
 from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
 from PyQt5.QtWidgets import QMessageBox
 from ui.array_copy_dialog import ArrayCopyDialog
-from edit.commands import AddItemCommand, MacroCommand
+from edit.commands import AddItemCommand, MacroCommand, FilletCommand
 import copy
 
 class MainWindow(QMainWindow):
@@ -551,6 +552,16 @@ class MainWindow(QMainWindow):
         self.point_action.setShortcut('Ctrl+7')
         self.point_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_POINT))
         self.draw_menu.addAction(self.point_action)
+
+        # 倒圆角
+        self.fillet_action = QAction('倒圆角', self)
+        self.fillet_action.triggered.connect(self.show_fillet_dialog)
+        self.draw_menu.addAction(self.fillet_action)
+
+        # 加码齿
+        self.gear_action = QAction('加码齿', self)
+        self.gear_action.triggered.connect(self.show_gear_dialog)
+        self.draw_menu.addAction(self.gear_action)
 
         self.draw_menu.addSeparator()
 
@@ -2204,6 +2215,414 @@ class MainWindow(QMainWindow):
             self.logger.error(f"Error opening bitmap dialog: {e}", exc_info=True)
             QMessageBox.critical(self, "错误", f"打开位图处理对话框时发生错误:\n{e}")
 
+    def show_fillet_dialog(self):
+        """显示倒圆角对话框并执行倒圆角操作"""
+        try:
+            dlg = FilletDialog(self)
+            if dlg.exec_() == QDialog.Accepted:
+                values = dlg.get_values()
+                radius = values['radius']
+                min_angle = values['min_angle']
+                max_angle = values['max_angle']
+                mode = values['mode']
+                
+                if mode == 'manual':
+                    self.apply_manual_fillet(radius, min_angle, max_angle)
+                elif mode == 'auto':
+                    self.apply_auto_fillet(radius, min_angle, max_angle)
+        except Exception as e:
+            self.logger.error(f"Error in fillet dialog: {e}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"倒圆角操作失败:\n{e}")
+    
+    def apply_manual_fillet(self, radius, min_angle, max_angle):
+        """手动倒圆角：对选中的路径在指定角点处倒圆角"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先选择要倒圆角的路径")
+            return
+        
+        from ui.graphics_items import EditablePathItem
+        
+        filleted_count = 0
+        commands = []
+        
+        for item in selected_items:
+            if isinstance(item, EditablePathItem):
+                try:
+                    # 获取路径点
+                    points = item.points()
+                    if len(points) < 3:
+                        continue
+                    
+                    # 执行倒圆角
+                    new_points = self._fillet_path(points, radius, min_angle, max_angle)
+                    if new_points and len(new_points) != len(points):
+                        # 创建命令
+                        cmd = FilletCommand(item, points, new_points)
+                        commands.append(cmd)
+                        filleted_count += 1
+                except Exception as e:
+                    self.logger.error(f"Error applying fillet to item: {e}")
+                    continue
+        
+        if commands:
+            # 执行命令
+            if len(commands) == 1:
+                cmd = commands[0]
+                cmd.redo()
+                self.whiteboard.canvas.edit_manager.push_undo(cmd)
+            else:
+                macro_cmd = MacroCommand("倒圆角")
+                for cmd in commands:
+                    macro_cmd.add_command(cmd)
+                macro_cmd.redo()
+                self.whiteboard.canvas.edit_manager.push_undo(macro_cmd)
+            QMessageBox.information(self, "成功", f"已对 {filleted_count} 条路径进行倒圆角处理")
+        else:
+            QMessageBox.information(self, "提示", "没有找到可倒圆角的路径")
+    
+    def apply_auto_fillet(self, radius, min_angle, max_angle):
+        """自动倒圆角：对所有路径自动查找符合条件的角点并倒圆角"""
+        from ui.graphics_items import EditablePathItem
+        
+        all_items = []
+        for item in self.whiteboard.canvas.scene.items():
+            if isinstance(item, EditablePathItem):
+                all_items.append(item)
+        
+        if not all_items:
+            QMessageBox.information(self, "提示", "画布中没有路径")
+            return
+        
+        commands = []
+        filleted_count = 0
+        total_corners = 0
+        processed_corners = 0
+        
+        for item in all_items:
+            try:
+                points = item.points()
+                if len(points) < 3:
+                    continue
+                
+                # 统计角点数量
+                num_vertices = len(points)
+                # 检查是否闭合
+                is_closed = False
+                if num_vertices >= 3:
+                    import math
+                    dist_to_close = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
+                    is_closed = dist_to_close < 1e-6
+                
+                if is_closed:
+                    total_corners += num_vertices
+                else:
+                    total_corners += max(0, num_vertices - 2)  # 开放路径，首尾点不是角点
+                
+                new_points = self._fillet_path(points, radius, min_angle, max_angle)
+                if new_points and len(new_points) != len(points):
+                    # 计算实际处理的角点数量（通过点数变化估算）
+                    original_segments = len(points) - (0 if is_closed else 1)
+                    new_segments = len(new_points) - (0 if is_closed else 1)
+                    if new_segments > original_segments:
+                        processed_corners += (new_segments - original_segments) // 2  # 粗略估算
+                    
+                    cmd = FilletCommand(item, points, new_points)
+                    commands.append(cmd)
+                    filleted_count += 1
+            except Exception as e:
+                self.logger.error(f"Error applying auto fillet to item: {e}", exc_info=True)
+                continue
+        
+        if commands:
+            if len(commands) == 1:
+                cmd = commands[0]
+                cmd.redo()
+                self.whiteboard.canvas.edit_manager.push_undo(cmd)
+            else:
+                macro_cmd = MacroCommand("自动倒圆角")
+                for cmd in commands:
+                    macro_cmd.add_command(cmd)
+                macro_cmd.redo()
+                self.whiteboard.canvas.edit_manager.push_undo(macro_cmd)
+            QMessageBox.information(self, "成功", f"已对 {filleted_count} 条路径进行自动倒圆角处理\n总角点数: {total_corners}")
+        else:
+            QMessageBox.information(self, "提示", "没有找到可倒圆角的路径")
+    
+    def _fillet_path(self, points, radius, min_angle, max_angle):
+        """对路径进行倒圆角处理"""
+        import math
+        
+        if len(points) < 3:
+            return points[:]
+        
+        # 转换为场景坐标（如果需要）
+        def get_xy(pt):
+            if isinstance(pt, (tuple, list)) and len(pt) >= 2:
+                return float(pt[0]), float(pt[1])
+            return float(pt.x()), float(pt.y())
+        
+        # 转换所有点
+        pts = [get_xy(p) for p in points]
+        
+        # 检查路径是否闭合（首尾点距离很近）
+        is_closed = False
+        if len(pts) >= 3:
+            dist_to_close = math.sqrt((pts[0][0] - pts[-1][0])**2 + (pts[0][1] - pts[-1][1])**2)
+            is_closed = dist_to_close < 1e-6
+        
+        new_points = []
+        
+        # 处理每个角点（对于闭合路径，处理所有点；对于开放路径，跳过首尾点）
+        num_vertices = len(pts)
+        
+        # 对于闭合路径，处理所有点；对于开放路径，跳过首尾点
+        if is_closed:
+            # 闭合路径：处理所有点（包括最后一个点，它连接到第一个点）
+            vertex_indices = list(range(num_vertices))
+            # 对于闭合路径，不预先添加点，让第一个角点处理时决定起始点
+        else:
+            # 开放路径：跳过首尾点（它们不是角点）
+            vertex_indices = list(range(1, num_vertices - 1))
+            # 添加第一个点
+            new_points.append(pts[0])
+        
+        for i in vertex_indices:
+            # 确定前一个点、当前点和后一个点
+            if is_closed:
+                # 闭合路径：使用模运算处理首尾连接
+                prev_idx = (i - 1) % num_vertices
+                next_idx = (i + 1) % num_vertices
+                p0 = pts[prev_idx]
+                p1 = pts[i]
+                p2 = pts[next_idx]
+            else:
+                # 开放路径：直接使用相邻索引
+                p0 = pts[i - 1]
+                p1 = pts[i]
+                p2 = pts[i + 1]
+            
+            # 计算向量（从p1指向p0和p2）
+            v1 = (p0[0] - p1[0], p0[1] - p1[1])  # p1 -> p0
+            v2 = (p2[0] - p1[0], p2[1] - p1[1])  # p1 -> p2
+            
+            # 计算向量长度
+            len1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            len2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            
+            if len1 < 1e-6 or len2 < 1e-6:
+                new_points.append(p1)
+                continue
+            
+            # 归一化向量
+            u1 = (v1[0] / len1, v1[1] / len1)  # 从p1指向p0的单位向量
+            u2 = (v2[0] / len2, v2[1] / len2)  # 从p1指向p2的单位向量
+            
+            # 计算夹角（使用点积）
+            dot_product = u1[0] * u2[0] + u1[1] * u2[1]
+            dot_product = max(-1.0, min(1.0, dot_product))  # 限制在[-1, 1]范围内
+            angle = math.acos(dot_product)
+            angle_deg = math.degrees(angle)
+            
+            # 计算叉积以确定路径方向（用于确定圆弧方向）
+            cross_product = u1[0] * u2[1] - u1[1] * u2[0]  # 2D叉积
+            
+            # 计算内角（对于凸角，内角 = angle；对于凹角，内角 = 2π - angle）
+            # 通过叉积判断：如果叉积为正，路径是逆时针，内角就是angle；如果叉积为负，路径是顺时针，内角是2π - angle
+            # 但更简单的方法：内角就是两个向量之间的夹角，范围是[0, π]
+            # 对于倒圆角，我们通常处理的是内角小于180度的角（凸角）
+            inner_angle_deg = angle_deg  # 内角（0-180度）
+            
+            # 检查内角是否在范围内
+            # 注意：对于矩形等图形，所有角点都是90度，应该在0-180度范围内
+            if inner_angle_deg < min_angle or inner_angle_deg > max_angle:
+                # 角度不在范围内，保留原角点
+                # 对于闭合路径，需要确保角点之间的连接
+                if len(new_points) == 0:
+                    # 这是第一个角点，但角度不在范围内
+                    # 对于闭合路径，需要添加前一个点（最后一个点）作为起点
+                    if is_closed:
+                        prev_vertex_idx = (i - 1) % num_vertices
+                        prev_pt = pts[prev_vertex_idx]
+                        # 检查前一个角点是否被处理
+                        # 如果前一个角点没有被处理，它应该已经被添加为 p1
+                        # 但这里 new_points 是空的，说明前一个角点也没有被处理
+                        # 所以我们需要添加前一个点作为起点
+                        new_points.append(prev_pt)
+                new_points.append(p1)
+                continue
+            
+            # 对于接近180度的角（几乎直线），不进行倒圆角
+            # 但允许在max_angle范围内的角
+            if inner_angle_deg > 179.0 and max_angle < 179.0:
+                new_points.append(p1)
+                continue
+            
+            # 检查半径是否太大（不能超过线段长度）
+            min_seg_len = min(len1, len2)
+            # 确保半径不超过线段长度的45%，留出足够空间
+            max_radius = min_seg_len * 0.45
+            if radius > max_radius:
+                # 半径太大，使用最大允许值
+                radius_actual = max_radius
+                # 如果最大允许值太小，跳过这个角点
+                if radius_actual < 1e-6:
+                    new_points.append(p1)
+                    continue
+            else:
+                radius_actual = radius
+            
+            # 计算倒圆角的两个切点
+            # 计算角平分线方向（指向角内部）
+            bisector = (u1[0] + u2[0], u1[1] + u2[1])
+            bisector_len = math.sqrt(bisector[0]**2 + bisector[1]**2)
+            if bisector_len < 1e-6:
+                new_points.append(p1)
+                continue
+            
+            bisector = (bisector[0] / bisector_len, bisector[1] / bisector_len)
+            
+            # 计算圆心到角点的距离
+            half_angle = angle / 2.0
+            if abs(math.sin(half_angle)) < 1e-6:
+                new_points.append(p1)
+                continue
+            
+            dist_to_center = radius_actual / math.sin(half_angle)
+            
+            # 圆心位置（在角平分线上，距离角点dist_to_center）
+            # 需要确定圆心在角的内侧还是外侧
+            # 对于凸角，圆心在角的内侧（沿角平分线方向）
+            center = (p1[0] + bisector[0] * dist_to_center, 
+                     p1[1] + bisector[1] * dist_to_center)
+            
+            # 计算切点
+            # 切点1：在p0->p1线段上，距离p1为dist1（向p0方向）
+            dist1 = radius_actual / math.tan(half_angle)
+            # 确保切点不会超出线段范围
+            if dist1 > len1 * 0.85:
+                dist1 = len1 * 0.85  # 限制在85%以内，留出安全边距
+            if dist1 < 1e-6:
+                # 距离太小，跳过这个角点
+                new_points.append(p1)
+                continue
+            # u1是从p1指向p0，所以p1 + u1 * dist1是从p1向p0方向移动
+            t1 = (p1[0] + u1[0] * dist1, p1[1] + u1[1] * dist1)
+            
+            # 切点2：在p1->p2线段上，距离p1为dist2（向p2方向）
+            dist2 = radius_actual / math.tan(half_angle)
+            # 确保切点不会超出线段范围
+            if dist2 > len2 * 0.85:
+                dist2 = len2 * 0.85  # 限制在85%以内，留出安全边距
+            if dist2 < 1e-6:
+                # 距离太小，跳过这个角点
+                new_points.append(p1)
+                continue
+            # u2是从p1指向p2，所以p1 + u2 * dist2是从p1向p2方向移动
+            t2 = (p1[0] + u2[0] * dist2, p1[1] + u2[1] * dist2)
+            
+            # 添加第一个切点（如果与上一个点不同）
+            if len(new_points) == 0:
+                # 这是第一个被处理的角点
+                # 对于闭合路径，不需要添加最后一个点作为起点
+                # 让路径自然闭合，在处理完所有角点后检查
+                new_points.append(t1)
+            else:
+                # 检查是否需要添加连接线段
+                last_pt = new_points[-1]
+                dist_to_last = math.sqrt((t1[0] - last_pt[0])**2 + (t1[1] - last_pt[1])**2)
+                if dist_to_last > 1e-6:
+                    # 对于闭合路径，如果上一个角点没有被处理，可能需要添加连接线段
+                    if is_closed:
+                        # 检查上一个角点（索引 i-1）是否被处理
+                        # 如果上一个角点没有被处理，它应该已经被添加为 p1
+                        # 但为了确保路径连续，我们需要检查是否需要添加中间点
+                        prev_vertex_idx = (i - 1) % num_vertices
+                        prev_vertex_pt = pts[prev_vertex_idx]
+                        dist_to_prev_vertex = math.sqrt((last_pt[0] - prev_vertex_pt[0])**2 + (last_pt[1] - prev_vertex_pt[1])**2)
+                        if dist_to_prev_vertex > 1e-6:
+                            # 上一个角点没有被处理，但 last_pt 不是 prev_vertex_pt
+                            # 这意味着上一个角点被处理了，但 t2 和当前 t1 之间有间隙
+                            # 这种情况不应该发生，但为了安全，我们直接添加 t1
+                            pass
+                    new_points.append(t1)
+            
+            # 生成圆弧点
+            # 计算从圆心到切点的角度
+            vec_t1 = (t1[0] - center[0], t1[1] - center[1])
+            vec_t2 = (t2[0] - center[0], t2[1] - center[1])
+            
+            angle1 = math.atan2(vec_t1[1], vec_t1[0])
+            angle2 = math.atan2(vec_t2[1], vec_t2[0])
+            
+            # 确定圆弧方向
+            # 根据路径方向（通过叉积判断）确定圆弧是顺时针还是逆时针
+            angle_diff = angle2 - angle1
+            # 标准化角度差到[-pi, pi]
+            while angle_diff > math.pi:
+                angle_diff -= 2 * math.pi
+            while angle_diff < -math.pi:
+                angle_diff += 2 * math.pi
+            
+            # 如果叉积为正，路径是逆时针，圆弧应该逆时针；如果叉积为负，路径是顺时针，圆弧应该顺时针
+            # 但我们需要确保圆弧连接两个切点，所以需要检查角度差的方向
+            if abs(angle_diff) < 1e-6:
+                # 角度差太小，直接连接两个切点
+                new_points.append(t2)
+                continue
+            
+            # 生成圆弧点
+            num_arc_points = max(4, int(math.degrees(abs(angle_diff)) / 5))  # 每5度一个点
+            for j in range(1, num_arc_points):
+                t = j / num_arc_points
+                arc_angle = angle1 + angle_diff * t
+                arc_x = center[0] + radius_actual * math.cos(arc_angle)
+                arc_y = center[1] + radius_actual * math.sin(arc_angle)
+                new_points.append((arc_x, arc_y))
+            
+            # 添加第二个切点
+            new_points.append(t2)
+        
+        # 处理路径的结束
+        if is_closed:
+            # 闭合路径：确保路径闭合
+            if len(new_points) == 0:
+                # 如果没有角点被处理，返回原路径
+                return pts[:]
+            
+            # 对于闭合路径，路径应该自然闭合
+            # 检查最后一个点和第一个点是否接近
+            first_pt = new_points[0]
+            last_pt = new_points[-1]
+            dist_to_first = math.sqrt((last_pt[0] - first_pt[0])**2 + (last_pt[1] - first_pt[1])**2)
+            
+            # 如果距离很小，认为路径已经闭合
+            # 如果距离较大，可能需要添加连接点，但通常不应该发生
+            # 因为倒圆角后的路径应该通过圆弧自然闭合
+        else:
+            # 非闭合路径：添加最后一个点
+            if len(pts) > 0:
+                last_pt = pts[-1]
+                if len(new_points) == 0:
+                    # 如果没有角点被处理，添加起点和终点
+                    new_points.append(pts[0])
+                    new_points.append(last_pt)
+                else:
+                    last_new_pt = new_points[-1]
+                    dist_to_last = math.sqrt((last_new_pt[0] - last_pt[0])**2 + (last_new_pt[1] - last_pt[1])**2)
+                    if dist_to_last > 1e-6:
+                        new_points.append(last_pt)
+        
+        # 确保至少有两个点
+        if len(new_points) < 2:
+            return pts[:]
+        
+        return new_points
+    
+    def show_gear_dialog(self):
+        """显示加码齿对话框"""
+        QMessageBox.information(self, "提示", "加码齿功能暂未实现")
+
     def open_file(self):
         """打开RLD文件"""
         from my_io.RLD.init_rld import RLDFileHandler
@@ -3046,10 +3465,24 @@ class MainWindow(QMainWindow):
 
             # 执行导出
             allowed_colors = None
+            layer_params_map = None
             if hasattr(self, 'right_panel'):
                 allowed_colors = self.right_panel.get_output_enabled_colors()
-            
-            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors)
+                # 从 RightPanel.layer_data 构建一个简化的图层参数字典，传给导出器
+                try:
+                    layer_params_map = {}
+                    for hex_color, p in self.right_panel.layer_data.items():
+                        key = str(hex_color).upper()
+                        layer_params_map[key] = {
+                            'seal_gap': getattr(p, 'seal_gap', 0.0),
+                            'laser_on_delay': getattr(p, 'laser_on_delay', 0),
+                            'laser_off_delay': getattr(p, 'laser_off_delay', 0),
+                            'mode': getattr(p, 'mode', '激光切割'),
+                        }
+                except Exception:
+                    layer_params_map = None
+
+            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors, layer_params_map)
 
             if success:
                 # 读取生成的文件以获取更多信息
