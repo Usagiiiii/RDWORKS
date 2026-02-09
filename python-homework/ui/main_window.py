@@ -2367,9 +2367,14 @@ class MainWindow(QMainWindow):
         
         # 检查路径是否闭合（首尾点距离很近）
         is_closed = False
+        had_closure_point = False
         if len(pts) >= 3:
             dist_to_close = math.sqrt((pts[0][0] - pts[-1][0])**2 + (pts[0][1] - pts[-1][1])**2)
             is_closed = dist_to_close < 1e-6
+            if is_closed:
+                # 避免重复闭合点导致的退化角点
+                had_closure_point = True
+                pts = pts[:-1]
         
         new_points = []
         
@@ -2587,18 +2592,23 @@ class MainWindow(QMainWindow):
         if is_closed:
             # 闭合路径：确保路径闭合
             if len(new_points) == 0:
-                # 如果没有角点被处理，返回原路径
-                return pts[:]
+                # 如果没有角点被处理，返回原路径并保持闭合
+                closed_pts = pts[:]
+                if not closed_pts:
+                    return closed_pts
+                if math.hypot(closed_pts[0][0] - closed_pts[-1][0], closed_pts[0][1] - closed_pts[-1][1]) > 1e-6:
+                    closed_pts.append(closed_pts[0])
+                return closed_pts
             
-            # 对于闭合路径，路径应该自然闭合
-            # 检查最后一个点和第一个点是否接近
+            # 对于闭合路径，确保首尾闭合点存在
             first_pt = new_points[0]
             last_pt = new_points[-1]
             dist_to_first = math.sqrt((last_pt[0] - first_pt[0])**2 + (last_pt[1] - first_pt[1])**2)
-            
-            # 如果距离很小，认为路径已经闭合
-            # 如果距离较大，可能需要添加连接点，但通常不应该发生
-            # 因为倒圆角后的路径应该通过圆弧自然闭合
+            if dist_to_first > 1e-6:
+                new_points.append(first_pt)
+            elif had_closure_point:
+                # 若原路径显式闭合，确保闭合点存在（避免精度误差丢失）
+                new_points[-1] = first_pt
         else:
             # 非闭合路径：添加最后一个点
             if len(pts) > 0:
@@ -2615,6 +2625,11 @@ class MainWindow(QMainWindow):
         
         # 确保至少有两个点
         if len(new_points) < 2:
+            if is_closed and pts:
+                closed_pts = pts[:]
+                if math.hypot(closed_pts[0][0] - closed_pts[-1][0], closed_pts[0][1] - closed_pts[-1][1]) > 1e-6:
+                    closed_pts.append(closed_pts[0])
+                return closed_pts
             return pts[:]
         
         return new_points
