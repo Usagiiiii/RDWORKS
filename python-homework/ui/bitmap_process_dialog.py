@@ -73,7 +73,13 @@ class BitmapProcessDialog(QDialog):
         self.setWindowTitle("位图处理")
         self.resize(900, 540)
 
-        qimage = self.target_item.pixmap().toImage()
+        if self.target_item and hasattr(self.target_item, 'pixmap'):
+            qimage = self.target_item.pixmap().toImage()
+        else:
+            # 创建默认空白图
+            qimage = QImage(800, 600, QImage.Format_ARGB32)
+            qimage.fill(Qt.white)
+
         buffer = QBuffer()
         buffer.open(QIODevice.ReadWrite)
         qimage.save(buffer, "PNG")
@@ -81,7 +87,7 @@ class BitmapProcessDialog(QDialog):
 
         try:
             pil_image = Image.open(io.BytesIO(buffer.data())).convert("RGBA")
-        except Exception:  # 粗略兜底，确保对话框可用
+        except Exception:
             pil_image = Image.new("RGBA", (100, 100), (255, 255, 255, 255))
 
         self.original_image = pil_image

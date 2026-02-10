@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
+import os
+import configparser
+
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QStackedWidget,
     QWidget, QGroupBox, QLabel, QLineEdit, QCheckBox, QComboBox,
@@ -12,6 +16,7 @@ from PyQt5.QtCore import Qt, QSize, QEvent
 from PyQt5.QtGui import QIcon, QColor
 from ui.import_advanced_dialog import AdvancedImportDialog
 
+<<<<<<< HEAD
 class ScanBacklashInputDialog(QDialog):
     """扫描反向间隙输入对话框"""
     def __init__(self, parent=None, speed="0", backlash="0", offset="0"):
@@ -109,6 +114,76 @@ class ScanBacklashInputDialog(QDialog):
             'backlash': self.backlash_edit.text().strip(),
             'offset': self.offset_edit.text().strip()
         }
+=======
+
+def _get_persisted_settings_path():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(base_dir, "..", "system_settings.ini"))
+
+
+def load_persisted_settings(canvas):
+    if not canvas:
+        return
+
+    path = _get_persisted_settings_path()
+    if not os.path.exists(path):
+        return
+
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read(path, encoding="utf-8")
+    except Exception:
+        return
+
+    def parse_value(raw):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+
+    imp = {}
+    exp = {}
+
+    if cfg.has_section("import_settings"):
+        for k, v in cfg.items("import_settings"):
+            imp[k] = parse_value(v)
+
+    if cfg.has_section("export_settings"):
+        for k, v in cfg.items("export_settings"):
+            exp[k] = parse_value(v)
+
+    if imp:
+        canvas.import_settings = imp
+    if exp:
+        canvas.export_settings = exp
+        if "small_circle_limits" in exp:
+            canvas.small_circle_limit = exp.get("small_circle_limits") or []
+
+
+def save_persisted_settings(import_settings, export_settings):
+    path = _get_persisted_settings_path()
+    cfg = configparser.ConfigParser()
+    cfg["import_settings"] = {}
+    cfg["export_settings"] = {}
+
+    def dump_value(val):
+        try:
+            return json.dumps(val, ensure_ascii=True)
+        except Exception:
+            return str(val)
+
+    for k, v in (import_settings or {}).items():
+        cfg["import_settings"][k] = dump_value(v)
+
+    for k, v in (export_settings or {}).items():
+        cfg["export_settings"][k] = dump_value(v)
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    except Exception:
+        pass
+>>>>>>> 3ec087f (feat: restore and apply local 72-file changes)
 
 class CustomColorDialog(QColorDialog):
     def __init__(self, initial=Qt.white, parent=None, title="Color"):
@@ -264,11 +339,43 @@ class CustomColorDialog(QColorDialog):
                 self.custom_well_array.update()
                 self.custom_well_array.repaint()
 
+class SmallCircleLimitDialog(QDialog):
+    def __init__(self, parent=None, diameter="", speed=""):
+        super().__init__(parent)
+        self.setWindowTitle("小圆限速")
+        self.resize(300, 150)
+        
+        layout = QFormLayout(self)
+        
+        self.le_diameter = QLineEdit(str(diameter))
+        self.le_speed = QLineEdit(str(speed))
+        
+        layout.addRow("直径(mm):", self.le_diameter)
+        layout.addRow("速度(mm/s):", self.le_speed)
+        
+        btns = QHBoxLayout()
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btns.addWidget(btn_ok)
+        btns.addWidget(btn_cancel)
+        layout.addRow(btns)
+        
+    def get_data(self):
+        return self.le_diameter.text(), self.le_speed.text()
+
 class SystemSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("参数设置")
         self.resize(780, 580)
+        try:
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                load_persisted_settings(self.parent().whiteboard.canvas)
+        except Exception:
+            pass
         self.init_ui()
 
     def on_imp_adv_clicked(self):
@@ -317,10 +424,12 @@ class SystemSettingsDialog(QDialog):
         self.btn_import_param = QPushButton("导入软件参数")
         self.btn_import_param.setFixedWidth(120)
         bottom_layout.addWidget(self.btn_import_param)
+        self.btn_import_param.clicked.connect(self.on_btn_import_param_clicked)
         
         self.btn_export_param = QPushButton("导出软件参数")
         self.btn_export_param.setFixedWidth(120)
         bottom_layout.addWidget(self.btn_export_param)
+        self.btn_export_param.clicked.connect(self.on_btn_export_param_clicked)
         
         bottom_layout.addStretch()
         
@@ -340,6 +449,57 @@ class SystemSettingsDialog(QDialog):
 
     def change_page(self, index):
         self.stacked_widget.setCurrentIndex(index)
+
+    def on_add_circle_limit(self):
+        dlg = SmallCircleLimitDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            d, s = dlg.get_data()
+            if d and s:
+                row = self.table_circle.rowCount()
+                self.table_circle.insertRow(row)
+                self.table_circle.setItem(row, 0, QTableWidgetItem(d))
+                self.table_circle.setItem(row, 1, QTableWidgetItem(s))
+                self.sort_circle_table()
+
+    def on_del_circle_limit(self):
+        row = self.table_circle.currentRow()
+        if row >= 0:
+            self.table_circle.removeRow(row)
+
+    def on_edit_circle_limit(self, row, col):
+        d_item = self.table_circle.item(row, 0)
+        s_item = self.table_circle.item(row, 1)
+        d = d_item.text() if d_item else ""
+        s = s_item.text() if s_item else ""
+        
+        dlg = SmallCircleLimitDialog(self, d, s)
+        if dlg.exec_() == QDialog.Accepted:
+            d_new, s_new = dlg.get_data()
+            if d_new and s_new:
+                self.table_circle.setItem(row, 0, QTableWidgetItem(d_new))
+                self.table_circle.setItem(row, 1, QTableWidgetItem(s_new))
+                self.sort_circle_table()
+
+    def sort_circle_table(self):
+        rows = []
+        for r in range(self.table_circle.rowCount()):
+            d_item = self.table_circle.item(r, 0)
+            s_item = self.table_circle.item(r, 1)
+            if d_item and s_item:
+                try:
+                    d_val = float(d_item.text())
+                except ValueError:
+                    d_val = 0.0
+                rows.append((d_val, d_item.text(), s_item.text()))
+        
+        rows.sort(key=lambda x: x[0])
+        
+        self.table_circle.setRowCount(0)
+        for _, d_text, s_text in rows:
+            r = self.table_circle.rowCount()
+            self.table_circle.insertRow(r)
+            self.table_circle.setItem(r, 0, QTableWidgetItem(d_text))
+            self.table_circle.setItem(r, 1, QTableWidgetItem(s_text))
 
     def accept(self):
         try:
@@ -431,10 +591,32 @@ class SystemSettingsDialog(QDialog):
                          exp_settings['out_curve_prec'] = float(self.edit_out_curve_prec.text() or 80.0)
                          exp_settings['unit_size'] = self.combo_unit_size.currentText()
                          exp_settings['unit_speed'] = self.combo_unit_speed.currentText()
+                         if hasattr(self, 'combo_scan_dir'):
+                             exp_settings['scan_direction'] = self.combo_scan_dir.currentText()
                      except Exception as e:
                          print(f"Error parsing export settings: {e}")
                      
                      wb.canvas.export_settings = exp_settings
+                     
+                     # Update Small Circle Limits
+                     if hasattr(self, 'table_circle') and hasattr(self, 'group_circle'):
+                        circle_limits = []
+                        if self.group_circle.isChecked():
+                            for r in range(self.table_circle.rowCount()):
+                                d_item = self.table_circle.item(r, 0)
+                                s_item = self.table_circle.item(r, 1)
+                                if d_item and s_item:
+                                    try:
+                                        d = float(d_item.text())
+                                        s = float(s_item.text())
+                                        circle_limits.append((d, s))
+                                    except ValueError:
+                                        pass
+                                wb.canvas.small_circle_limit = circle_limits
+                                wb.canvas.export_settings['small_circle_enable'] = self.group_circle.isChecked()
+                                wb.canvas.export_settings['small_circle_limits'] = circle_limits
+
+                            save_persisted_settings(wb.canvas.import_settings, wb.canvas.export_settings)
 
                 # Update Optimize Settings (including gap compensation)
                 if hasattr(self, 'chk_gap_compensation'):
@@ -738,32 +920,52 @@ class SystemSettingsDialog(QDialog):
         left_layout = QVBoxLayout()
         
         # Small Circle Speed Limit
-        group_circle = QGroupBox("小圆限速")
-        group_circle.setCheckable(True)
-        group_circle.setChecked(False)
-        vbox_circle = QVBoxLayout(group_circle)
+        self.group_circle = QGroupBox("小圆限速")
+        self.group_circle.setCheckable(True)
+        self.group_circle.setChecked(False)
+        vbox_circle = QVBoxLayout(self.group_circle)
         
-        table_circle = QTableWidget(7, 2)
-        table_circle.setHorizontalHeaderLabels(["直径(mm)", "速度(mm/s)"])
-        table_circle.verticalHeader().setVisible(False)
-        table_circle.setAlternatingRowColors(True)
-        # Mock data
-        data = [
-            ("1.100", "15.00000"), ("2.100", "20.00000"), ("3.100", "25.00000"),
-            ("4.100", "30.00000"), ("6.100", "35.00000"), ("8.100", "40.00000")
-        ]
-        for r, (d, s) in enumerate(data):
-            table_circle.setItem(r, 0, QTableWidgetItem(d))
-            table_circle.setItem(r, 1, QTableWidgetItem(s))
+        self.table_circle = QTableWidget(7, 2)
+        self.table_circle.setHorizontalHeaderLabels(["直径(mm)", "速度(mm/s)"])
+        self.table_circle.verticalHeader().setVisible(False)
+        self.table_circle.setAlternatingRowColors(True)
+        self.table_circle.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_circle.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table_circle.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        
+        # Load data (prefer export settings)
+        data = []
+        enable_circle = False
+        if self.parent() and hasattr(self.parent(), 'whiteboard') and hasattr(self.parent().whiteboard, 'canvas'):
+            canvas = self.parent().whiteboard.canvas
+            exp = getattr(canvas, 'export_settings', {})
+            enable_circle = bool(exp.get('small_circle_enable', False))
+            data = exp.get('small_circle_limits', []) or getattr(canvas, 'small_circle_limit', [])
+
+        self.group_circle.setChecked(enable_circle)
             
-        vbox_circle.addWidget(table_circle)
+        self.table_circle.setRowCount(0)
+        for d, s in data:
+            row = self.table_circle.rowCount()
+            self.table_circle.insertRow(row)
+            self.table_circle.setItem(row, 0, QTableWidgetItem(str(d)))
+            self.table_circle.setItem(row, 1, QTableWidgetItem(str(s)))
+            
+        self.table_circle.cellDoubleClicked.connect(self.on_edit_circle_limit)
+            
+        vbox_circle.addWidget(self.table_circle)
         
         hbox_circle_btns = QHBoxLayout()
-        hbox_circle_btns.addWidget(QPushButton("增加..."))
-        hbox_circle_btns.addWidget(QPushButton("删除"))
+        self.btn_circle_add = QPushButton("增加...")
+        self.btn_circle_add.clicked.connect(self.on_add_circle_limit)
+        self.btn_circle_del = QPushButton("删除")
+        self.btn_circle_del.clicked.connect(self.on_del_circle_limit)
+        
+        hbox_circle_btns.addWidget(self.btn_circle_add)
+        hbox_circle_btns.addWidget(self.btn_circle_del)
         vbox_circle.addLayout(hbox_circle_btns)
         
-        left_layout.addWidget(group_circle)
+        left_layout.addWidget(self.group_circle)
         
         # Cut controls
         grid_cut = QGridLayout()
@@ -824,17 +1026,17 @@ class SystemSettingsDialog(QDialog):
         # Scan settings
         hb_scan_dir = QHBoxLayout()
         hb_scan_dir.addWidget(QLabel("扫描方向:"))
-        combo_scan = QComboBox()
-        combo_scan.addItems([
+        self.combo_scan_dir = QComboBox()
+        self.combo_scan_dir.addItems([
             "从下往上(从左往右)",
             "从下往上(从右往左)",
             "从上往下(从左往右)",
             "从上往下(从右往左)"
         ])
-        combo_scan.setMaxVisibleItems(10)
-        combo_scan.setEditable(True)
-        combo_scan.lineEdit().setReadOnly(True)
-        hb_scan_dir.addWidget(combo_scan)
+        self.combo_scan_dir.setMaxVisibleItems(10)
+        self.combo_scan_dir.setEditable(True)
+        self.combo_scan_dir.lineEdit().setReadOnly(True)
+        hb_scan_dir.addWidget(self.combo_scan_dir)
         right_layout.addLayout(hb_scan_dir)
         
         right_layout.addWidget(QCheckBox("启用主板补偿方式"))
@@ -1454,9 +1656,15 @@ class SystemSettingsDialog(QDialog):
                  if 'dxf2' in imp: self.chk_dxf2.setChecked(imp['dxf2'])
                  if 'dxf_point' in imp: self.chk_dxf_point.setChecked(imp['dxf_point'])
                  
-                 if 'pt_circle' in imp: 
-                     self.chk_pt_circle.setChecked(imp['pt_circle'][0])
-                     self.edit_pt_circle.setText(str(imp['pt_circle'][1]))
+                 if 'pt_circle' in imp:
+                     pt_circle = imp['pt_circle']
+                     if isinstance(pt_circle, (list, tuple)) and len(pt_circle) >= 2:
+                         self.chk_pt_circle.setChecked(bool(pt_circle[0]))
+                         self.edit_pt_circle.setText(str(pt_circle[1]))
+                     else:
+                         self.chk_pt_circle.setChecked(bool(pt_circle))
+                         if not self.edit_pt_circle.text():
+                             self.edit_pt_circle.setText("0")
                      
                  if 'ai_image' in imp: self.chk_ai_image.setChecked(imp['ai_image'])
                  if 'new_ai' in imp: self.chk_new_ai.setChecked(imp['new_ai'])
@@ -1466,8 +1674,12 @@ class SystemSettingsDialog(QDialog):
                  if 'nc_unit' in imp: self.edit_nc_unit.setText(str(imp['nc_unit']))
                  
                  if 'd1d2' in imp:
-                     self.chk_d1d2.setChecked(imp['d1d2'][0])
-                     self.combo_d1.setCurrentText(str(imp['d1d2'][1]))
+                     d1d2 = imp['d1d2']
+                     if isinstance(d1d2, (list, tuple)) and len(d1d2) >= 2:
+                         self.chk_d1d2.setChecked(bool(d1d2[0]))
+                         self.combo_d1.setCurrentText(str(d1d2[1]))
+                     else:
+                         self.chk_d1d2.setChecked(bool(d1d2))
                      
                  if 'field_name' in imp: self.chk_field_name.setChecked(imp['field_name'])
                  
@@ -1509,8 +1721,185 @@ class SystemSettingsDialog(QDialog):
                  if 'out_curve_prec' in exp: self.edit_out_curve_prec.setText(str(exp['out_curve_prec']))
                  if 'unit_size' in exp: self.combo_unit_size.setCurrentText(str(exp['unit_size']))
                  if 'unit_speed' in exp: self.combo_unit_speed.setCurrentText(str(exp['unit_speed']))
+                 if 'scan_direction' in exp and hasattr(self, 'combo_scan_dir'):
+                     self.combo_scan_dir.setCurrentText(str(exp['scan_direction']))
         except Exception as e:
             print(f"Error loading import/export settings: {e}")
+
+    def _gather_import_export_settings(self):
+        """从 UI 中收集导入/导出相关设置，返回 dict {import_settings, export_settings}"""
+        imp_settings = {}
+        exp_settings = {}
+        try:
+            imp_settings['plt_unit'] = self.combo_plt_unit.currentText()
+            imp_settings['text_height'] = float(self.edit_text_height.text() or 0)
+            imp_settings['dxf_unit'] = self.combo_dxf_unit.currentText()
+            imp_settings['dxf_custom_unit'] = float(self.edit_dxf_custom_unit.text() or 1.0)
+
+            imp_settings['dxf_text'] = self.chk_dxf_text.isChecked()
+            imp_settings['dxf2'] = self.chk_dxf2.isChecked()
+            imp_settings['dxf_point'] = self.chk_dxf_point.isChecked()
+
+            imp_settings['pt_circle'] = (self.chk_pt_circle.isChecked(), float(self.edit_pt_circle.text() or 0))
+
+            imp_settings['ai_image'] = self.chk_ai_image.isChecked()
+            imp_settings['new_ai'] = self.chk_new_ai.isChecked()
+            imp_settings['ai_fill'] = self.chk_ai_fill.isChecked()
+            imp_settings['dst_color'] = self.chk_dst_color.isChecked()
+            imp_settings['no_ext'] = self.chk_no_ext.isChecked()
+            imp_settings['nc_unit'] = float(self.edit_nc_unit.text() or 0.1)
+
+            imp_settings['d1d2'] = (self.chk_d1d2.isChecked(), int(self.combo_d1.currentText()))
+            imp_settings['field_name'] = self.chk_field_name.isChecked()
+
+            imp_settings['close_check'] = (self.chk_close.isChecked(), float(self.edit_close_tol.text() or 0))
+            imp_settings['merge_lines'] = (self.chk_merge.isChecked(), float(self.edit_merge_tol.text() or 0))
+            imp_settings['node_handle'] = (self.chk_node.isChecked(), float(self.edit_node_tol.text() or 0))
+            imp_settings['curve_smooth'] = (self.chk_smooth.isChecked(), float(self.edit_smooth_prec.text() or 0))
+            imp_settings['auto_group'] = self.chk_auto_group.isChecked()
+            imp_settings['imp_rdimage'] = self.chk_imp_rdimage.isChecked()
+            imp_settings['imp_clear'] = self.chk_imp_clear.isChecked()
+            imp_settings['imp_move'] = self.chk_imp_move.isChecked()
+            imp_settings['gap'] = (self.chk_gap.isChecked(), float(self.edit_gap.text() or 0))
+
+            imp_settings['multi_file'] = self.chk_multi_file.isChecked()
+            imp_settings['single_app'] = self.chk_single_app.isChecked()
+            imp_settings['auto_rot'] = int(self.combo_auto_rot.currentText())
+            imp_settings['dock_pos'] = self.combo_dock_pos.currentText()
+
+        except Exception as e:
+            print(f"Error gathering import settings: {e}")
+
+        try:
+            exp_settings['out_call'] = self.chk_out_call.isChecked()
+            exp_settings['enable_count'] = self.chk_enable_count.isChecked()
+            exp_settings['f1_start'] = self.chk_f1_start.isChecked()
+            exp_settings['out_curve_prec'] = float(self.edit_out_curve_prec.text() or 80.0)
+            exp_settings['unit_size'] = self.combo_unit_size.currentText()
+            exp_settings['unit_speed'] = self.combo_unit_speed.currentText()
+            if hasattr(self, 'combo_scan_dir'):
+                exp_settings['scan_direction'] = self.combo_scan_dir.currentText()
+            if hasattr(self, 'table_circle') and hasattr(self, 'group_circle'):
+                circle_limits = []
+                if self.group_circle.isChecked():
+                    for r in range(self.table_circle.rowCount()):
+                        d_item = self.table_circle.item(r, 0)
+                        s_item = self.table_circle.item(r, 1)
+                        if d_item and s_item:
+                            try:
+                                d = float(d_item.text())
+                                s = float(s_item.text())
+                                circle_limits.append((d, s))
+                            except ValueError:
+                                pass
+                exp_settings['small_circle_enable'] = self.group_circle.isChecked()
+                exp_settings['small_circle_limits'] = circle_limits
+        except Exception as e:
+            print(f"Error gathering export settings: {e}")
+
+        return {'import_settings': imp_settings, 'export_settings': exp_settings}
+
+    def on_btn_export_param_clicked(self):
+        """导出软件参数到 CFG (INI) 文件"""
+        try:
+            fname, _ = QFileDialog.getSaveFileName(self, "导出软件参数", "", "配置文件 (*.cfg);;所有文件 (*)")
+            if not fname:
+                return
+            data = self._gather_import_export_settings()
+            # 写入为 INI/CFG 格式，复杂值以 JSON 字符串存储
+            import configparser, json
+            cfg = configparser.ConfigParser()
+            cfg['import_settings'] = {}
+            cfg['export_settings'] = {}
+            for k, v in data['import_settings'].items():
+                if isinstance(v, (dict, list, tuple)):
+                    cfg['import_settings'][k] = json.dumps(v, ensure_ascii=False)
+                else:
+                    cfg['import_settings'][k] = str(v)
+
+            for k, v in data['export_settings'].items():
+                if isinstance(v, (dict, list, tuple)):
+                    cfg['export_settings'][k] = json.dumps(v, ensure_ascii=False)
+                else:
+                    cfg['export_settings'][k] = str(v)
+
+            with open(fname, 'w', encoding='utf-8') as f:
+                cfg.write(f)
+
+            QMessageBox.information(self, "导出成功", f"已导出参数到:\n{fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出参数失败: {e}")
+
+    def on_btn_import_param_clicked(self):
+        """从 CFG/JSON 文件导入软件参数并应用到 UI"""
+        try:
+            fname, _ = QFileDialog.getOpenFileName(self, "导入软件参数", "", "配置文件 (*.cfg);;所有文件 (*)")
+            if not fname:
+                return
+            # 支持 CFG/INI 格式（优先），也支持旧 JSON 格式
+            import configparser, json
+            data = {}
+            try:
+                cfg = configparser.ConfigParser()
+                cfg.read(fname, encoding='utf-8')
+                if 'import_settings' in cfg or 'export_settings' in cfg:
+                    imp = {}
+                    exp = {}
+                    if 'import_settings' in cfg:
+                        for k, v in cfg['import_settings'].items():
+                            try:
+                                imp[k] = json.loads(v)
+                            except Exception:
+                                # 尝试基本类型转换
+                                if v.lower() in ('true', 'false'):
+                                    imp[k] = v.lower() == 'true'
+                                else:
+                                    try:
+                                        imp[k] = int(v)
+                                    except Exception:
+                                        try:
+                                            imp[k] = float(v)
+                                        except Exception:
+                                            imp[k] = v
+                    if 'export_settings' in cfg:
+                        for k, v in cfg['export_settings'].items():
+                            try:
+                                exp[k] = json.loads(v)
+                            except Exception:
+                                if v.lower() in ('true', 'false'):
+                                    exp[k] = v.lower() == 'true'
+                                else:
+                                    try:
+                                        exp[k] = int(v)
+                                    except Exception:
+                                        try:
+                                            exp[k] = float(v)
+                                        except Exception:
+                                            exp[k] = v
+                    data = {'import_settings': imp, 'export_settings': exp}
+                else:
+                    # not ini-style; try JSON
+                    with open(fname, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+            except Exception:
+                # fallback to JSON
+                with open(fname, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+            imp = data.get('import_settings', {}) if isinstance(data, dict) else {}
+            exp = data.get('export_settings', {}) if isinstance(data, dict) else {}
+
+            # Apply to canvas if available
+            if self.parent() and hasattr(self.parent(), 'whiteboard'):
+                canvas = self.parent().whiteboard.canvas
+                canvas.import_settings = imp
+                canvas.export_settings = exp
+
+            # Refresh UI
+            self._load_import_export_ui()
+            QMessageBox.information(self, "导入成功", f"已从文件导入参数:\n{fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", f"导入参数失败: {e}")
 
     def get_interface_settings(self):
         return {

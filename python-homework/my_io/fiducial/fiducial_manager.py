@@ -36,10 +36,17 @@ class FiducialManager:
     def remove_fiducial(self):
         """删除定位点"""
         if self._fiducial_item:
-            self.canvas.scene.removeItem(self._fiducial_item)
+            # 只有当item属于当前场景且场景存在时才执行removeItem
+            if self._fiducial_item.scene() == self.canvas.scene:
+                self.canvas.scene.removeItem(self._fiducial_item)
             self._fiducial_item = None
         self._fiducial = None
         logger.info("已删除定位点")
+
+    def reset(self):
+        """重置状态（关联的图元已被外部清除时使用）"""
+        self._fiducial_item = None
+        self._fiducial = None
 
     def get_fiducial(self) -> Optional[Tuple[Point, str]]:
         """获取当前定位点"""

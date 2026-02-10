@@ -4,16 +4,18 @@
 右侧属性面板
 """
 import os
+import configparser
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
                              QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox, QDialog, QButtonGroup,
-                             QStyledItemDelegate, QStyle)
+                             QStyledItemDelegate, QStyle, QMenu, QTreeWidget, QTreeWidgetItem, QDialogButtonBox, QFrame)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView, QListView
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter, QPen
+from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter, QPen, QDoubleValidator
 from .device_config_dialog import DeviceConfigDialog
+from .debug_control_dialog import CommandDebugDialog
 from my_io.gcode.gcode_exporter import GCodeExporter
 from utils.device_manager import DeviceManager
 from my_io.communication.laser_communicator import LaserCommunicator
@@ -32,6 +34,7 @@ class LayerParams:
         self.max_power = 30.0
         self.scan_mode = "水平单向"
         self.scan_interval = 0.1
+        self.scan_direction = "跟随全局"
         self.priority = 1
         self.name = "" # 预留
         
@@ -49,6 +52,151 @@ class LayerParams:
         self.speed_2 = 100.0
         self.min_power_2 = 30.0
         self.max_power_2 = 30.0
+
+PARAM_OPTIONS = {
+    "扫描模式": ["一般模式", "特殊模式"],
+    "逐行送料": ["是", "否"],
+    "结束送料": ["是", "否"],
+    "X轴开机复位": ["是", "否"],
+    "Y轴开机复位": ["是", "否"],
+    "Z轴开机复位": ["是", "否"],
+    "U轴开机复位": ["是", "否"],
+    "走边框模式": ["关光走边框", "开光切边框", "四角打点"],
+    "阵列加工方式": ["双向走阵列", "单向走阵列"],
+    "吹气方式": ["出光吹气", "加工吹气", "一直吹气"],
+    "回位位置": ["定位点", "原点", "锚点"],
+    "寻焦模式": ["接触式寻焦", "非接触式寻焦"],
+    "使能旋转雕刻": ["是", "否"],
+    "快慢速切换使能": ["是", "否"],
+    "Z轴升降模式": ["电机模式", "IO模式"],
+}
+
+class OneClickSetupDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("切割参数")
+        self.resize(300, 100)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        layout.addWidget(QLabel("切割模式"))
+        
+        self.combo = QComboBox()
+        self.combo.addItems(["慢速切割", "精度切割", "普通切割", "快速切割", "超快速切割"])
+        
+        # 下拉框样式设置
+        self.combo.setMaxVisibleItems(10)
+        self.combo.setEditable(True)
+        self.combo.lineEdit().setReadOnly(True)
+        
+        layout.addWidget(self.combo)
+        
+        # 添加标准按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, Qt.Horizontal, self)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+class RotationSpeedDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置旋转速度")
+        self.setFixedSize(240, 100)
+        
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
+        
+        # 中间区域使用 QFrame 模拟 sunken 边框
+        container = QFrame(self)
+        container.setFrameShape(QFrame.Box) # 或者 QFrame.StyledPanel
+        container.setFrameShadow(QFrame.Sunken)
+        container.setLineWidth(1)
+        
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(10, 10, 10, 10)
+        container_layout.setSpacing(5)
+        container_layout.setAlignment(Qt.AlignCenter)
+        
+        lbl = QLabel("速度(mm/s):")
+        container_layout.addWidget(lbl)
+        
+        self.speed_input = QLineEdit("50.00")
+        self.speed_input.setFixedWidth(100) 
+        # 设置输入校验，仅允许输入数字
+        validator = QDoubleValidator(0.0, 9999.0, 3, self.speed_input)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        self.speed_input.setValidator(validator)
+        container_layout.addWidget(self.speed_input)
+        
+        main_layout.addWidget(container)
+        
+        # 按钮区域
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.addStretch()
+        
+        self.btn_ok = QPushButton("OK")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_ok.setFixedSize(60, 22)
+        
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.setFixedSize(60, 22)
+        
+        btn_layout.addWidget(self.btn_ok)
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addStretch()
+        
+        main_layout.addLayout(btn_layout)
+
+class UserParamDelegate(QStyledItemDelegate):
+    """自定义委托，用于优化用户参数树的编辑体验（增加高度、字号）"""
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        # 增加行高，设置为32（根据需要调整）
+        size.setHeight(max(size.height(), 32))
+        return size
+
+    def createEditor(self, parent, option, index):
+        # 第0列（参数名）不可编辑
+        if index.column() == 0:
+            return None
+            
+        # 第1列是值
+        if index.column() == 1:
+            # 获取参数名称（第0列）
+            name_idx = index.model().index(index.row(), 0, index.parent())
+            param_name = name_idx.data()
+            
+            if param_name in PARAM_OPTIONS:
+                combo = QComboBox(parent)
+                combo.addItems(PARAM_OPTIONS[param_name])
+                
+                # 下拉框样式设置
+                combo.setMaxVisibleItems(10)
+                combo.setEditable(True)
+                combo.lineEdit().setReadOnly(True)
+                
+                return combo
+                
+        return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):
+        if isinstance(editor, QComboBox):
+             val = index.data(Qt.EditRole)
+             idx = editor.findText(val)
+             if idx >= 0:
+                 editor.setCurrentIndex(idx)
+        else:
+             super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):
+        if isinstance(editor, QComboBox):
+             model.setData(index, editor.currentText())
+        else:
+             super().setModelData(editor, model, index)
 
 class LayerColorDelegate(QStyledItemDelegate):
     """自定义委托，用于第一列图层颜色的显示"""
@@ -249,6 +397,7 @@ class RightPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.canvas = None # 持有 Canvas 引用
+        self._internal_selection_change = False  # 防止循环触发选中的标志
         self.layer_data = {} # Key: hex color string, Value: LayerParams
         self.layer_order = [] # 存储图层顺序（hex color string list）
         
@@ -256,10 +405,41 @@ class RightPanel(QWidget):
         self.communicator.log_message.connect(self.on_comm_log)
         self.communicator.error_occurred.connect(self.on_comm_error)
         self.communicator.sending_finished.connect(self.on_sending_finished)
+        self.communicator.connection_changed.connect(self.on_connection_changed) # 添加连接状态监听
         
         self.current_layer_color = None # 当前选中的图层颜色（用于解决焦点丢失时的参数保存问题）
         
         self.init_ui()
+        
+        # 监听设备列表变化
+        DeviceManager().devices_changed.connect(self.refresh_device_list_and_restore_selection)
+
+    def on_connection_changed(self, connected):
+        """当底层连接状态改变时触发"""
+        # 可以更新UI状态，例如按钮颜色等
+        pass
+        
+    def refresh_device_list_and_restore_selection(self):
+        """刷新设备列表，并尝试保持选中项（如果有新增，选中新增）"""
+        current_text = self.combo_device.currentText()
+        old_count = self.combo_device.count() # 记录刷新前的数量
+        
+        self.refresh_device_list()
+        
+        new_count = self.combo_device.count()
+        
+        # 如果数量增加了，说明很可能是 CommandDebugDialog 添加了新设备，此时应自动选中最新的那个
+        if new_count > old_count:
+            self.combo_device.setCurrentIndex(new_count - 1)
+        else:
+            # 否则尝试保持之前的选中
+            idx = self.combo_device.findText(current_text)
+            if idx >= 0:
+                self.combo_device.setCurrentIndex(idx)
+            else:
+                # 如果之前的项不存在了（被修改了），默认选中第一个
+                 if self.combo_device.count() > 0:
+                     self.combo_device.setCurrentIndex(0)
 
     def set_canvas(self, canvas):
         """设置画布引用并连接信号"""
@@ -668,7 +848,7 @@ class RightPanel(QWidget):
             except Exception:
                 pass
             
-            lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors())
+            lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors(), layer_settings=self.layer_data)
             if not lines:
                 QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
                 return
@@ -692,10 +872,141 @@ class RightPanel(QWidget):
         self.communicator.stop_sending()
 
     def on_btn_download_clicked(self):
-        """下载"""
+        """下载: 生成 GCode 并作为文件上传到设备"""
         if not self.check_connection_and_alert():
             return
-        QMessageBox.information(self, "提示", "下载功能暂未实现")
+            
+        if not self.canvas:
+            return
+
+        try:
+            # 1. 生成 GCode
+            exporter = GCodeExporter()
+            exporter.set_config({
+                'feed_rate': self.speed_spin.value() * 60, 
+                'max_laser_power': self.max_power_spin.value() * 2.55
+            })
+            
+            lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors(), layer_settings=self.layer_data)
+            if not lines:
+                QMessageBox.warning(self, "提示", "画布为空")
+                return
+
+            # 2. 写入临时文件
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.nc', encoding='utf-8') as tf:
+                tf.write('\n'.join(lines))
+                temp_path = tf.name
+            
+            # 3. 询问用户远程文件名 (可选，这里先硬编码或使用默认)
+            remote_filename = "job_download.nc"
+            
+            # 4. 触发上传
+            # 注意: 上传是阻塞操作还是异步？我们现在的 communicator.upload_file_to_sd 是同步阻塞循环且处理事件
+            # 最好显示一个进度条对话框，但现在先简单处理
+            
+            QMessageBox.information(self, "开始下载", f"即将上传 {len(lines)} 行代码到设备 SD 卡...")
+            
+            success = self.communicator.upload_file_to_sd(temp_path, remote_filename)
+            
+            os.remove(temp_path) # 清理临时文件
+            
+            if success:
+                QMessageBox.information(self, "完成", "文件下载成功")
+            else:
+                QMessageBox.warning(self, "失败", "文件下载失败，请查看日志")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"下载过程出错: {str(e)}")
+
+    # ----------------- 测试面板功能实现 -----------------
+    def on_test_read_position(self):
+        """读取当前位置：发送查询指令"""
+        if not self.check_connection_and_alert():
+            return
+        # 常见的查询状态/位置指令，这里使用 '?' 作为示例
+        try:
+            self.communicator.send_immediate_gcode("?")
+            # 临时置为等待状态
+            self.coord_x_label.setText("X: -")
+            self.coord_y_label.setText("Y: -")
+            self.coord_z_label.setText("Z: -")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"发送查询失败: {e}")
+
+    def on_test_move_to_target(self):
+        """移动到目标位置，发送绝对移动指令"""
+        if not self.check_connection_and_alert():
+            return
+        try:
+            x = float(self.x_target.text())
+            y = float(self.y_target.text())
+        except Exception:
+            QMessageBox.warning(self, "输入错误", "目标坐标必须为数字")
+            return
+
+        # 使用快速移动 G0 指令
+        cmd = f"G0 X{float(x):.3f} Y{float(y):.3f}"
+        if self.chk_laser_on.isChecked():
+            # 如果勾选出光，先关闭出光（安全）或按需处理
+            pass
+
+        self.communicator.send_immediate_gcode(cmd)
+
+    def on_test_prev_time(self):
+        """显示前次加工时间（示例为占位）"""
+        # 目前没有真实记录，显示占位
+        self.prev_time_label.setText("00时:00分:00秒:000毫秒")
+
+    def on_axis_move(self, axis: str, direction: int):
+        """单轴点动移动，direction: 1 or -1"""
+        if not self.check_connection_and_alert():
+            return
+        try:
+            offset = float(self.offset_edit.text()) * direction
+        except Exception:
+            QMessageBox.warning(self, "输入错误", "偏移必须为数字")
+            return
+
+        try:
+            speed = float(self.speed_edit.text())
+        except Exception:
+            speed = 50.0
+
+        # 转换速度到 mm/min（G代码通常使用 mm/min）
+        feed = int(speed * 60)
+        # 使用 $J 相对插补点动（参考已有快捷命令）
+        cmd = f"$J=G91 {axis}{offset:.3f} F{feed}"
+        self.communicator.send_immediate_gcode(cmd)
+
+    def on_origin_xy(self):
+        if not self.check_connection_and_alert():
+            return
+        # 将 XY 轴设置为当前为原点
+        self.communicator.send_immediate_gcode("G10 L20 P0 X0 Y0")
+
+    def on_origin_z(self):
+        if not self.check_connection_and_alert():
+            return
+        self.communicator.send_immediate_gcode("G10 L20 P0 Z0")
+
+    def on_origin_u(self):
+        if not self.check_connection_and_alert():
+            return
+        # U 轴同样设置为0（如果存在）
+        self.communicator.send_immediate_gcode("G10 L20 P0 U0")
+
+    def on_focus(self):
+        if not self.check_connection_and_alert():
+            return
+        # 寻焦为示例命令，具体命令需根据设备定义
+        self.communicator.send_immediate_gcode("G28")
+
+    def on_locate(self):
+        if not self.check_connection_and_alert():
+            return
+        # 定位为示例命令
+        self.communicator.send_immediate_gcode("G0 X0 Y0")
 
     def on_btn_cut_border_clicked(self):
         """切边框"""
@@ -990,30 +1301,53 @@ class RightPanel(QWidget):
 
         # 1. 扫描画布上的颜色
         used_colors = set()
-        from ui.graphics_items import EditablePathItem, EditableEllipseItem
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
         from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem
         
         LAYER_COLOR_ROLE = Qt.UserRole + 100
+
+        # 辅助：收集每种颜色的项目类型，用于推断默认模式
+        color_item_types = {} 
 
         for item in self.canvas.scene.items():
             color = None
             if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                 color = item.pen().color()
+                item_type = 'vector'
             elif isinstance(item, QGraphicsTextItem):
                 color = item.defaultTextColor()
+                item_type = 'text'
+            elif isinstance(item, TextGraphicsItem):
+                color = item.pen().color()
+                item_type = 'text'
             elif isinstance(item, QGraphicsPixmapItem):
                 # 检查是否有绑定的图层颜色
                 color_data = item.data(LAYER_COLOR_ROLE)
                 if color_data and isinstance(color_data, QColor):
                     color = color_data
+                item_type = 'image'
             
             if color and color.isValid():
-                used_colors.add(color.name().upper())
+                hex_color = color.name().upper()
+                used_colors.add(hex_color)
+                
+                if hex_color not in color_item_types:
+                    color_item_types[hex_color] = set()
+                color_item_types[hex_color].add(item_type)
 
         # 2. 同步数据
         for hex_color in used_colors:
             if hex_color not in self.layer_data:
-                self.layer_data[hex_color] = LayerParams(QColor(hex_color))
+                new_params = LayerParams(QColor(hex_color))
+                # 智能识别默认模式
+                if hex_color in color_item_types:
+                    types = color_item_types[hex_color]
+                    if 'image' in types:
+                        new_params.mode = "激光扫描"  # 图片默认扫描
+                    else:
+                        new_params.mode = "激光切割" # 其他默认切割
+                
+                self.layer_data[hex_color] = new_params
 
         # --- 优化：检查是否需要重建表格 ---
         if not force:
@@ -1143,6 +1477,59 @@ class RightPanel(QWidget):
         hex_color = self.layer_table.item(row, 0).data(Qt.UserRole)
         self.current_layer_color = hex_color # 更新当前选中的颜色
         
+        # --- 新增：实现点选图层 -> 选中画布对应图形 ---
+        # 只有当不是程序内部同步触发（即用户手动点击图层列表）时才执行
+        if not self._internal_selection_change and self.canvas and self.canvas.scene:
+            try:
+                target_color_name = hex_color
+                
+                from ui.graphics_items import EditablePathItem, EditableEllipseItem
+                from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsItem
+                LAYER_COLOR_ROLE = Qt.UserRole + 100
+                
+                # 遍历所有项，匹配颜色的设为选中，不匹配的取消选中
+                # 注意：这里会触发 selectionChanged 信号，进而触发 on_selection_changed
+                # 但由于 on_selection_changed 会再次调用 selectRow (如果是同一行则可能是无操作，或者是重入)
+                # 关键是我们需要防止 on_layer_selected 再次被递归调用导致的逻辑混乱
+                # 基于 self._internal_selection_change 的保护逻辑主要是在 on_selection_changed -> on_layer_selected 这个方向
+                # 这里是 on_layer_selected -> canvas -> on_selection_changed -> on_layer_selected
+                # 所以我们需要在这里也设置标志，告诉 on_selection_changed "这是我触发的，你别管" 
+                # 或者，on_selection_changed 本身就是为了同步 "Canvas -> Layer List"。
+                # 如果 Canvas 变了（因为我们在这里改的），on_selection_changed 会再次尝试 selectRow。
+                # 如果 Row 已经是对的，selectRow 不会有副作用。
+                
+                # 为了安全，我们可以临时禁用 on_selection_changed 的影响？
+                # 但 on_selection_changed 是 MainWindow 连接的。RightPanel 不好直接断开。
+                # 实际上，只要 on_selection_changed 里的 selectRow 不会改变当前行（因为它就是当前行），
+                # 那么 on_layer_selected 就不会再次被触发。
+                # 只有当 Canvas 上选中的东西导致 逻辑认为应该选中 另一行时 才会出问题。
+                # 这里我们是全选该颜色的所有东西，所以 Canvas 选中的只能是这个颜色的，逻辑上会选中当前行。
+                # 所以应该是安全的。
+                
+                for item in self.canvas.scene.items():
+                    # 忽略不可选或隐藏的项
+                    if not item.flags() & QGraphicsItem.ItemIsSelectable or not item.isVisible():
+                        continue
+                        
+                    color = None
+                    if isinstance(item, (EditablePathItem, EditableEllipseItem)):
+                         color = item.pen().color()
+                    elif isinstance(item, QGraphicsTextItem):
+                         color = item.defaultTextColor()
+                    elif isinstance(item, QGraphicsPixmapItem):
+                         color_data = item.data(LAYER_COLOR_ROLE)
+                         if color_data and isinstance(color_data, QColor):
+                             color = color_data
+                    
+                    if color and color.name().upper() == target_color_name:
+                        item.setSelected(True)
+                    else:
+                        item.setSelected(False)
+                     
+            except Exception as e:
+                print(f"Sync layer selection error: {e}")
+        # -----------------------------------------------
+
         params = self.layer_data.get(hex_color)
         if params:
             self.color_bar.setStyleSheet(f"background-color: {hex_color}; border: 1px solid #888;")
@@ -1415,8 +1802,10 @@ class RightPanel(QWidget):
                 hex_color = color.name().upper()
                 for row in range(self.layer_table.rowCount()):
                     if self.layer_table.item(row, 0).data(Qt.UserRole) == hex_color:
+                        self._internal_selection_change = True  # 设置标志，防止反向触发
                         self.layer_table.selectRow(row)
-                        self.on_layer_selected() # 手动触发更新参数
+                        self.on_layer_selected() # 刷新参数显示
+                        self._internal_selection_change = False # 复位标志
                         break
 
     # 激光按钮点击回调
@@ -1651,29 +2040,43 @@ class RightPanel(QWidget):
 
     def create_user_tab(self):
         """创建用户标签页（加工参数界面）"""
-        widget=QWidget()
-        main_layout=QHBoxLayout(widget)
-        main_layout.setContentsMargins(8,8,8,8)
+        widget = QWidget()
+        main_layout = QHBoxLayout(widget)
+        main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        param_widget=QWidget()
-        param_layout=QVBoxLayout(param_widget)
-        param_layout.setContentsMargins(0,0,0,0)
+        # 左侧参数区域
+        param_widget = QWidget()
+        param_layout = QVBoxLayout(param_widget)
+        param_layout.setContentsMargins(0, 0, 0, 0)
         param_layout.setSpacing(8)
 
+<<<<<<< HEAD
         # 顶部单选按钮：加工参数 / 辅助参数 / 其他参数
         param_type_layout=QHBoxLayout()
+=======
+        # 顶部单选按钮组
+        param_type_layout = QHBoxLayout()
+>>>>>>> 3ec087f (feat: restore and apply local 72-file changes)
         param_type_layout.setSpacing(10)
-        process_radio=QRadioButton("加工参数")
-        process_radio.setChecked(True)
-        assist_radio=QRadioButton("辅助参数")
-        other_radio=QRadioButton("其他参数")
-        param_type_layout.addWidget(process_radio)
-        param_type_layout.addWidget(assist_radio)
-        param_type_layout.addWidget(other_radio)
+        
+        self.user_param_group = QButtonGroup(self)
+        self.radio_process = QRadioButton("加工参数")
+        self.radio_assist = QRadioButton("辅助参数")
+        self.radio_other = QRadioButton("其他参数")
+        
+        self.user_param_group.addButton(self.radio_process, 0)
+        self.user_param_group.addButton(self.radio_assist, 1)
+        self.user_param_group.addButton(self.radio_other, 2)
+        
+        param_type_layout.addWidget(self.radio_process)
+        param_type_layout.addWidget(self.radio_assist)
+        param_type_layout.addWidget(self.radio_other)
         param_type_layout.addStretch()
+        
         param_layout.addLayout(param_type_layout)
 
+<<<<<<< HEAD
         # 使用 QStackedWidget 在三种参数页面之间切换
         from PyQt5.QtWidgets import QStackedWidget
         stack = QStackedWidget()
@@ -2069,8 +2472,310 @@ class RightPanel(QWidget):
         # 如果canvas已设置，加载反向间隙值
         if self.canvas and hasattr(self, 'backlash_x_edit'):
             self._load_backlash_values()
+=======
+        # 参数树
+        self.user_param_tree = QTreeWidget()
+        self.user_param_tree.setHeaderHidden(True)
+        self.user_param_tree.setColumnCount(2)
+        # 调整列宽
+        self.user_param_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.user_param_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.user_param_tree.setAlternatingRowColors(True)
+        self.user_param_tree.setItemsExpandable(True)
+        self.user_param_tree.setRootIsDecorated(True)
+        # 设置自定义委托以增加行高
+        self.user_param_tree.setItemDelegate(UserParamDelegate(self.user_param_tree))
+        self.user_param_tree.itemClicked.connect(self.on_user_param_tree_item_clicked)
+        
+        param_layout.addWidget(self.user_param_tree)
+
+        # 默认选中第一个并刷新列表
+        self.radio_process.setChecked(True)
+        self.user_param_group.buttonClicked.connect(self.update_user_param_tree)
+        
+        # 初始化数据
+        self.init_user_params_data()
+        self.update_user_param_tree()
+
+        # 右侧按钮区域
+        btn_widget = QWidget()
+        btn_layout = QVBoxLayout(btn_widget)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(6)
+        
+        btn_open = QPushButton("打开")
+        btn_save = QPushButton("保存")
+        btn_read = QPushButton("读参数")
+        btn_write = QPushButton("写参数")
+        
+        btn_open.clicked.connect(self.on_open_params_clicked)
+        btn_save.clicked.connect(self.on_save_params_clicked)
+        btn_read.clicked.connect(self.on_read_params_clicked)
+        btn_write.clicked.connect(self.on_write_params_clicked)
+        
+        btn_layout.addWidget(btn_open)
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_read)
+        btn_layout.addWidget(btn_write)
+        btn_layout.addStretch()
+
+        main_layout.addWidget(param_widget, 3)
+        main_layout.addWidget(btn_widget, 1)
+>>>>>>> 3ec087f (feat: restore and apply local 72-file changes)
 
         return widget
+
+    def init_user_params_data(self):
+        """初始化用户参数数据"""
+        self.user_params = {
+            0: [ # 加工参数
+                ("切割参数", [
+                    ("空程速度(mm/s)", "200.000"),
+                    ("空程加速度(mm/s2)", "3000.000"),
+                    ("拐弯速度(mm/s)", "20.000"),
+                    ("拐弯加速度(mm/s2)", "400.000"),
+                    ("切割加速度(mm/s2)", "3000.000"),
+                    ("空走延时(ms)", "0.000"),
+                    ("切割加速倍率(0%-200%)", "100"),
+                    ("空程加速倍率(0%-200%)", "100"),
+                    ("拐弯系数(0%-200%)", "100"),
+                    ("一键设置", ""), # Special case
+                ]),
+                ("扫描参数", [
+                    ("x轴起始速度(mm/s)", "10.000"),
+                    ("y轴起始速度(mm/s)", "10.000"),
+                    ("x轴加速度(mm/s2)", "10000.000"),
+                    ("y轴加速度(mm/s2)", "3000.000"),
+                    ("扫描换行速度(mm/s)", "100.000"),
+                    ("扫描模式", "一般模式"),
+                    ("光斑大小(50~99%)(mm)", "80.000"),
+                    ("扫描系数", "100"),
+                ])
+            ],
+            1: [ # 辅助参数
+                ("送料参数", [
+                    ("送料前延时(s)", "0.000"),
+                    ("送料后延时(ms)", "0"),
+                    ("逐行送料", "否"),
+                    ("逐行送料补偿(mm)", "0.000"),
+                    ("结束送料", "是"),
+                ]),
+                ("复位参数", [
+                    ("复位速度(mm/s)", "20.000"),
+                    ("X轴开机复位", "是"),
+                    ("Y轴开机复位", "是"),
+                    ("Z轴开机复位", "否"),
+                    ("U轴开机复位", "否"),
+                ]),
+                ("走边框", [
+                    ("走边框模式", "关光走边框"),
+                    ("白边距离(mm)", "0.000"),
+                ])
+            ],
+            2: [ # 其他参数
+                ("其他参数", [
+                    ("阵列加工方式", "双向走阵列"),
+                    ("反向间隙X(mm)", "0.000"),
+                    ("反向间隙Y(mm)", "0.000"),
+                    ("吹气方式", "出光吹气"),
+                ]),
+                ("回位参数", [
+                    ("回位位置", "定位点"),
+                ]),
+                ("对焦参数", [
+                     ("焦距(mm)", "5.000"),
+                     ("材料厚度(mm)", "0.000"),
+                     ("寻焦模式", "接触式寻焦"),
+                ]),
+                ("旋转雕刻", [
+                    ("使能旋转雕刻", "否"),
+                    ("周脉冲", "1000.000"),
+                    ("工件直径(mm)", "20.000"),
+                    ("周脉冲测试", ""),
+                ]),
+                ("无线面板", [
+                    ("快慢速切换使能", "否"),
+                    ("快速移动(mm/s)", "100.000"),
+                    ("慢速移动(mm/s)", "10.000"),
+                ]),
+                ("特殊参数", [
+                    ("抬笔高度(mm)", "0.000"),
+                    ("落笔高度(mm)", "0.000"),
+                    ("Z轴升降模式", "电机模式"),
+                    ("吸附开延时(ms)", "0"),
+                    ("吸附关延时(ms)", "0"),
+                ])
+            ]
+        }
+
+    def update_user_param_tree(self):
+        """更新参数树显示"""
+        self.user_param_tree.clear()
+        
+        idx = self.user_param_group.checkedId()
+        if idx not in self.user_params:
+            return
+            
+        categories = self.user_params[idx]
+        for cat_name, items in categories:
+            cat_item = QTreeWidgetItem(self.user_param_tree)
+            cat_item.setText(0, cat_name)
+            # 设置第一列跨越所有列（像标题一样）？不，截图里在右边可能没有东西
+            # 但用户截图里，类别是有一行的。
+            # 我们可以设置背景色来区分
+            cat_item.setExpanded(True) # 默认展开
+            
+            for key, value in items:
+                child = QTreeWidgetItem(cat_item)
+                child.setText(0, key)
+                
+                # 特殊处理按钮类型的项
+                if key == "一键设置":
+                     # 创建一个按钮 (...)
+                     btn = QPushButton("...")
+                     btn.setFixedSize(30, 20) # 小按钮
+                     btn.clicked.connect(self.on_one_click_setup)
+                     
+                     # 放置在第二列
+                     self.user_param_tree.setItemWidget(child, 1, btn)
+                     
+                elif key == "周脉冲测试":
+                     # 创建一个按钮
+                     btn = QPushButton("...")
+                     btn.setFixedSize(30, 20) # 小按钮
+                     btn.clicked.connect(self.on_pulse_test_setup)
+                     
+                     # 放置在第二列
+                     self.user_param_tree.setItemWidget(child, 1, btn)
+                     
+                else:
+                    child.setText(1, value)
+                    child.setFlags(child.flags() | Qt.ItemIsEditable)
+
+    def on_user_param_tree_item_clicked(self, item, column):
+        """用户参数树单击事件处理"""
+        # 获取第一列的文本作为参数名
+        param_name = item.text(0)
+        # 如果是下拉框类型的参数，单击即进入编辑状态（显示下拉框）
+        if param_name in PARAM_OPTIONS:
+            self.user_param_tree.editItem(item, 1)
+
+    def on_one_click_setup(self):
+        """打开一键设置对话框"""
+        dialog = OneClickSetupDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            # 获取选中的模式，这里暂不执行具体逻辑，因为用户只要求界面
+            # mode = dialog.combo.currentText()
+            pass
+
+    def on_pulse_test_setup(self):
+        """打开周脉冲测试设置对话框"""
+        dialog = RotationSpeedDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            # 同样暂不执行逻辑
+            # speed = dialog.speed_input.text()
+            pass
+
+    def on_open_params_clicked(self):
+        """打开参数文件"""
+        filename, _ = QFileDialog.getOpenFileName(self, "打开参数", "", "INI Files (*.ini)")
+        if not filename:
+             return
+             
+        try:
+             config = configparser.ConfigParser()
+             config.read(filename, encoding='utf-8')
+             
+             # 更新 self.user_params
+             for group_idx, categories in self.user_params.items():
+                 for cat_idx, (cat_name, items) in enumerate(categories):
+                     if cat_name in config:
+                         section = config[cat_name]
+                         new_items = []
+                         for key, value in items:
+                              if key in section:
+                                  new_items.append((key, section[key]))
+                              else:
+                                  new_items.append((key, value))
+                         # Update the category items in place
+                         categories[cat_idx] = (cat_name, new_items)
+             
+             self.update_user_param_tree()
+             QMessageBox.information(self, "提示", "参数加载成功")
+             
+        except Exception as e:
+             QMessageBox.warning(self, "错误", f"加载参数失败: {str(e)}")
+
+    def on_save_params_clicked(self):
+        """保存参数文件"""
+        filename, _ = QFileDialog.getSaveFileName(self, "保存参数", "params.ini", "INI Files (*.ini)")
+        if not filename:
+             return
+             
+        try:
+             config = configparser.ConfigParser()
+             
+             for group_idx, categories in self.user_params.items():
+                 for cat_name, items in categories:
+                     config[cat_name] = {}
+                     for key, value in items:
+                         # Skip buttons
+                         if key in ["一键设置", "周脉冲测试"]:
+                             continue
+                         config[cat_name][key] = str(value)
+                         
+             with open(filename, 'w', encoding='utf-8') as f:
+                 config.write(f)
+                 
+             QMessageBox.information(self, "提示", "参数保存成功")
+             
+        except Exception as e:
+             QMessageBox.warning(self, "错误", f"保存参数失败: {str(e)}")
+
+    def on_read_params_clicked(self):
+        """读取机器参数"""
+        if not self.check_connection_and_alert():
+             return
+
+        # 模拟读取参数
+        QMessageBox.information(self, "提示", "正在从机器读取参数...")
+        
+        # 模拟：更新一些值
+        # 假设读取到了 工件直径=50
+        try:
+             # 查找 "其他参数" -> "旋转雕刻" -> "工件直径(mm)"
+             # loop to find
+             found = False
+             categories = self.user_params[2] # Other params
+             for cat_idx, (cat_name, items) in enumerate(categories):
+                 if cat_name == "旋转雕刻":
+                     new_items = []
+                     for key, value in items:
+                         if key == "工件直径(mm)":
+                             new_items.append((key, "50.000")) # Simulated read value
+                             found = True
+                         else:
+                             new_items.append((key, value))
+                     categories[cat_idx] = (cat_name, new_items)
+                     break
+            
+             if found:
+                 self.update_user_param_tree()
+                 QMessageBox.information(self, "提示", "参数读取成功 (模拟: 工件直径已更新为 50.000)")
+             else:
+                 QMessageBox.information(self, "提示", "参数读取成功")
+
+        except Exception as e:
+             QMessageBox.warning(self, "错误", f"读取参数失败: {str(e)}")
+
+    def on_write_params_clicked(self):
+        """写入机器参数"""
+        if not self.check_connection_and_alert():
+             return
+
+        # 模拟写入
+        QMessageBox.information(self, "提示", "正在写入参数到机器...")
+        QMessageBox.information(self, "提示", "参数写入成功 (模拟)")
 
     def create_test_tab(self):
         """创建测试标签页"""
@@ -2085,25 +2790,35 @@ class RightPanel(QWidget):
         coord_layout.setSpacing(6)
 
         coord_display_layout=QHBoxLayout()
-        coord_display_layout.addWidget(QLabel("X=?"))
-        coord_display_layout.addWidget(QLabel("Y=?"))
-        coord_display_layout.addWidget(QLabel("Z=?"))
+        self.coord_x_label = QLabel("X=?")
+        self.coord_y_label = QLabel("Y=?")
+        self.coord_z_label = QLabel("Z=?")
+        coord_display_layout.addWidget(self.coord_x_label)
+        coord_display_layout.addWidget(self.coord_y_label)
+        coord_display_layout.addWidget(self.coord_z_label)
         coord_display_layout.addStretch()
-        coord_display_layout.addWidget(QPushButton("读当前位置"))
+        self.btn_read_pos = QPushButton("读当前位置")
+        self.btn_read_pos.clicked.connect(self.on_test_read_position)
+        coord_display_layout.addWidget(self.btn_read_pos)
         coord_layout.addLayout(coord_display_layout)
 
         target_layout=QHBoxLayout()
-        x_target=QLineEdit("0.000")
-        y_target=QLineEdit("0.000")
-        target_layout.addWidget(x_target)
-        target_layout.addWidget(y_target)
-        target_layout.addWidget(QPushButton("移动到目标位置"))
+        self.x_target = QLineEdit("0.000")
+        self.y_target = QLineEdit("0.000")
+        target_layout.addWidget(self.x_target)
+        target_layout.addWidget(self.y_target)
+        self.btn_move_to_target = QPushButton("移动到目标位置")
+        self.btn_move_to_target.clicked.connect(self.on_test_move_to_target)
+        target_layout.addWidget(self.btn_move_to_target)
         coord_layout.addLayout(target_layout)
 
         time_layout=QHBoxLayout()
-        time_layout.addWidget(QLabel("0时:0分:0秒:0毫秒"))
+        self.prev_time_label = QLabel("0时:0分:0秒:0毫秒")
+        time_layout.addWidget(self.prev_time_label)
         time_layout.addStretch()
-        time_layout.addWidget(QPushButton("前次加工时间"))
+        self.btn_prev_time = QPushButton("前次加工时间")
+        self.btn_prev_time.clicked.connect(self.on_test_prev_time)
+        time_layout.addWidget(self.btn_prev_time)
         coord_layout.addLayout(time_layout)
         layout.addWidget(coord_group)
 
@@ -2114,54 +2829,95 @@ class RightPanel(QWidget):
 
         xy_layout=QHBoxLayout()
         xy_button_layout=QVBoxLayout()
-        xy_button_layout.addWidget(QPushButton("Y+"))
+        self.btn_y_plus = QPushButton("Y+")
+        self.btn_y_plus.clicked.connect(lambda: self.on_axis_move('Y', 1))
+        xy_button_layout.addWidget(self.btn_y_plus)
         xy_mid_layout=QHBoxLayout()
-        xy_mid_layout.addWidget(QPushButton("X-"))
-        xy_mid_layout.addWidget(QPushButton("原点"))
-        xy_mid_layout.addWidget(QPushButton("X+"))
+        self.btn_x_minus = QPushButton("X-")
+        self.btn_origin_xy = QPushButton("原点")
+        self.btn_x_plus = QPushButton("X+")
+        self.btn_x_minus.clicked.connect(lambda: self.on_axis_move('X', -1))
+        self.btn_origin_xy.clicked.connect(self.on_origin_xy)
+        self.btn_x_plus.clicked.connect(lambda: self.on_axis_move('X', 1))
+        xy_mid_layout.addWidget(self.btn_x_minus)
+        xy_mid_layout.addWidget(self.btn_origin_xy)
+        xy_mid_layout.addWidget(self.btn_x_plus)
         xy_button_layout.addLayout(xy_mid_layout)
-        xy_button_layout.addWidget(QPushButton("Y-"))
+        self.btn_y_minus = QPushButton("Y-")
+        self.btn_y_minus.clicked.connect(lambda: self.on_axis_move('Y', -1))
+        xy_button_layout.addWidget(self.btn_y_minus)
         xy_layout.addLayout(xy_button_layout)
 
         param_layout=QVBoxLayout()
         param_layout.addWidget(QLabel("偏移(mm):"))
-        offset_edit=QLineEdit("10.000")
-        param_layout.addWidget(offset_edit)
+        self.offset_edit=QLineEdit("10.000")
+        param_layout.addWidget(self.offset_edit)
         param_layout.addWidget(QLabel("速度(mm/s):"))
-        speed_edit=QLineEdit("50")
-        param_layout.addWidget(speed_edit)
+        self.speed_edit=QLineEdit("50")
+        param_layout.addWidget(self.speed_edit)
         param_layout.addWidget(QLabel("激光功率(%):"))
-        power_edit=QLineEdit("0")
-        param_layout.addWidget(power_edit)
+        self.power_edit=QLineEdit("0")
+        param_layout.addWidget(self.power_edit)
         xy_layout.addLayout(param_layout)
         axis_layout.addLayout(xy_layout)
 
         lower_layout=QHBoxLayout()
         zu_button_layout=QVBoxLayout()
-        zu_button_layout.addWidget(QPushButton("Z+"))
+        self.btn_z_plus = QPushButton("Z+")
+        self.btn_z_plus.clicked.connect(lambda: self.on_axis_move('Z', 1))
+        zu_button_layout.addWidget(self.btn_z_plus)
         zu_mid_layout=QHBoxLayout()
-        zu_mid_layout.addWidget(QPushButton("原点"))
-        zu_mid_layout.addWidget(QPushButton("Z-"))
+        self.btn_origin_z = QPushButton("原点")
+        self.btn_z_minus = QPushButton("Z-")
+        self.btn_origin_z.clicked.connect(self.on_origin_z)
+        self.btn_z_minus.clicked.connect(lambda: self.on_axis_move('Z', -1))
+        zu_mid_layout.addWidget(self.btn_origin_z)
+        zu_mid_layout.addWidget(self.btn_z_minus)
         zu_button_layout.addLayout(zu_mid_layout)
-        zu_button_layout.addWidget(QPushButton("U+"))
+        self.btn_u_plus = QPushButton("U+")
+        self.btn_u_plus.clicked.connect(lambda: self.on_axis_move('U', 1))
+        zu_button_layout.addWidget(self.btn_u_plus)
         zu_mid2_layout=QHBoxLayout()
-        zu_mid2_layout.addWidget(QPushButton("原点"))
-        zu_mid2_layout.addWidget(QPushButton("U-"))
+        self.btn_origin_u = QPushButton("原点")
+        self.btn_u_minus = QPushButton("U-")
+        self.btn_origin_u.clicked.connect(self.on_origin_u)
+        self.btn_u_minus.clicked.connect(lambda: self.on_axis_move('U', -1))
+        zu_mid2_layout.addWidget(self.btn_origin_u)
+        zu_mid2_layout.addWidget(self.btn_u_minus)
         zu_button_layout.addLayout(zu_mid2_layout)
         lower_layout.addLayout(zu_button_layout)
 
         check_layout=QVBoxLayout()
-        check_layout.addWidget(QCheckBox("连续运动"))
-        check_layout.addWidget(QCheckBox("从原点移动"))
-        check_layout.addWidget(QCheckBox("是否出光"))
+        self.chk_continuous = QCheckBox("连续运动")
+        self.chk_from_origin = QCheckBox("从原点移动")
+        self.chk_laser_on = QCheckBox("是否出光")
+        check_layout.addWidget(self.chk_continuous)
+        check_layout.addWidget(self.chk_from_origin)
+        check_layout.addWidget(self.chk_laser_on)
         check_layout.addStretch()
-        check_layout.addWidget(QPushButton("寻焦"))
-        check_layout.addWidget(QPushButton("定位"))
+        self.btn_focus = QPushButton("寻焦")
+        self.btn_focus.clicked.connect(self.on_focus)
+        self.btn_locate = QPushButton("定位")
+        self.btn_locate.clicked.connect(self.on_locate)
+        check_layout.addWidget(self.btn_focus)
+        check_layout.addWidget(self.btn_locate)
+        
+        # 新增调试按钮 - 已移除，功能合并至主界面工具箱
+        # btn_debug = QPushButton("高级调试/命令模式")
+        # btn_debug.clicked.connect(self.open_debug_console)
+        # btn_debug.setStyleSheet("background-color: #e1f5fe; border: 1px solid #039be5; color: #0277bd; font-weight: bold;")
+        # check_layout.addWidget(btn_debug)
+
         lower_layout.addLayout(check_layout)
         axis_layout.addLayout(lower_layout)
         layout.addWidget(axis_group)
 
         return widget
+
+    def open_debug_console(self):
+        """打开高级调试控制台"""
+        dialog = CommandDebugDialog(self.communicator, self)
+        dialog.exec_()
 
     def create_transform_tab(self):
         """创建变换标签页"""

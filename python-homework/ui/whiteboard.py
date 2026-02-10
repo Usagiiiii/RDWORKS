@@ -43,6 +43,10 @@ class PathPreviewItem(QGraphicsItem):
         self.setEnabled(False) # 不接收鼠标事件，避免遮挡底层操作
         self.setAcceptHoverEvents(False)
         
+    def shape(self):
+        # 返回空路径，彻底避免鼠标碰撞检测
+        return QPainterPath()
+
     def boundingRect(self):
         rect = QRectF()
         for line in self.travels:
@@ -187,6 +191,47 @@ class ScaleHandle(QGraphicsRectItem):
             'ml': Qt.SizeHorCursor, 'mr': Qt.SizeHorCursor
         }
         self.setCursor(cursors.get(self.pos_type, Qt.ArrowCursor))
+
+    def mouseDoubleClickEvent(self, event):
+        """双击处理：如果是文字对象，重新打开编辑窗口"""
+        if event.button() == Qt.LeftButton:
+            items = self.canvas.get_selected_items()
+            if len(items) == 1:
+                from ui.graphics_items import TextGraphicsItem
+                item = items[0]
+                if isinstance(item, TextGraphicsItem):
+                    from ui.text_dialog import TextDialog
+                    try:
+                        dlg = TextDialog(self.canvas, initial_text=item.text_data, initial_settings=item.settings)
+                        if dlg.exec_() == QDialog.Accepted:
+                            new_data = dlg.get_data()
+                            # Update text item
+                            # We should use Undo Command
+                            # But TextGraphicsItem doesn't store simple state for undo easily except rebuilding?
+                            # Let's check command usage.
+                            # For now update directly and maybe rebuild undo?
+                            # Ideally: remove old, add new OR update existing.
+                            
+                            # Use Undo Command
+                            from edit.text_commands import ChangeTextCommand
+                            
+                            old_text = item.text_data
+                            old_settings = dict(item.settings)
+                            new_text = new_data['text']
+                            new_settings = new_data
+                            
+                            cmd = ChangeTextCommand(self.canvas, item, old_text, old_settings, new_text, new_settings)
+                            cmd.redo()
+                            self.canvas.edit_manager.push_undo(cmd)
+                            
+                            # Update scene and handles
+                            self.canvas.scene.update()
+                            self.canvas.update_selection_handles()
+                    except Exception as e:
+                        print(f"Edit text error: {e}")
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -344,14 +389,15 @@ class ScaleHandle(QGraphicsRectItem):
                 m.scale(sx, sy)
                 m.translate(-cx_old, -cy_old)
                 
-                new_t = state * m # 注意乘法顺序，state 是 item 的 local-to-scene。
-                # 应该是 M * state ? 
-                # Point_scene_new = M * Point_scene_old
-                # Point_scene_old = state * Point_local
-                # Point_scene_new = M * state * Point_local
-                # 所以 new_transform = M * state
+                # 修正：必须考虑 item.pos() 的偏移
+                # Trans_new = Trans_old * Translate(Pos) * M * Translate(-Pos)
+                pos = item.pos()
+                t_pos = QTransform().translate(pos.x(), pos.y())
+                t_neg_pos = QTransform().translate(-pos.x(), -pos.y())
                 
-                item.setTransform(m * state)
+                new_t = state * t_pos * m * t_neg_pos
+                
+                item.setTransform(new_t)
 
 
 class RotateHandle(QGraphicsEllipseItem):
@@ -688,6 +734,7 @@ class GridCanvas(QGraphicsView):
         ROTATE = 19  # 旋转工具（鼠标拖拽或角度输入）
         BOX_ZOOM = 20  # 框选缩放工具
         MEASURE = 21   # 测量工具
+        FILLET = 22    # 倒圆角工具
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -718,8 +765,13 @@ class GridCanvas(QGraphicsView):
         self._drawing_tmp: Optional[QGraphicsPathItem] = None
         self._current_color = QColor(0, 0, 0)  # 默认黑色
         self._origin_location = 1  # 1:TL, 2:TR, 3:BL, 4:BR
-        self._laser_pos_anchor = 1 # 1-9
-        self._laser_pos_relative = False # Default unchecked based on usual software, but user asked to implement check box.
+        self._laser_pos_anchor = 1 # 1=TL, default to Top-Left
+        self._laser_pos_relative = True # Default checked as per user request
+
+        self._fillet_pick_enabled = False
+        self._fillet_probe_callback = None
+        self._fillet_apply_callback = None
+        self._fillet_valid_cursor = None
 
         # 定位点相关属性 - 使用新的管理器
         from my_io.fiducial.fiducial_manager import FiducialManager
@@ -728,6 +780,19 @@ class GridCanvas(QGraphicsView):
         # -------------------------- 新增：初始化编辑管理器 --------------------------
         self.edit_manager = EditManager(self)
         # -------------------------- Interface Settings --------------------------
+        self.import_settings = {
+            'plt_unit': '1016',
+            'dxf_unit': '毫米',
+            'dxf_custom_unit': 1.0,
+            'nc_unit': '0.10000',
+            'out_curve_prec': 80.0,
+            'close_check': False,
+            'close_tol': 0.1,
+            'merge_lines': False,
+            'merge_tol': 0.1,
+            'curve_smooth': False,
+            'auto_group': True
+        }
         self.grid_enabled = True
         self.grid_spacing = 50.0
         self.color_background = QColor("white")
@@ -1233,11 +1298,58 @@ class GridCanvas(QGraphicsView):
         self._cached_black_arrow_cursor = QCursor(pixmap, 0, 0)
         return self._cached_black_arrow_cursor
 
+    def _get_fillet_cursor(self):
+        if self._fillet_valid_cursor is not None:
+            return self._fillet_valid_cursor
+
+        from PyQt5.QtGui import QPixmap, QPainter, QPen, QBrush, QColor, QCursor
+
+        size = 24
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        pen = QPen(QColor(0, 0, 0))
+        pen.setWidth(2)
+        painter.setPen(pen)
+
+        cx = size // 2
+        cy = size // 2
+        painter.drawLine(cx, 3, cx, size - 3)
+        painter.drawLine(3, cy, size - 3, cy)
+
+        painter.setBrush(QBrush(Qt.NoBrush))
+        hole_pen = QPen(QColor(0, 0, 0))
+        hole_pen.setWidth(2)
+        painter.setPen(hole_pen)
+        painter.drawEllipse(cx - 3, cy - 3, 6, 6)
+
+        painter.end()
+
+        self._fillet_valid_cursor = QCursor(pixmap, cx, cy)
+        return self._fillet_valid_cursor
+
+    def enable_fillet_pick(self, probe_callback, apply_callback):
+        self._fillet_pick_enabled = True
+        self._fillet_probe_callback = probe_callback
+        self._fillet_apply_callback = apply_callback
+        self.set_tool(self.Tool.FILLET)
+
+    def disable_fillet_pick(self):
+        self._fillet_pick_enabled = False
+        self._fillet_probe_callback = None
+        self._fillet_apply_callback = None
+
     # --- 工具设置方法 ---
     def set_tool(self, t: int):
         """设置当前工具"""
         old_tool = self._tool
         self._tool = t
+
+        if old_tool == self.Tool.FILLET:
+            self.disable_fillet_pick()
 
         if old_tool == self.Tool.MEASURE:
             self._measuring_start = None
@@ -1389,6 +1501,8 @@ class GridCanvas(QGraphicsView):
         rect = QRectF(0, 0, self._work_w, self._work_h)
         self._work_item = self.scene.addRect(rect, pen, brush)
         self._work_item.setZValue(-100) # Put at bottom
+        # Crucial: Disable mouse interaction for the background paper so RubberBand selection works
+        self._work_item.setAcceptedMouseButtons(Qt.NoButton) 
         self._workarea_items.append(self._work_item)
         
         if self.grid_enabled:
@@ -1403,12 +1517,14 @@ class GridCanvas(QGraphicsView):
             for x in range(0, int(self._work_w) + 1, int(step)):
                 line = self.scene.addLine(x, 0, x, self._work_h, thin)
                 line.setZValue(-99)
+                line.setAcceptedMouseButtons(Qt.NoButton) # Disable mouse for grid lines
                 self._workarea_items.append(line)
                 
             # Y lines
             for y in range(0, int(self._work_h) + 1, int(step)):
                 line = self.scene.addLine(0, y, self._work_w, y, thin)
                 line.setZValue(-99)
+                line.setAcceptedMouseButtons(Qt.NoButton) # Disable mouse for grid lines
                 self._workarea_items.append(line)
 
         # --- Direction Indicator (Origin) ---
@@ -1438,6 +1554,7 @@ class GridCanvas(QGraphicsView):
         marker.setPen(QPen(Qt.NoPen))
         marker.setBrush(QBrush(QColor("red")))
         marker.setZValue(100)
+        marker.setAcceptedMouseButtons(Qt.NoButton)
         self._workarea_items.append(marker)
         
         # Blue Arrows
@@ -1452,6 +1569,7 @@ class GridCanvas(QGraphicsView):
         end_y = oy + dx_y * arrow_len
         line_x = self.scene.addLine(ox, oy, end_x, end_y, arrow_pen)
         line_x.setZValue(100)
+        line_x.setAcceptedMouseButtons(Qt.NoButton)
         self._workarea_items.append(line_x)
         
         # X-Axis Head
@@ -1470,6 +1588,7 @@ class GridCanvas(QGraphicsView):
         poly_x = make_head(p1_x, angle_x)
         item_poly_x = self.scene.addPolygon(poly_x, QPen(Qt.NoPen), QBrush(QColor("blue")))
         item_poly_x.setZValue(100)
+        item_poly_x.setAcceptedMouseButtons(Qt.NoButton)
         self._workarea_items.append(item_poly_x)
 
         # Y-Axis Arrow
@@ -1477,6 +1596,7 @@ class GridCanvas(QGraphicsView):
         end_yy = oy + dy_y * arrow_len
         line_y = self.scene.addLine(ox, oy, end_yx, end_yy, arrow_pen)
         line_y.setZValue(100)
+        line_y.setAcceptedMouseButtons(Qt.NoButton)
         self._workarea_items.append(line_y)
 
         # Y-Axis Head
@@ -1485,6 +1605,7 @@ class GridCanvas(QGraphicsView):
         poly_y = make_head(p1_y, angle_y)
         item_poly_y = self.scene.addPolygon(poly_y, QPen(Qt.NoPen), QBrush(QColor("blue")))
         item_poly_y.setZValue(100)
+        item_poly_y.setAcceptedMouseButtons(Qt.NoButton)
         self._workarea_items.append(item_poly_y)
 
     def set_work_size(self, w: float, h: float):
@@ -1794,7 +1915,7 @@ class GridCanvas(QGraphicsView):
         self._emit_view_changed()  # 同步标尺
 
     def show_path_preview(self, items: List[QGraphicsItem]):
-        """显示切割路径预览"""
+        """显示切割路径预览（增强版：支持文字/复杂路径内部空移解析）"""
         self.hide_path_preview()
         if not items:
             return
@@ -1807,34 +1928,59 @@ class GridCanvas(QGraphicsView):
         markers.append(start_pt) # Laser Head Marker
         last_end_point = start_pt
         
+        from PyQt5.QtGui import QPainterPath
+        
         for item in items:
             # 获取项的路径
-            path = None
-            if hasattr(item, 'path'):
-                path = item.path()
+            raw_path = None
+            if isinstance(item, (QGraphicsEllipseItem, EditableEllipseItem)):
+               raw_path = QPainterPath()
+               raw_path.addEllipse(item.rect())
+            elif isinstance(item, QGraphicsRectItem):
+               raw_path = QPainterPath()
+               raw_path.addRect(item.rect())
+            elif hasattr(item, 'path'):
+                raw_path = item.path()
             else:
-                path = item.shape()
+                raw_path = item.shape()
             
-            if path is None or path.isEmpty():
+            if raw_path is None or raw_path.isEmpty():
                 continue
+            
+            # 将路径转换到场景坐标系
+            trans = item.sceneTransform()
+            path = trans.map(raw_path)
+            
+            # 解析路径元素，提取所有 MoveTo 作为空移线段
+            count = path.elementCount()
+            for i in range(count):
+                elem = path.elementAt(i)
+                pt = QPointF(elem.x, elem.y)
                 
-            # 获取起点和终点（局部坐标）
-            # pointAtPercent(0) 是起点, pointAtPercent(1) 是终点
-            start_local = path.pointAtPercent(0)
-            end_local = path.pointAtPercent(1)
-            
-            # 转换为场景坐标
-            start_scene = item.mapToScene(start_local)
-            end_scene = item.mapToScene(end_local)
-            
-            # 添加起点标记 (User requested to remove green squares on graphics, except laser head)
-            # markers.append(start_scene) 
-            
-            # 如果有上一个项，添加空移路径
-            if last_end_point is not None:
-                travels.append(QLineF(last_end_point, start_scene))
+                if elem.type == QPainterPath.MoveToElement:
+                    # 这是一个新的子路径起点，生成空移线
+                    if last_end_point is not None:
+                        # 只有当两点距离足够大时才显示虚线（避免微小误差）
+                        if QLineF(last_end_point, pt).length() > 0.001:
+                            travels.append(QLineF(last_end_point, pt))
+                            # 可以在每个笔画起点添加微小的标记（可选）
+                            # markers.append(pt) 
+                    
+                    last_end_point = pt
+                    
+                elif elem.type == QPainterPath.LineToElement:
+                    last_end_point = pt
                 
-            last_end_point = end_scene
+                elif elem.type == QPainterPath.CurveToElement:
+                    # 贝塞尔曲线的第一个控制点，忽略
+                    pass
+                
+                elif elem.type == QPainterPath.CurveToDataElement:
+                    # 贝塞尔曲线的数据点（C2 或 EndPoint）
+                    # 总是更新，确保最后停留在 EndPoint
+                    last_end_point = pt
+            
+            # 最后一个元素处理完毕，last_end_point 已停留在 item 的最后一点
             
         if travels or markers:
             self._path_preview_item = PathPreviewItem(travels, markers)
@@ -2123,6 +2269,14 @@ class GridCanvas(QGraphicsView):
                 pass
 
     def mouseMoveEvent(self, e: QMouseEvent):
+        # 节点框选更新
+        if getattr(self, '_is_node_selecting', False) and self._node_select_rect_item:
+            cur_pos = self.mapToScene(e.pos())
+            orig = self._node_select_origin
+            rect = QRectF(orig, cur_pos).normalized()
+            self._node_select_rect_item.setRect(rect)
+            return
+
         # Handle Custom Pan
         if self._tool == self.Tool.PAN and self._panning:
             delta = e.pos() - self._pan_start_pos
@@ -2136,6 +2290,19 @@ class GridCanvas(QGraphicsView):
         
         # 始终发送坐标信号，确保坐标信息一直显示
         self.headMoved.emit(float(pos.x()), float(pos.y()))
+
+        if self._tool == self.Tool.FILLET and self._fillet_pick_enabled:
+            ok = False
+            try:
+                if self._fillet_probe_callback:
+                    ok = bool(self._fillet_probe_callback(pos))
+            except Exception:
+                ok = False
+            if ok:
+                self.viewport().setCursor(self._get_fillet_cursor())
+            else:
+                self.viewport().setCursor(Qt.CrossCursor)
+            return
         
         if self._tool == self.Tool.MEASURE:
             self._measuring_current = pos
@@ -2204,7 +2371,21 @@ class GridCanvas(QGraphicsView):
                 path.lineTo(pos.x(), pos.y())
             elif self._tool == self.Tool.DRAW_POLY:
                 # 折线预览：将当前已点的所有顶点与鼠标位置连成直线段，以实时显示当前折线路径
-                pts = self._drawing_pts + [(pos.x(), pos.y())]
+                target_x, target_y = pos.x(), pos.y()
+                
+                # Check for snap-to-close
+                if self._drawing_pts and len(self._drawing_pts) >= 2:
+                    sx, sy = self._drawing_pts[0]
+                    scale = self.transform().m11()
+                    tol = 10.0 / scale if scale > 0 else 10.0
+                    if (pos.x() - sx)**2 + (pos.y() - sy)**2 < tol**2:
+                        target_x, target_y = sx, sy
+                        # Show a different cursor to indicate closing
+                        self.viewport().setCursor(Qt.PointingHandCursor)
+                    else:
+                        self.viewport().setCursor(Qt.CrossCursor)
+
+                pts = self._drawing_pts + [(target_x, target_y)]
                 path = QPainterPath()
                 if len(pts) >= 2:
                     path.moveTo(pts[0][0], pts[0][1])
@@ -2438,11 +2619,19 @@ class GridCanvas(QGraphicsView):
         """清除缩放手柄"""
         if hasattr(self, '_scale_handles'):
             for h in self._scale_handles:
-                self.scene.removeItem(h)
+                try:
+                    if h.scene():
+                        h.scene().removeItem(h)
+                except Exception:
+                    pass
             self._scale_handles = []
         
         if hasattr(self, '_scale_bbox_item') and self._scale_bbox_item:
-            self.scene.removeItem(self._scale_bbox_item)
+            try:
+                if self._scale_bbox_item.scene():
+                    self._scale_bbox_item.scene().removeItem(self._scale_bbox_item)
+            except Exception:
+                pass
             self._scale_bbox_item = None
 
     # --- 鼠标事件处理 ---
@@ -2466,6 +2655,24 @@ class GridCanvas(QGraphicsView):
 
         pos = self.mapToScene(e.pos())
         x, y = pos.x(), pos.y()
+
+        if self._tool == self.Tool.FILLET and self._fillet_pick_enabled:
+            if e.button() == Qt.RightButton:
+                self.disable_fillet_pick()
+                self.set_tool(self.Tool.SELECT)
+                if hasattr(self, 'toolChanged'):
+                    self.toolChanged.emit(self.Tool.SELECT)
+                e.accept()
+                return
+
+            if e.button() == Qt.LeftButton:
+                try:
+                    if self._fillet_apply_callback:
+                        self._fillet_apply_callback(pos)
+                except Exception:
+                    pass
+                e.accept()
+                return
 
         # 记录按下时选中项的状态，用于在鼠标释放时生成移动命令
         try:
@@ -2491,11 +2698,77 @@ class GridCanvas(QGraphicsView):
             self._move_tracking = []
 
         if e.button() == Qt.LeftButton:
+            if self._tool == self.Tool.NODE_EDIT:
+                # 节点编辑模式特殊处理
+                # 1. 检测点击对象
+                item = self.itemAt(e.pos())
+                from ui.graphics_items import _DragHandle, _ControlPointHandle
+
+                # 如果点击的是句柄，允许默认交互（拖拽）
+                if isinstance(item, (_DragHandle, _ControlPointHandle)):
+                    super().mousePressEvent(e)
+                    return
+
+                # 如果点击的是可编辑路径 -> 激活该路径的节点编辑，不显示对象选择框
+                if isinstance(item, EditablePathItem):
+                    self.scene.clearSelection() # 清除系统选择（消除虚线框）
+                    
+                    # 支持 Shift 键多选激活
+                    if e.modifiers() & Qt.ShiftModifier:
+                        # 切换当前项的状态或保持激活
+                        new_state = not getattr(item, '_node_edit_enabled', False)
+                        # 用户习惯：Shift通常是加选，所以强制为True比较合理，或者Toggle
+                        # 这里使用 Toggle 逻辑
+                        item.enable_node_edit(not getattr(item, '_node_edit_enabled', False))
+                    else:
+                        # 单选模式：
+                        # 如果点击的路径已经是激活的，且有其他激活路径，是否应该保持？
+                        # 通常：点击一个对象 = 唯独选中它
+                        
+                        # 激活当前项
+                        if not getattr(item, '_node_edit_enabled', False):
+                            item.enable_node_edit(True)
+                        
+                        # 停用其他所有项
+                        for it in self.all_paths():
+                            if it != item and getattr(it, '_node_edit_enabled', False):
+                                it.enable_node_edit(False)
+                    
+                    # 更新 _active_node_edit_item (指向最近操作的项，用于部分逻辑兼容)
+                    if getattr(item, '_node_edit_enabled', False):
+                        self._active_node_edit_item = item
+                    else:
+                        # 如果当前项被关闭了，尝试找另一个激活的
+                        self._active_node_edit_item = None
+                        for it in self.all_paths():
+                            if getattr(it, '_node_edit_enabled', False):
+                                self._active_node_edit_item = it
+                                break
+
+                    e.accept()
+                    return
+
+                # 如果点击的是空白处（或非路径非句柄） -> 开始框选节点
+                # 前提是：已经有处于节点编辑模式的路径
+                active_paths = [p for p in self.all_paths() if getattr(p, '_node_edit_enabled', False)]
+                if active_paths:
+                    self._is_node_selecting = True
+                    self._node_select_origin = self.mapToScene(e.pos())
+                    
+                    # 创建橡皮筋
+                    self._node_select_rect_item = QGraphicsRectItem()
+                    self._node_select_rect_item.setPen(QPen(Qt.black, 1, Qt.DashLine))
+                    self._node_select_rect_item.setBrush(QBrush(QColor(0, 0, 255, 30)))
+                    self.scene.addItem(self._node_select_rect_item)
+                    e.accept()
+                    return
+
             if self._tool == self.Tool.DELETE:
                 # 获取视图坐标下的 Item（最上层）
                 item = self.itemAt(e.pos())
                 if item:
                     # 过滤掉不需要删除的辅助对象
+                    from ui.graphics_items import _DragHandle
                     is_helper = False
                     if hasattr(self, '_workarea_items') and (item in self._workarea_items):
                         is_helper = True
@@ -2602,8 +2875,23 @@ class GridCanvas(QGraphicsView):
                     except Exception:
                         pass
                 else:
-                    self._drawing_pts.append((x, y))
-                    self._show_drawing_preview()
+                    # Check for close
+                    processed = False
+                    if len(self._drawing_pts) >= 2:
+                        sx, sy = self._drawing_pts[0]
+                        scale = self.transform().m11()
+                        tol = 10.0 / scale if scale > 0 else 10.0
+                        if (x - sx)**2 + (y - sy)**2 < tol**2:
+                             # Close loop
+                             self._drawing_pts.append((sx, sy))
+                             self.add_polyline(self._drawing_pts)
+                             self._clear_drawing_state()
+                             self.viewport().setCursor(Qt.CrossCursor)
+                             processed = True
+                    
+                    if not processed:
+                        self._drawing_pts.append((x, y))
+                        self._show_drawing_preview()
 
             elif self._tool == self.Tool.DRAW_CURVE:
                 # 曲线绘制：点击添加锚点，右键结束
@@ -2793,6 +3081,38 @@ class GridCanvas(QGraphicsView):
             item.setTransform(transform)
 
     def mouseReleaseEvent(self, e: QMouseEvent):
+        # 节点框选结束处理
+        if getattr(self, '_is_node_selecting', False):
+            if self._node_select_rect_item:
+                rect = self._node_select_rect_item.rect()
+                self.scene.removeItem(self._node_select_rect_item)
+                self._node_select_rect_item = None
+                
+                # 查找框选中的句柄
+                items = self.scene.items(rect)
+                from ui.graphics_items import _DragHandle
+                
+                # 获取所有处于编辑模式的路径
+                active_paths = [p for p in self.all_paths() if getattr(p, '_node_edit_enabled', False)]
+                
+                # 如果未按住Shift，清除所有激活路径的旧节点选择
+                if not (e.modifiers() & Qt.ShiftModifier):
+                    for path in active_paths:
+                        path._selected_handle_indices.clear()
+                
+                # 遍历选中的句柄，从属相应的路径并选中
+                for it in items:
+                    if isinstance(it, _DragHandle) and it._owner in active_paths:
+                        it._owner._selected_handle_indices.add(it._idx)
+                        
+                # 刷新所有激活路径的外观
+                for path in active_paths:
+                    path._rebuild_handles()
+            
+            self._is_node_selecting = False
+            e.accept()
+            return
+
         # Handle Custom Pan
         if self._tool == self.Tool.PAN and self._panning:
             self._panning = False
@@ -3057,12 +3377,62 @@ class GridCanvas(QGraphicsView):
 
     def clear(self):
         """清空画布（适配原接口）"""
-        self.scene.clear()
+        # 先清除历史记录，防止 undo 引用即将删除的图元
+        self.edit_manager.reset()
+        # 重置定位点管理器状态（不触发removeItem，因为scene.clear会统一清理）
+        self.fiducial_manager.reset()
+
+        # 清除临时绘图对象引用
+        self._drawing_tmp = None
+        self._last_img_item = None
+        self._rotate_tracking = None
+        self._cursor_preview = None
+        
+        # 重置交互手柄引用（不调用 removeItem，因为 scene.clear 会一并清理）
+        # 显式将 Python 端列表/引用置空，断开与 C++ 底层对象的关联
+        self._scale_handles = []
+        self._scale_bbox_item = None
+        self._rotate_handle = None
+
+        # 屏蔽信号，防止 scene.clear 过程中触发 selectionChanged 导致 _on_selection_changed 
+        # 试图移除已经被清除的 items (缩放手柄、旋转把手等)
+        # 
+        # 同时，断开 selectionChanged 信号连接，确保万无一失。
+        # clear() 完成后再根据需要重连（或者只依赖 blockSignals）。
+        # 这里使用 blockSignals 已经足够，但为了绝对安全，我们确保在 clear 期间没有任何副作用。
+        
+        self.scene.blockSignals(True)
+        try:
+            # 2026-02-08: 发现 scene.clear() 仍导致大量 removeItem error。
+            # 这可能是因为 Python 垃圾回收机制或某些 item 在 cleanup 时触发了意外行为。
+            # 尝试先手动清空选中项，这会触发 selectionChanged (但被 blocked)，
+            # 帮助 scene 更平滑地过渡。
+            
+            # 手动移除所有 items 的选中状态，这可能会清理掉一些关联的 handles
+            for item in self.scene.items():
+                item.setSelected(False)
+            
+            # Now performing clear
+            self.scene.clear()
+            
+            # 关键修复：scene.clear() 已经删除了底层 C++ 对象。
+            # 必须清空 Python 端列表，防止后续 _draw_workarea() 试图再次 removeItem() 导致崩溃 (Error: scene 0x0)
+            self._workarea_items = []
+            self._work_item = None
+            
+        except Exception as e:
+            logger.error(f"Canvas clear error: {e}")
+        finally:
+            self.scene.blockSignals(False)
+            
+        # 手动重置选中状态通知
+        self.edit_manager.set_has_selection(False)
+        
         self._draw_workarea()  # 重新绘制工作区网格
         self._last_img_item = None
         self._bitmap_count = 0
         self._drawing_pts = []
-        self.remove_fiducial()
+        # self.remove_fiducial() # 不需要了，fiducial_manager.reset() + scene.clear() 已经处理
         self._emit_view_changed()
 
     def export_image(self, filename):

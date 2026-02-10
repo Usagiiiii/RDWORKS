@@ -37,10 +37,20 @@ def _check_conversion_tool(tool: str) -> Optional[str]:
 
     # 检查系统PATH
     for path in os.environ.get('PATH', '').split(os.pathsep):
+        # 排除 Windows system32 下的 convert.exe (它不是 ImageMagick)
+        if sys.platform.startswith('win') and tool.lower() in ('convert', 'convert.exe'):
+            if 'system32' in path.lower():
+                continue
+                
         exe_path = os.path.join(path, tool)
         if sys.platform.startswith('win'):
             exe_path += '.exe'
         if os.path.exists(exe_path) and os.access(exe_path, os.X_OK):
+            # 二次确认：如果是 convert.exe，检查路径是否通过
+            if sys.platform.startswith('win') and tool.lower() in ('convert', 'convert.exe'):
+               if 'system32' in exe_path.lower():
+                   continue
+                   
             logger.info(f"在系统PATH中找到工具: {exe_path}")
             return exe_path
 
@@ -80,9 +90,13 @@ def _find_tool_in_directory(tool_name: str, tools_dir: str) -> Optional[str]:
     # Windows可执行文件模式（增加更多可能路径）
     if sys.platform.startswith('win'):
         patterns = [
+            f"{tool_name}.com", # 优先查找 .com (CLI wrapper) 对于 Inkscape 等工具
             f"{tool_name}.exe",  # 直接在tools目录下
+            f"{tool_name}/{tool_name}.com",
             f"{tool_name}/{tool_name}.exe",  # 工具同名子目录
+            f"{tool_name}/bin/{tool_name}.com",
             f"{tool_name}/bin/{tool_name}.exe",  # 工具子目录的bin文件夹
+            f"bin/{tool_name}.com",
             f"bin/{tool_name}.exe",  # tools/bin目录
             f"*/{tool_name}.exe",  # 任意一级子目录
             f"*/*/{tool_name}.exe",  # 任意二级子目录

@@ -403,6 +403,14 @@ class LayerSettingsDialog(QDialog):
         # 扫描参数 (默认隐藏，仅在扫描模式显示)
         self.lbl_scan_mode = QLabel("扫描方式:")
         self.combo_scan_mode = self.create_combobox(["水平单向", "水平双向", "垂直单向", "垂直双向"])
+        self.lbl_scan_direction = QLabel("扫描方向:")
+        self.combo_scan_direction = self.create_combobox([
+            "跟随全局",
+            "从下往上(从左往右)",
+            "从下往上(从右往左)",
+            "从上往下(从左往右)",
+            "从上往下(从右往左)"
+        ])
         self.lbl_scan_interval = QLabel("扫描间隔(mm):")
         self.spin_scan_interval = QDoubleSpinBox()
         self.spin_scan_interval.setRange(0.001, 100.0)
@@ -412,19 +420,21 @@ class LayerSettingsDialog(QDialog):
         
         mid_layout.addWidget(self.lbl_scan_mode, 5, 0)
         mid_layout.addWidget(self.combo_scan_mode, 5, 1, 1, 2)
-        mid_layout.addWidget(self.lbl_scan_interval, 6, 0)
-        mid_layout.addWidget(self.spin_scan_interval, 6, 1, 1, 2)
+        mid_layout.addWidget(self.lbl_scan_direction, 6, 0)
+        mid_layout.addWidget(self.combo_scan_direction, 6, 1, 1, 2)
+        mid_layout.addWidget(self.lbl_scan_interval, 7, 0)
+        mid_layout.addWidget(self.spin_scan_interval, 7, 1, 1, 2)
         
         # 是否吹气
-        mid_layout.addWidget(QLabel("是否吹气:"), 7, 0)
+        mid_layout.addWidget(QLabel("是否吹气:"), 8, 0)
         self.combo_blowing = self.create_combobox(["是", "否"])
-        mid_layout.addWidget(self.combo_blowing, 7, 1, 1, 2)
+        mid_layout.addWidget(self.combo_blowing, 8, 1, 1, 2)
         
         # 功率设置区域 (使用 QFrame 模拟分割线效果)
         line = QWidget()
         line.setFixedHeight(1)
         line.setStyleSheet("background-color: #A0A0A0;")
-        mid_layout.addWidget(line, 8, 0, 1, 3)
+        mid_layout.addWidget(line, 9, 0, 1, 3)
 
         power_container = QWidget()
         power_layout = QGridLayout(power_container)
@@ -466,13 +476,13 @@ class LayerSettingsDialog(QDialog):
         self.chk_power_default = QCheckBox("默认")
         power_layout.addWidget(self.chk_power_default, 7, 2, Qt.AlignRight)
 
-        mid_layout.addWidget(power_container, 9, 0, 1, 3)
+        mid_layout.addWidget(power_container, 10, 0, 1, 3)
         
         # 底部横线
         line2 = QWidget()
         line2.setFixedHeight(1)
         line2.setStyleSheet("background-color: #A0A0A0;")
-        mid_layout.addWidget(line2, 10, 0, 1, 3)
+        mid_layout.addWidget(line2, 11, 0, 1, 3)
         
         params_container.addWidget(mid_group, 1)
         
@@ -587,6 +597,8 @@ class LayerSettingsDialog(QDialog):
         is_scan = (mode == "激光扫描")
         self.lbl_scan_mode.setVisible(is_scan)
         self.combo_scan_mode.setVisible(is_scan)
+        self.lbl_scan_direction.setVisible(is_scan)
+        self.combo_scan_direction.setVisible(is_scan)
         self.lbl_scan_interval.setVisible(is_scan)
         self.spin_scan_interval.setVisible(is_scan)
 
@@ -619,6 +631,7 @@ class LayerSettingsDialog(QDialog):
         
         # 加载扫描参数
         self.combo_scan_mode.setCurrentText(getattr(p, 'scan_mode', "水平单向"))
+        self.combo_scan_direction.setCurrentText(getattr(p, 'scan_direction', "跟随全局"))
         self.spin_scan_interval.setValue(getattr(p, 'scan_interval', 0.1))
         self.on_mode_changed(0) # 更新可见性
         
@@ -660,6 +673,7 @@ class LayerSettingsDialog(QDialog):
         
         # 保存扫描参数
         p.scan_mode = self.combo_scan_mode.currentText()
+        p.scan_direction = self.combo_scan_direction.currentText()
         p.scan_interval = self.spin_scan_interval.value()
         
         p.is_blowing = (self.combo_blowing.currentIndex() == 0)

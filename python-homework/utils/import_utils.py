@@ -223,6 +223,23 @@ def _convert_with_tool(input_path: str, target_format: str, tool_name: str) -> O
                     f'-sOutputFile={output_path}',
                     input_path
                 ]
+            elif target_format == 'pdf':
+                cmd = [
+                    tool_path,
+                    '-dSAFER', '-dBATCH', '-dNOPAUSE',
+                    '-sDEVICE=pdfwrite',
+                    # 针对AI/EPS文件通过GS转PDF时，页面大小和原点对齐常有问题。
+                    # 使用超大画布 + 偏移原点策略，确保所有内容都能被捕捉到。
+                    # 原来2000点可能不够（例如偏移500后只能容纳1500点的内容，约529mm）
+                    # 提升到10000点（约3.5米），足够覆盖绝大多数大幅面图纸
+                    '-dDEVICEWIDTHPOINTS=10000',
+                    '-dDEVICEHEIGHTPOINTS=10000',
+                    '-dFIXEDMEDIA',
+                    f'-sOutputFile={output_path}',
+                    '-c', '<</PageOffset [1000 1000]>> setpagedevice',
+                    '-f',
+                    input_path
+                ]
             else:
                 return None
         else:
@@ -232,6 +249,8 @@ def _convert_with_tool(input_path: str, target_format: str, tool_name: str) -> O
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
 
+        logger.info(f"Running conversion command: {' '.join(cmd)}")
+
         # 运行命令
         result = subprocess.run(
             cmd,
@@ -239,9 +258,9 @@ def _convert_with_tool(input_path: str, target_format: str, tool_name: str) -> O
             text=False,  # 使用二进制模式
             timeout=60,
             env=env,
-            check=True
+            check=False # Do not raise immediately, handle return code
         )
-
+        
         # 手动处理输出，避免编码错误
         stdout = b''
         stderr = b''
@@ -249,6 +268,11 @@ def _convert_with_tool(input_path: str, target_format: str, tool_name: str) -> O
             stdout = result.stdout.decode('utf-8', errors='ignore')
         if result.stderr:
             stderr = result.stderr.decode('utf-8', errors='ignore')
+            
+        if result.returncode != 0:
+            logger.error(f"Command failed (Return Code {result.returncode}):")
+            logger.error(f"STDOUT: {stdout}")
+            logger.error(f"STDERR: {stderr}")
 
         # 检查转换结果
         if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
@@ -260,11 +284,6 @@ def _convert_with_tool(input_path: str, target_format: str, tool_name: str) -> O
                 os.unlink(output_path)
             return None
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"工具{tool_name}执行失败: {e.returncode}")
-        if 'output_path' in locals() and os.path.exists(output_path):
-            os.unlink(output_path)
-        return None
     except subprocess.TimeoutExpired:
         logger.error(f"工具{tool_name}执行超时")
         if 'output_path' in locals() and os.path.exists(output_path):
@@ -287,12 +306,15 @@ def _get_inkscape_version(inkscape_path: str) -> Optional[Tuple[int, int, int]]:
         )
         if result.returncode == 0:
             # 解析版本号，如 "Inkscape 1.2.2 (732a01da63, 2022-12-09)"
-            version_match = re.search(r'Inkscape\s+([0-9]+)\.([0-9]+)\.([0-9]+)', result.stdout)
+            # 宽松匹配：可能只有 Inkscape 1.2
+            version_match = re.search(r'Inkscape\s+([0-9]+)\.([0-9]+)', result.stdout)
             if version_match:
                 major = int(version_match.group(1))
                 minor = int(version_match.group(2))
-                patch = int(version_match.group(3))
-                return (major, minor, patch)
+                # patch optional
+                return (major, minor, 0)
     except Exception as e:
         logger.warning(f"获取Inkscape版本失败: {str(e)}")
-    return None
+    
+    # 如果版本检测失败，默认认为是新版本(1.0+)，因为老版本用户较少且通常新安装的都是1.x
+    return (1, 0, 0)
