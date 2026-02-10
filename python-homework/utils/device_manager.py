@@ -1,17 +1,28 @@
 import json
 import os
+from PyQt5.QtCore import QObject, pyqtSignal
 
 CONFIG_FILE = "devices.json"
 
-class DeviceManager:
+class DeviceManager(QObject):
     _instance = None
+    devices_changed = pyqtSignal() # 信号：设备列表发生变化
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(DeviceManager, cls).__new__(cls)
-            cls._instance.devices = []
-            cls._instance.load_devices()
+            # 必须显式调用 QObject 的初始化，否则 C++ 部分未初始化会导致 RuntimeError
+            super(DeviceManager, cls._instance).__init__()
         return cls._instance
+    
+    def __init__(self):
+        # Prevent re-initialization
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        # super().__init__() # Removed: already called in __new__
+        self.devices = []
+        self.load_devices()
+        self._initialized = True
 
     def load_devices(self):
         if os.path.exists(CONFIG_FILE):
@@ -38,13 +49,16 @@ class DeviceManager:
     def add_device(self, name, address):
         self.devices.append({"name": name, "address": address})
         self.save_devices()
+        self.devices_changed.emit()
 
     def remove_device(self, index):
         if 0 <= index < len(self.devices):
             self.devices.pop(index)
             self.save_devices()
+            self.devices_changed.emit()
 
     def update_device(self, index, name, address):
         if 0 <= index < len(self.devices):
             self.devices[index] = {"name": name, "address": address}
             self.save_devices()
+            self.devices_changed.emit()

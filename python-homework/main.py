@@ -7,7 +7,7 @@
 
 import os
 import sys
-
+#cd c:\Users\臧雪鹏\Desktop\RDWORKS-python\python-homework  python modbus_server_sim.py
 # 在导入 PyQt5 之前尝试设置 QT 插件路径，避免因用户目录含非 ASCII 字符导致
 # QLibraryInfo 返回的路径被替换成问号（例如 C:/Users/???/...）而无法找到 plugins。
 if 'QT_QPA_PLATFORM_PLUGIN_PATH' not in os.environ:

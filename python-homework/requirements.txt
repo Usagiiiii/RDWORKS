@@ -23,3 +23,4 @@ pyparsing
 opencv-python
 pyserial
 pymodbus
+ezdxf

@@ -55,6 +55,15 @@ class EditManager(QObject):
         self.redoAvailable.emit(self._history_index < len(self._history))
         self.historyChanged.emit(self._build_history_descriptions(), self._history_index)
 
+    def reset(self):
+        """清空历史记录（新建文件时使用）"""
+        self._history.clear()
+        self._history_index = 0
+        self.undoAvailable.emit(False)
+        self.redoAvailable.emit(False)
+        # self._build_history_descriptions() might return empty list anyway
+        self.historyChanged.emit([], 0)
+
     def undo(self):
         if self._history_index == 0:
             return

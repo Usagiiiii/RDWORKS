@@ -381,9 +381,45 @@ class TextDialog(QDialog):
         self.combo_shx.setEnabled(not is_tt)
 
     def load_initial_settings(self):
-        if self.initial_settings:
-            # Load settings into UI
-            pass # Implementation dependent on how we want to defaults
+        s = self.initial_settings
+        if not s:
+            return
+
+        # Font Type
+        is_tt = s.get('is_truetype', True)
+        self.radio_truetype.setChecked(is_tt)
+        self.radio_shx.setChecked(not is_tt)
+        
+        # Font Family
+        font_family = s.get('font_family', 'Arial')
+        index = self.combo_font.findText(font_family)
+        if index >= 0:
+            self.combo_font.setCurrentIndex(index)
+        
+        # Style
+        self.btn_bold.setChecked(s.get('is_bold', False))
+        self.btn_italic.setChecked(s.get('is_italic', False))
+        
+        # Metrics
+        self.spin_height.setValue(float(s.get('height', 10.0)))
+        self.spin_width_percent.setValue(int(s.get('width_percent', 100)))
+        self.spin_char_spacing.setValue(float(s.get('char_spacing', 0.0)))
+        self.spin_line_spacing.setValue(float(s.get('line_spacing', 0.0)))
+        
+        # Variable Text
+        enable_var = s.get('enable_var', False)
+        self.chk_enable_var.setChecked(enable_var)
+        if enable_var:
+            var_type = s.get('var_type', '日期')
+            idx = self.combo_var_type.findText(var_type)
+            if idx >= 0:
+                self.combo_var_type.setCurrentIndex(idx)
+            
+            # Simple restoration for variable fields if needed, 
+            # but user focus is on font params.
+        
+        # Trigger mode update
+        self.toggle_font_mode()
 
     def update_preview(self):
         # Update the font of the input area to match selection

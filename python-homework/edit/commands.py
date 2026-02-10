@@ -739,9 +739,30 @@ class ChangeSegmentTypeCommand(Command):
             self.item.set_segment_types(self.old_types)
 
 
+class UpdatePathDataCommand(Command):
+    """更新路径点/分段/控制点数据"""
+    def __init__(self, item, new_data, desc="修改路径"):
+        self.item = item
+        self.new_data = new_data
+        self.old_data = item.get_path_data()
+        self.desc = desc
+
+    def redo(self):
+        try:
+            self.item.set_path_data(self.new_data)
+        except Exception:
+            pass
+
+    def undo(self):
+        try:
+            self.item.set_path_data(self.old_data)
+        except Exception:
+            pass
+
+
 class MacroCommand(Command):
-    def __init__(self, description=''):
-        self.commands = []
+    def __init__(self, description='', commands=None):
+        self.commands = commands if commands is not None else []
         self.description = description
 
     def add_command(self, cmd):

@@ -106,8 +106,16 @@ class DataCheckDialog(QDialog):
         main_layout.addWidget(left_widget, 4) # Ratio 4
         
         # --- Connections for Enabled States ---
-        self.chk_auto_close.toggled.connect(self.txt_closure_tol.setEnabled)
-        self.chk_enable_overlap_tol.toggled.connect(self.txt_overlap_tol.setEnabled)
+        # 初始绑定与逻辑处理（包含父级选中状态的级联控制）
+        self.chk_closure.toggled.connect(self.update_closure_ui)
+        self.chk_auto_close.toggled.connect(self.update_closure_ui)
+        
+        self.chk_overlap.toggled.connect(self.update_overlap_ui)
+        self.chk_enable_overlap_tol.toggled.connect(self.update_overlap_ui)
+
+        # 初始化状态
+        self.update_closure_ui()
+        self.update_overlap_ui()
 
         # --- Right Side ---
         right_widget = QWidget()
@@ -280,11 +288,10 @@ class DataCheckDialog(QDialog):
             self.append_text("未发现相交曲线", True)
 
     def check_overlap(self, items):
-        overlap_found = False
+        overlap_count = 0
+        overlapping_items = set()
         
-        # 逻辑修改：
-        # 如果勾选了“使能重叠容差”，使用用户输入的容差值。
-        # 如果未勾选，则使用极小值 (1e-7)，意味着必须几乎完全重合才算重叠。
+        # 逻辑修改：使用用户设定的容差
         if self.chk_enable_overlap_tol.isChecked():
             try:
                 tol = float(self.txt_overlap_tol.text())
@@ -295,16 +302,23 @@ class DataCheckDialog(QDialog):
         
         path_items = [item for item in items if isinstance(item, EditablePathItem)]
         
-        # Check for duplicates or heavy overlap
+        # O(N^2) 检查
+        # 改进：如果 A 和 B 重叠，两个都算作"有问题"的区域，都应该被高亮选中。
+        
         for i in range(len(path_items)):
-            pts1 = path_items[i].points()
+            item1 = path_items[i]
+            pts1 = item1.points()
+            if not pts1: continue
+            
             for j in range(i + 1, len(path_items)):
-                pts2 = path_items[j].points()
+                item2 = path_items[j]
+                pts2 = item2.points()
                 
+                # 点数不同直接跳过
                 if len(pts1) != len(pts2):
                     continue
-                    
-                # Check if all points are within tolerance
+                
+                # Forward check
                 is_duplicate = True
                 for k in range(len(pts1)):
                     dist = math.hypot(pts1[k][0]-pts2[k][0], pts1[k][1]-pts2[k][1])
@@ -312,25 +326,34 @@ class DataCheckDialog(QDialog):
                         is_duplicate = False
                         break
                 
-                # Also check reverse direction? (optional, good for user experience)
+                # Reverse check
                 if not is_duplicate:
-                    is_duplicate = True
+                    is_duplicate_rev = True
                     for k in range(len(pts1)):
-                        # pts1[k] vs pts2[n-1-k]
                         dist = math.hypot(pts1[k][0]-pts2[-(k+1)][0], pts1[k][1]-pts2[-(k+1)][1])
                         if dist > tol:
-                            is_duplicate = False
+                            is_duplicate_rev = False
                             break
+                    if is_duplicate_rev:
+                        is_duplicate = True
 
                 if is_duplicate:
-                    overlap_found = True
-                    break
-            if overlap_found: break
+                    overlap_count += 1
+                    overlapping_items.add(item1)
+                    overlapping_items.add(item2)
+        
+        # 更新选中状态
+        if overlapping_items:
+            self.canvas.scene.clearSelection()
+            for item in overlapping_items:
+                item.setSelected(True)
+            self.canvas.update()
 
-        if overlap_found:
-             self.append_text("发现重叠线条", False)
+        if overlap_count > 0:
+             self.append_text(f"发现重叠线条数:{overlap_count}", False)
         else:
              self.append_text("未发现重叠线条", True)
+
 
     def append_text(self, text, is_green=False):
         cursor = self.txt_result.textCursor()
@@ -367,3 +390,17 @@ class DataCheckDialog(QDialog):
         cursor.movePosition(cursor.End)
         cursor.insertText(text + "\n", fmt)
         self.txt_result.setTextCursor(cursor)
+
+    def update_closure_ui(self, *args):
+        """更新封闭性检查UI状态"""
+        is_checked = self.chk_closure.isChecked()
+        self.chk_auto_close.setEnabled(is_checked)
+        # 容差输入框只有在启用封闭性检查且勾选自动闭合时才可用
+        self.txt_closure_tol.setEnabled(is_checked and self.chk_auto_close.isChecked())
+
+    def update_overlap_ui(self, *args):
+        """更新重叠检查UI状态"""
+        is_checked = self.chk_overlap.isChecked()
+        self.chk_enable_overlap_tol.setEnabled(is_checked)
+        # 容差输入框只有在启用重叠检查且勾选容差使能时才可用
+        self.txt_overlap_tol.setEnabled(is_checked and self.chk_enable_overlap_tol.isChecked())

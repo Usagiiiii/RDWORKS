@@ -5,8 +5,8 @@
 """
 
 
-from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem
-from PyQt5.QtCore import Qt, QPointF, QRectF
+from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem, QStyle
+from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF
 from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent, QFont, QTransform, QFontMetrics, QFontDatabase, QFontMetricsF
 
 import math
@@ -44,6 +44,7 @@ class EditablePathItem(QGraphicsPathItem):
         self.setFlags(QGraphicsPathItem.ItemIsSelectable | QGraphicsPathItem.ItemIsMovable)
         # 用于记录拖动前的原始点
         self._move_orig_points = None
+        self.micro_joint_config = None  # {enabled, mode, qty, dist, width}
 
     def setPen(self, pen):
         super().setPen(pen)
@@ -161,6 +162,38 @@ class EditablePathItem(QGraphicsPathItem):
         if getattr(self, '_node_edit_enabled', False) and self._handles:
             self._update_handles_positions()
 
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        # Draw Micro-joints markers (Visual only)
+        if hasattr(self, 'micro_joint_config') and self.micro_joint_config and self.micro_joint_config.get('enabled', False):
+            self._draw_micro_joints(painter)
+
+    def _draw_micro_joints(self, painter):
+        path = self.path()
+        length = path.length()
+        if length <= 0:
+            return
+
+        # Prepare Painter for Cross
+        # 使用 Cosmetic 笔以确保在任何缩放级别下都能看到线条，增加宽度
+        pen = QPen(Qt.blue, 2.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        
+        cross_size = 4.0
+
+        # 只在起点绘制一个标记，作为启用的指示
+        pt = path.pointAtPercent(0.0)
+        
+        # Draw X
+        p1 = QPointF(pt.x() - cross_size, pt.y() - cross_size)
+        p2 = QPointF(pt.x() + cross_size, pt.y() + cross_size)
+        painter.drawLine(QLineF(p1, p2))
+        
+        p3 = QPointF(pt.x() - cross_size, pt.y() + cross_size)
+        p4 = QPointF(pt.x() + cross_size, pt.y() - cross_size)
+        painter.drawLine(QLineF(p3, p4))
+
     def points(self):
         return self._points[:]
 
@@ -175,6 +208,66 @@ class EditablePathItem(QGraphicsPathItem):
         # 只有在节点编辑模式开启时才显示/重建锚点句柄
         if getattr(self, '_node_edit_enabled', False):
             self._rebuild_handles()
+
+    def is_closed(self):
+        """检查是否闭合"""
+        if len(self._points) < 3:
+            return False
+        if getattr(self, '_straight_close', False):
+            return True
+        p0 = self._points[0]
+        p1 = self._points[-1]
+        return math.hypot(p0[0]-p1[0], p0[1]-p1[1]) < 1e-5
+
+    def change_start_point(self, index):
+        """
+        改变闭合图形的起割点
+        index: 原_points中的索引，该点将变成新的起点(索引0)
+        """
+        if not self.is_closed():
+            return False
+        if index == 0:
+            return True
+            
+        # 验证首尾是否重合
+        p_start = self._points[0]
+        p_end = self._points[-1]
+        physically_closed = math.hypot(p_start[0]-p_end[0], p_start[1]-p_end[1]) < 1e-5
+        
+        if physically_closed:
+            # 这是一个多边形环，实际上有 N-1 个唯一顶点
+            unique_pts = self._points[:-1]
+            num_unique = len(unique_pts)
+            if index >= num_unique:
+                return False 
+                
+            # 旋转点
+            new_unique = unique_pts[index:] + unique_pts[:index]
+            # 补回闭合点
+            new_pts = new_unique + [new_unique[0]]
+            
+            # --- 旋转属性 ---
+            target_len = num_unique # segments count
+            
+            # 1. Segment Types
+            if hasattr(self, '_segment_types') and len(self._segment_types) == target_len:
+                old_segs = self._segment_types
+                new_segs = old_segs[index:] + old_segs[:index]
+                self._segment_types = new_segs
+            
+            # 2. Control Points
+            if hasattr(self, '_control_points') and self._control_points:
+                new_cps = {}
+                for k, v in self._control_points.items():
+                    # k is segment index
+                    new_k = (k - index) % target_len
+                    new_cps[new_k] = v
+                self._control_points = new_cps
+            
+            self.set_points(new_pts)
+            return True
+        else:
+            return False
 
     def get_path_data(self):
         """返回路径完整数据(点,段类型,控制点)"""
@@ -244,10 +337,22 @@ class EditablePathItem(QGraphicsPathItem):
 
     def _clear_handles(self):
         for h in self._handles:
-            # 如果是子项，可以直接清理或者从 scene 移除
-            if h.scene():
-                h.scene().removeItem(h)
-            h.setParentItem(None)
+            # 安全移除逻辑：先检查scene是否存在
+            try:
+                # 注意：当父项被移除时，h.scene() 可能已经为 None 或者无效
+                # 为了避免 removeItem 报错，我们只在 h 确实归属于某个 scene 时尝试移除
+                scene = h.scene()
+                if scene:
+                    # Double check if item thinks it has a scene (catch C++ warning conditions)
+                    # Python wrapper might be stale.
+                    scene.removeItem(h)
+            except Exception:
+                pass
+            
+            try:
+                h.setParentItem(None)
+            except Exception:
+                pass
         self._handles.clear()
 
     def _rebuild_handles(self):
@@ -333,6 +438,22 @@ class EditablePathItem(QGraphicsPathItem):
                     h.update() # Trigger repaint of the dashed line
                 else:
                     h.setVisible(False)
+
+    def paint(self, painter, option, widget=None):
+        # 覆写 paint 以控制选框绘制
+        # 备份原始 State_Selected 状态
+        original_state = option.state
+        
+        # 如果处于节点编辑模式，临时移除 Selected 状态，防止 Qt 绘制虚线选框
+        if getattr(self, '_node_edit_enabled', False):
+            option.state &= ~QStyle.State_Selected
+
+        super().paint(painter, option, widget)
+        if hasattr(self, 'micro_joint_config') and self.micro_joint_config and self.micro_joint_config.get('enabled', False):
+            self._draw_micro_joints(painter)
+        
+        # 恢复状态（虽然对 painter 没影响，但保持好习惯）
+        option.state = original_state
 
     def update_point(self, idx: int, x: float, y: float):
         if 0 <= idx < len(self._points):
@@ -865,39 +986,53 @@ class _ControlPointHandle(QGraphicsRectItem):
 
 
 class _DragHandle(QGraphicsRectItem):
-    def __init__(self, owner, idx: int, x: float, y: float):
-        r = 3.0  # Slightly smaller for square
-        # 创建矩形，初始位置在 (0, 0)，大小为 2r x 2r
+    def __init__(self, owner: 'EditablePathItem', idx: int, x: float, y: float):
+        r = 3.0
         super().__init__(-r, -r, 2 * r, 2 * r, parent=owner)
         self._owner = owner
         self._idx = idx
-        # 蓝色正方形
-        pen = QPen(QColor(0, 0, 255))
+        # 黑色边框，白色填充 (仿照截图 3)
+        pen = QPen(QColor(0, 0, 0))
         pen.setWidth(1)
         pen.setCosmetic(True)
         self.setPen(pen)
-        # 白色填充或浅蓝填充? User said "blue square". 
-        # Usually handles are white with blue border or solid blue.
-        # Screenshot shows small squares with white interior maybe?
-        # Let's use blue border, white fill to be clean, or blue fill. 
-        # User said "tip of arrow... small blue square". Solid blue implies filled.
-        # But previous code had alpha 120.
-        self.setBrush(QBrush(QColor(255, 255, 255))) # White fill
-        # Or blue fill? "small blue square".
-        # Let's try White fill with Blue border similar to standard node tools.
-        # Screenshot provided: Nodes on rectangle are small squares.
+        self.setBrush(QBrush(QColor(255, 255, 255)))
         
         self.setZValue(10)
-        # 不设置 ItemIsMovable，避免 Qt 自动移动句柄
-        self.setFlags(QGraphicsItem.ItemIsSelectable)
-        self.setCursor(Qt.ArrowCursor) # Or CrossCursor? Or inherit?
-        # Node edit cursor usually is specific.
+        self.setFlags(QGraphicsItem.ItemIsSelectable) 
+        # 注意：不设置 Movable，拖拽逻辑由 ScaleHandle 或 外部 mouseMove 自行处理？
+        # 原代码是 ItemIsMovable，这里应该保持一致，或者由 Tool.NODE_EDIT 接管
+        # 如果是 Tool.NODE_EDIT 接管移动，则此处不需要 Movable，但 DragHandle 原本逻辑似乎依赖 Movable
+        # 考虑到用户说 "鼠标也可以按住节点进行调节路径"，我们保持 Movable 以便底层逻辑处理位置更新
+        # 但在框选时，我们需要区分是点击还是拖拽
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        self.setCursor(Qt.ArrowCursor)
         
-        # 设置句柄的场景位置 (Set local pos relative to parent)
+        # 绝对定位调整 (因为 parent 是 owner)
+        # 如果 owner 在 (0,0)，则 setPos(x,y)
+        # owner 是 PathItem，其 bounding rect 可能很大
         self.setPos(x, y)
 
-    def mouseMoveEvent(self, e: QMouseEvent):
-        # 获取鼠标在场景中的位置
+    def mouseMoveEvent(self, e):
+        # 阻止默认的 item 移动行为，改为不仅移动自己，还通知 owner 更新数据
+        # 1. 计算新的局部坐标 (因为 _DragHandle 是子项)
+        # 实际上 setPos 是在 parent (owner) 的坐标系下
+        # e.scenePos() -> map to parent?
+        # NO, DragHandle parent is owner. QGraphicsItem.mouseMoveEvent handles dragging if IsMovable.
+        # But we need real-time update of the polyline.
+        
+        # 让父类处理实际的移动 (setPos)
+        super().mouseMoveEvent(e)
+        
+        # 2. 获取移动后的新位置
+        new_pos = self.pos()
+        
+        # 3. 通知 owner 更新对应点的坐标 (实现实时预览)
+        # update_point 会触发 owner._update_path() -> setPath(...)
+        # 注意：update_point 内部可能会再次尝试更新所有 handles 位置，导致递归或抖动
+        # 我们需要 update_point 足够智能，或者在这里只更新 path 不更新 handles
+        if self._owner:
+             self._owner.update_point(self._idx, new_pos.x(), new_pos.y())
         scene_pos = self.mapToScene(e.pos())
         # 转换为 Owner (PathItem) 的局部坐标，因为 update_point 需要局部坐标
         local_pos = self._owner.mapFromScene(scene_pos)
@@ -1000,6 +1135,42 @@ class EditableEllipseItem(QGraphicsEllipseItem):
         self._node_edit_enabled = False
         self._handles = []
         self._move_orig_rect = None
+        self.micro_joint_config = None # {enabled, mode, qty, dist, width}
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        # Draw Micro-joints markers (Visual only)
+        if hasattr(self, 'micro_joint_config') and self.micro_joint_config and self.micro_joint_config.get('enabled', False):
+            self._draw_micro_joints(painter)
+
+    def _draw_micro_joints(self, painter):
+        # QGraphicsEllipseItem doesn't have path(), construct it from rect
+        path = QPainterPath()
+        path.addEllipse(self.rect())
+        
+        length = path.length()
+        if length <= 0:
+            return
+
+        # Prepare Painter for Cross
+        # 使用 Cosmetic 笔以确保在任何缩放级别下都能看到线条，增加宽度
+        pen = QPen(Qt.blue, 2.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        
+        cross_size = 4.0
+
+        # 只在起点绘制一个标记，作为启用的指示
+        pt = path.pointAtPercent(0.0)
+            
+        # Draw X
+        p1 = QPointF(pt.x() - cross_size, pt.y() - cross_size)
+        p2 = QPointF(pt.x() + cross_size, pt.y() + cross_size)
+        painter.drawLine(QLineF(p1, p2))
+        
+        p3 = QPointF(pt.x() - cross_size, pt.y() + cross_size)
+        p4 = QPointF(pt.x() + cross_size, pt.y() - cross_size)
+        painter.drawLine(QLineF(p3, p4))
 
     def setPen(self, pen):
         # 只有在非节点编辑模式下才更新颜色
@@ -1042,9 +1213,17 @@ class EditableEllipseItem(QGraphicsEllipseItem):
 
     def _clear_handles(self):
         for h in self._handles:
-            if h.scene():
-                h.scene().removeItem(h)
-            h.setParentItem(None)
+            try:
+                scene = h.scene()
+                if scene:
+                    scene.removeItem(h)
+            except Exception:
+                pass
+            
+            try:
+                h.setParentItem(None)
+            except Exception:
+                pass
         self._handles.clear()
 
         
