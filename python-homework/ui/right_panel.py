@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView, QListView
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter, QPen, QDoubleValidator
+from utils.tool_utils import get_resource_path
 from .device_config_dialog import DeviceConfigDialog
 from .debug_control_dialog import CommandDebugDialog
 from my_io.gcode.gcode_exporter import GCodeExporter
@@ -2051,13 +2052,8 @@ class RightPanel(QWidget):
         param_layout.setContentsMargins(0, 0, 0, 0)
         param_layout.setSpacing(8)
 
-<<<<<<< HEAD
-        # 顶部单选按钮：加工参数 / 辅助参数 / 其他参数
-        param_type_layout=QHBoxLayout()
-=======
         # 顶部单选按钮组
         param_type_layout = QHBoxLayout()
->>>>>>> 3ec087f (feat: restore and apply local 72-file changes)
         param_type_layout.setSpacing(10)
         
         self.user_param_group = QButtonGroup(self)
@@ -2076,403 +2072,6 @@ class RightPanel(QWidget):
         
         param_layout.addLayout(param_type_layout)
 
-<<<<<<< HEAD
-        # 使用 QStackedWidget 在三种参数页面之间切换
-        from PyQt5.QtWidgets import QStackedWidget
-        stack = QStackedWidget()
-        param_layout.addWidget(stack, 1)
-
-        # -------- 页面1：加工参数（保留原来的切割参数 + 扫描参数） --------
-        process_page = QWidget()
-        process_layout = QVBoxLayout(process_page)
-        process_layout.setContentsMargins(0, 0, 0, 0)
-        process_layout.setSpacing(8)
-
-        cut_group=QGroupBox("切割参数")
-        cut_layout=QVBoxLayout(cut_group)
-        cut_layout.setContentsMargins(10,10,10,10)
-        cut_layout.setSpacing(6)
-
-        cut_rows=[
-            ("空程速度(mm/s)","200.000"),
-            ("空程加速度(mm/s2)","3000.000"),
-            ("拐弯速度(mm/s)","20.000"),
-            ("拐弯加速度(mm/s2)","400.000"),
-            ("切割加速度(mm/s2)","3000.000"),
-            ("空走延时(ms)","0.000"),
-            ("切割加速倍率(0%~200%)","100"),
-            ("空程加速倍率(0%~200%)","100"),
-            ("拐弯系数(0%~200%)","100"),
-        ]
-        for label_text,value in cut_rows:
-            row_layout=QHBoxLayout()
-            row_layout.addWidget(QLabel(label_text),1)
-            edit=QLineEdit(value)
-            edit.setAlignment(Qt.AlignRight)
-            row_layout.addWidget(edit,1)
-            cut_layout.addLayout(row_layout)
-        cut_layout.addWidget(QPushButton("一键设置"),0,Qt.AlignRight)
-        process_layout.addWidget(cut_group)
-
-        scan_group=QGroupBox("扫描参数")
-        scan_layout=QVBoxLayout(scan_group)
-        scan_layout.setContentsMargins(10,10,10,10)
-        scan_layout.setSpacing(6)
-
-        scan_rows=[
-            ("x轴起始速度(mm/s)","10.000"),
-            ("y轴起始速度(mm/s)","10.000"),
-            ("x轴加速度(mm/s2)","10000.000"),
-            ("y轴加速度(mm/s2)","3000.000"),
-            ("扫描行速度(mm/s)","100.000"),
-            ("扫描模式","一般模式"),
-            ("光斑大小(50~99%)(mm)","80.000"),
-            ("扫描系数","100"),
-        ]
-        for label_text,value in scan_rows:
-            row_layout=QHBoxLayout()
-            row_layout.addWidget(QLabel(label_text),1)
-            edit=QLineEdit(value)
-            edit.setAlignment(Qt.AlignRight)
-            row_layout.addWidget(edit,1)
-            scan_layout.addLayout(row_layout)
-        process_layout.addWidget(scan_group)
-        process_layout.addStretch()
-
-        # -------- 页面2：辅助参数（参照截图1：送料参数 / 复位参数 / 走边框） --------
-        assist_page = QWidget()
-        assist_layout = QVBoxLayout(assist_page)
-        assist_layout.setContentsMargins(0,0,0,0)
-        assist_layout.setSpacing(8)
-
-        feed_group = QGroupBox("送料参数")
-        feed_layout = QVBoxLayout(feed_group)
-        feed_layout.setContentsMargins(10,10,10,10)
-        feed_layout.setSpacing(4)
-
-        # 送料前/后延时，逐行送料栈：数值输入，单位写在标签后面
-        def _add_delay_row(label_text, default_val="0.000"):
-            hl = QHBoxLayout()
-            hl.addWidget(QLabel(label_text), 2)
-            edit = QLineEdit(default_val)
-            edit.setAlignment(Qt.AlignRight)
-            hl.addWidget(edit, 1)
-            feed_layout.addLayout(hl)
-
-        _add_delay_row("送料前延时(s)")
-        _add_delay_row("送料后延时(ms)")
-
-        # 逐行送料 / 结束送料：是/否 选择
-        def _add_yes_no_row(label_text):
-            hl = QHBoxLayout()
-            hl.addWidget(QLabel(label_text), 2)
-            combo = QComboBox()
-            combo.addItems(["是", "否"])
-            combo.setEditable(True)
-            combo.setMaxVisibleItems(10)
-            combo.lineEdit().setReadOnly(True)
-            hl.addWidget(combo, 1)
-            feed_layout.addLayout(hl)
-
-        _add_yes_no_row("逐行送料")
-        _add_delay_row("逐行送料栈(mm)")
-        _add_yes_no_row("结束送料")
-        assist_layout.addWidget(feed_group)
-
-        reset_group = QGroupBox("复位参数")
-        reset_layout = QVBoxLayout(reset_group)
-        reset_layout.setContentsMargins(10,10,10,10)
-        reset_layout.setSpacing(4)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("复位速度(mm/s)"), 2)
-        edit_speed = QLineEdit("20.000")
-        edit_speed.setAlignment(Qt.AlignRight)
-        hl.addWidget(edit_speed, 1)
-        reset_layout.addLayout(hl)
-
-        for axis, default in [("X轴机复位", True),
-                              ("Y轴机复位", True),
-                              ("Z轴机复位", False),
-                              ("U轴机复位", False)]:
-            hl = QHBoxLayout()
-            cb = QCheckBox(axis)
-            cb.setChecked(default)
-            hl.addWidget(cb)
-            reset_layout.addLayout(hl)
-
-        assist_layout.addWidget(reset_group)
-
-        border_group = QGroupBox("走边框")
-        border_layout = QVBoxLayout(border_group)
-        border_layout.setContentsMargins(10,10,10,10)
-        border_layout.setSpacing(4)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("走边框模式"), 2)
-        combo_mode = QComboBox()
-        combo_mode.addItems(["关光走边框", "出光走边框"])
-        combo_mode.setMaxVisibleItems(10)
-        combo_mode.setEditable(True)
-        combo_mode.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_mode, 1)
-        border_layout.addLayout(hl)
-
-        hl2 = QHBoxLayout()
-        hl2.addWidget(QLabel("白边距离(mm)"), 2)
-        edit_margin = QLineEdit("0.000")
-        edit_margin.setAlignment(Qt.AlignRight)
-        hl2.addWidget(edit_margin, 1)
-        border_layout.addLayout(hl2)
-
-        assist_layout.addWidget(border_group)
-        assist_layout.addStretch()
-
-        # -------- 页面3：其他参数（参照截图2） --------
-        other_page = QWidget()
-        other_layout = QVBoxLayout(other_page)
-        other_layout.setContentsMargins(0,0,0,0)
-        other_layout.setSpacing(8)
-
-        other_group = QGroupBox("其他参数")
-        other_g_layout = QVBoxLayout(other_group)
-        other_g_layout.setContentsMargins(10,10,10,10)
-        other_g_layout.setSpacing(4)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("阵列加工方式"), 2)
-        combo_array = QComboBox()
-        combo_array.addItems(["双向走阵列", "单向走阵列"])
-        combo_array.setEditable(True)
-        combo_array.setMaxVisibleItems(10)
-        combo_array.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_array, 1)
-        other_g_layout.addLayout(hl)
-
-        # 反向间隙 X / Y：供 GCode 反向补偿使用
-        for label in ["反向间隙X(mm)", "反向间隙Y(mm)"]:
-            hl = QHBoxLayout()
-            hl.addWidget(QLabel(label), 2)
-            edit = QLineEdit("0.000")
-            edit.setAlignment(Qt.AlignRight)
-            hl.addWidget(edit, 1)
-            other_g_layout.addLayout(hl)
-            # 保存控件引用
-            if label.startswith("反向间隙X"):
-                self.backlash_x_edit = edit
-            else:
-                self.backlash_y_edit = edit
-        
-        # 连接输入框值改变信号，自动保存
-        if hasattr(self, 'backlash_x_edit'):
-            self.backlash_x_edit.editingFinished.connect(self._save_backlash_values)
-        if hasattr(self, 'backlash_y_edit'):
-            self.backlash_y_edit.editingFinished.connect(self._save_backlash_values)
-        
-        # 加载已保存的反向间隙值
-        self._load_backlash_values()
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("吹气方式"), 2)
-        combo_blow = QComboBox()
-        combo_blow.addItems(["出光吹气", "加工吹气", "一直吹气"])
-        combo_blow.setEditable(True)
-        combo_blow.setMaxVisibleItems(10)
-        combo_blow.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_blow, 1)
-        other_g_layout.addLayout(hl)
-        other_layout.addWidget(other_group)
-
-        back_group = QGroupBox("回位参数")
-        back_layout = QVBoxLayout(back_group)
-        back_layout.setContentsMargins(10,10,10,10)
-        back_layout.setSpacing(4)
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("回位位置"), 2)
-        combo_back = QComboBox()
-        combo_back.addItems(["机械原点", "回位点", "不回位"])
-        combo_back.setEditable(True)
-        combo_back.setMaxVisibleItems(10)
-        combo_back.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_back, 1)
-        back_layout.addLayout(hl)
-        other_layout.addWidget(back_group)
-
-        focus_group = QGroupBox("对焦参数")
-        focus_layout = QVBoxLayout(focus_group)
-        focus_layout.setContentsMargins(10,10,10,10)
-        focus_layout.setSpacing(4)
-
-        for label, val in [("焦距(mm)", "5.000"), ("材料厚度(mm)", "0.000")]:
-            hl = QHBoxLayout()
-            hl.addWidget(QLabel(label), 2)
-            edit = QLineEdit(val)
-            edit.setAlignment(Qt.AlignRight)
-            hl.addWidget(edit, 1)
-            focus_layout.addLayout(hl)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("寻焦模式"), 2)
-        combo_focus = QComboBox()
-        combo_focus.addItems(["接触式寻焦", "非接触式寻焦"])
-        combo_focus.setEditable(True)
-        combo_focus.setMaxVisibleItems(10)
-        combo_focus.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_focus, 1)
-        focus_layout.addLayout(hl)
-        other_layout.addWidget(focus_group)
-
-        rotate_group = QGroupBox("旋转雕刻")
-        rotate_layout = QVBoxLayout(rotate_group)
-        rotate_layout.setContentsMargins(10,10,10,10)
-        rotate_layout.setSpacing(4)
-
-        # 使能旋转雕刻：是/否 选择，默认否
-        hl_enable = QHBoxLayout()
-        hl_enable.addWidget(QLabel("使能旋转雕刻"), 2)
-        combo_enable_rotate = QComboBox()
-        combo_enable_rotate.addItems(["是", "否"])
-        combo_enable_rotate.setCurrentIndex(1)  # 默认 否
-        combo_enable_rotate.setEditable(True)
-        combo_enable_rotate.setMaxVisibleItems(10)
-        combo_enable_rotate.lineEdit().setReadOnly(True)
-        hl_enable.addWidget(combo_enable_rotate, 1)
-        rotate_layout.addLayout(hl_enable)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("周脉冲"), 2)
-        edit_peri = QLineEdit("1000.000")
-        edit_peri.setAlignment(Qt.AlignRight)
-        hl.addWidget(edit_peri, 1)
-        rotate_layout.addLayout(hl)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("工作直径(mm)"), 2)
-        edit_diam = QLineEdit("20.000")
-        edit_diam.setAlignment(Qt.AlignRight)
-        hl.addWidget(edit_diam, 1)
-        rotate_layout.addLayout(hl)
-        # 周脉冲测试（按钮）
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("周脉冲测试"), 2)
-        btn_pulse = QPushButton("测试")
-        hl.addWidget(btn_pulse, 1)
-        rotate_layout.addLayout(hl)
-
-        # 旋转速度设置对话框
-        def _show_rotate_speed_dialog():
-            from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
-            dlg = QDialog(widget.window())
-            dlg.setWindowTitle("设置旋转速度")
-            lay = QVBoxLayout(dlg)
-
-            row = QHBoxLayout()
-            row.addWidget(QLabel("速度(mm/s):"))
-            speed_edit = QLineEdit("50.00")
-            speed_edit.setAlignment(Qt.AlignRight)
-            row.addWidget(speed_edit)
-            lay.addLayout(row)
-
-            btn_row = QHBoxLayout()
-            btn_ok = QPushButton("OK")
-            btn_cancel = QPushButton("Cancel")
-            btn_row.addStretch()
-            btn_row.addWidget(btn_ok)
-            btn_row.addWidget(btn_cancel)
-            lay.addLayout(btn_row)
-
-            btn_ok.clicked.connect(dlg.accept)
-            btn_cancel.clicked.connect(dlg.reject)
-
-            dlg.exec_()
-
-        btn_pulse.clicked.connect(_show_rotate_speed_dialog)
-
-        other_layout.addWidget(rotate_group)
-
-        # 无线面板
-        wireless_group = QGroupBox("无线面板")
-        wireless_layout = QVBoxLayout(wireless_group)
-        wireless_layout.setContentsMargins(10,10,10,10)
-        wireless_layout.setSpacing(4)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("快慢速切换使能"), 2)
-        combo_ws = QComboBox()
-        combo_ws.addItems(["是", "否"])
-        combo_ws.setCurrentIndex(1)  # 默认 否
-        combo_ws.setEditable(True)
-        combo_ws.setMaxVisibleItems(10)
-        combo_ws.lineEdit().setReadOnly(True)
-        hl.addWidget(combo_ws, 1)
-        wireless_layout.addLayout(hl)
-
-        for label, val in [("快速移动(mm/s)", "100.000"), ("慢速移动(mm/s)", "10.000")]:
-            hl = QHBoxLayout()
-            hl.addWidget(QLabel(label), 2)
-            edit = QLineEdit(val)
-            edit.setAlignment(Qt.AlignRight)
-            hl.addWidget(edit, 1)
-            wireless_layout.addLayout(hl)
-
-        other_layout.addWidget(wireless_group)
-
-        # 特殊笔
-        special_group = QGroupBox("特殊参数")
-        special_layout = QVBoxLayout(special_group)
-        special_layout.setContentsMargins(10,10,10,10)
-        special_layout.setSpacing(4)
-
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("拾笔高度(mm)"), 2)
-        edit_pick = QLineEdit("0.000")
-        edit_pick.setAlignment(Qt.AlignRight)
-        hl.addWidget(edit_pick, 1)
-        special_layout.addLayout(hl)
-
-        other_layout.addWidget(special_group)
-        other_layout.addStretch()
-
-        # 添加三个页面到栈中
-        stack.addWidget(process_page)  # index 0
-        stack.addWidget(assist_page)   # index 1
-        stack.addWidget(other_page)    # index 2
-
-        # 单选按钮切换栈页面
-        def _on_radio_changed():
-            if process_radio.isChecked():
-                stack.setCurrentIndex(0)
-            elif assist_radio.isChecked():
-                stack.setCurrentIndex(1)
-            elif other_radio.isChecked():
-                stack.setCurrentIndex(2)
-
-        process_radio.toggled.connect(_on_radio_changed)
-        assist_radio.toggled.connect(_on_radio_changed)
-        other_radio.toggled.connect(_on_radio_changed)
-        stack.setCurrentIndex(0)
-
-        # 右侧按钮区（与截图风格一致）
-        btn_widget=QWidget()
-        btn_layout=QVBoxLayout(btn_widget)
-        btn_layout.setContentsMargins(0,0,0,0)
-        btn_layout.setSpacing(6)
-        btn_open = QPushButton("打开")
-        btn_save = QPushButton("保存")
-        btn_save.setEnabled(False)  # 参考截图，保存按钮置灰
-        btn_read = QPushButton("读参数")
-        btn_write = QPushButton("写参数")
-        for b in (btn_open, btn_save, btn_read, btn_write):
-            btn_layout.addWidget(b)
-        btn_layout.addStretch()
-
-        main_layout.addWidget(param_widget,3)
-        main_layout.addWidget(btn_widget,1)
-        
-        # 如果canvas已设置，加载反向间隙值
-        if self.canvas and hasattr(self, 'backlash_x_edit'):
-            self._load_backlash_values()
-=======
         # 参数树
         self.user_param_tree = QTreeWidget()
         self.user_param_tree.setHeaderHidden(True)
@@ -2521,7 +2120,6 @@ class RightPanel(QWidget):
 
         main_layout.addWidget(param_widget, 3)
         main_layout.addWidget(btn_widget, 1)
->>>>>>> 3ec087f (feat: restore and apply local 72-file changes)
 
         return widget
 
@@ -2932,7 +2530,7 @@ class RightPanel(QWidget):
         self.transform_btns = []
 
         position_btn = QPushButton()
-        position_icon_path = os.path.join("right_panel_icons", "position.png")
+        position_icon_path = get_resource_path(os.path.join("right_panel_icons", "position.png"))
         position_btn.setIcon(QIcon(QPixmap(position_icon_path)))
         position_btn.setIconSize(QSize(32, 32))
         position_btn.setFixedSize(40, 40)
@@ -2941,7 +2539,7 @@ class RightPanel(QWidget):
         self.transform_btns.append((position_btn, 0))
 
         rotate_btn = QPushButton()
-        rotate_icon_path = os.path.join("right_panel_icons", "rotate.png")
+        rotate_icon_path = get_resource_path(os.path.join("right_panel_icons", "rotate.png"))
         rotate_btn.setIcon(QIcon(QPixmap(rotate_icon_path)))
         rotate_btn.setIconSize(QSize(32, 32))
         rotate_btn.setFixedSize(40, 40)
@@ -2949,7 +2547,7 @@ class RightPanel(QWidget):
         self.transform_btns.append((rotate_btn, 1)) #绑定索引1
 
         scale_btn = QPushButton()
-        scale_icon_path = os.path.join("right_panel_icons", "scale.png")
+        scale_icon_path = get_resource_path(os.path.join("right_panel_icons", "scale.png"))
         scale_btn.setIcon(QIcon(QPixmap(scale_icon_path)))
         scale_btn.setIconSize(QSize(32, 32))
         scale_btn.setFixedSize(40, 40)
@@ -2957,14 +2555,14 @@ class RightPanel(QWidget):
         self.transform_btns.append((scale_btn, 2))
 
         size_btn = QPushButton()
-        size_icon_path = os.path.join("right_panel_icons", "size.png")
+        size_icon_path = get_resource_path(os.path.join("right_panel_icons", "size.png"))
         size_btn.setIcon(QIcon(QPixmap(size_icon_path)))
         size_btn.setIconSize(QSize(32, 32))
         size_btn.setFixedSize(40, 40)
         self.transform_btns.append((size_btn, 4))
 
         incline_btn = QPushButton()
-        incline_icon_path = os.path.join("right_panel_icons", "incline.png")
+        incline_icon_path = get_resource_path(os.path.join("right_panel_icons", "incline.png"))
         incline_btn.setIcon(QIcon(QPixmap(incline_icon_path)))
         incline_btn.setIconSize(QSize(32, 32))
         incline_btn.setFixedSize(40, 40)

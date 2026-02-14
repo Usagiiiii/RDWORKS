@@ -8,6 +8,7 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QToolButton, QButtonGroup
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtGui import QIcon
+from utils.tool_utils import get_resource_path
 
 
 class NodeEditToolbar(QWidget):
@@ -36,12 +37,12 @@ class NodeEditToolbar(QWidget):
         
         # 动作列表
         tools = [
-            ("➕", "在指定位置添加节点", "left_sidebar_icons/sidebar_icon2-1.png", self.ACTION_ADD_NODE),
-            ("➖", "删除选中的节点", "left_sidebar_icons/sidebar_icon2-2.png", self.ACTION_DELETE_NODE),
-            ("🔗", "连接两选中的节点", "left_sidebar_icons/sidebar_icon2-3.png", self.ACTION_CONNECT_NODES),
-            ("✂", "在选中的节点位置分割曲线", "left_sidebar_icons/sidebar_icon2-4.png", self.ACTION_BREAK_CURVE),
-            ("📏", "将当前选中的曲线段转化为直线", "left_sidebar_icons/sidebar_icon2-5.png", self.ACTION_TO_LINE),
-            ("〰", "将当前选中的直线段转化为曲线", "left_sidebar_icons/sidebar_icon2-6.png", self.ACTION_TO_CURVE),
+            ("➕", "在指定位置添加节点", get_resource_path("left_sidebar_icons/sidebar_icon2-1.png"), self.ACTION_ADD_NODE),
+            ("➖", "删除选中的节点", get_resource_path("left_sidebar_icons/sidebar_icon2-2.png"), self.ACTION_DELETE_NODE),
+            ("🔗", "连接两选中的节点", get_resource_path("left_sidebar_icons/sidebar_icon2-3.png"), self.ACTION_CONNECT_NODES),
+            ("✂", "在选中的节点位置分割曲线", get_resource_path("left_sidebar_icons/sidebar_icon2-4.png"), self.ACTION_BREAK_CURVE),
+            ("📏", "将当前选中的曲线段转化为直线", get_resource_path("left_sidebar_icons/sidebar_icon2-5.png"), self.ACTION_TO_LINE),
+            ("〰", "将当前选中的直线段转化为曲线", get_resource_path("left_sidebar_icons/sidebar_icon2-6.png"), self.ACTION_TO_CURVE),
         ]
 
         for icon_text, tooltip, icon_path, action_id in tools:
