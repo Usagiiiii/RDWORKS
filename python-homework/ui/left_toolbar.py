@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QToolButton, QButtonGroup
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtGui import QIcon
 from utils.language_manager import language_manager
+from utils.tool_utils import get_resource_path
 
 class LeftToolbar(QWidget):
     """左侧垂直工具栏"""
@@ -49,21 +50,21 @@ class LeftToolbar(QWidget):
         
         # 工具列表: key, icon_text, default_tooltip, icon_path, tool_id
         tools = [
-            ("Tool_Select", "↖", "图形选取", "left_sidebar_icons/sidebar_icon1.png", self.TOOL_SELECT),
-            ("Tool_NodeEdit", "✏", "节点编辑", "left_sidebar_icons/sidebar_icon2.png", self.TOOL_NODE_EDIT),
-            ("Tool_Line", "▭", "直线", "left_sidebar_icons/sidebar_icon3.png", self.TOOL_LINE),
-            ("Tool_Polyline", "○", "折线", "left_sidebar_icons/sidebar_icon4.png", self.TOOL_POLYLINE),
-            ("Tool_Curve", "⬢", "曲线", "left_sidebar_icons/sidebar_icon5.png", self.TOOL_CURVE),
-            ("Tool_Rectangle", "▲", "矩形", "left_sidebar_icons/sidebar_icon6.png", self.TOOL_RECTANGLE),
-            ("Tool_Ellipse", "◀", "椭圆", "left_sidebar_icons/sidebar_icon7.png", self.TOOL_ELLIPSE),
-            ("Tool_Text", "☰", "文字", "left_sidebar_icons/sidebar_icon8.png", self.TOOL_TEXT),
-            ("Tool_Point", "≋", "点", "left_sidebar_icons/sidebar_icon9.png", self.TOOL_POINT),
-            ("Tool_Grid", "⊞", "生成网络", "left_sidebar_icons/sidebar_icon10.png", self.TOOL_GRID),
-            ("Tool_Delete", "✂", "删除", "left_sidebar_icons/sidebar_icon11.png", self.TOOL_DELETE),
-            ("Tool_HMirror", "◐", "水平镜像", "left_sidebar_icons/sidebar_icon12.png", self.TOOL_H_MIRROR),
-            ("Tool_VMirror", "✱", "垂直镜像", "left_sidebar_icons/sidebar_icon13.png", self.TOOL_V_MIRROR),
-            ("Tool_Dock", "T", "图形停靠", "left_sidebar_icons/sidebar_icon14.png", self.TOOL_DOCK),
-            ("Tool_Array", "", "阵列复制", "left_sidebar_icons/sidebar_icon15.png", self.TOOL_ARRAY),
+            ("Tool_Select", "↖", "图形选取", get_resource_path("left_sidebar_icons/sidebar_icon1.png"), self.TOOL_SELECT),
+            ("Tool_NodeEdit", "✏", "节点编辑", get_resource_path("left_sidebar_icons/sidebar_icon2.png"), self.TOOL_NODE_EDIT),
+            ("Tool_Line", "▭", "直线", get_resource_path("left_sidebar_icons/sidebar_icon3.png"), self.TOOL_LINE),
+            ("Tool_Polyline", "○", "折线", get_resource_path("left_sidebar_icons/sidebar_icon4.png"), self.TOOL_POLYLINE),
+            ("Tool_Curve", "⬢", "曲线", get_resource_path("left_sidebar_icons/sidebar_icon5.png"), self.TOOL_CURVE),
+            ("Tool_Rectangle", "▲", "矩形", get_resource_path("left_sidebar_icons/sidebar_icon6.png"), self.TOOL_RECTANGLE),
+            ("Tool_Ellipse", "◀", "椭圆", get_resource_path("left_sidebar_icons/sidebar_icon7.png"), self.TOOL_ELLIPSE),
+            ("Tool_Text", "☰", "文字", get_resource_path("left_sidebar_icons/sidebar_icon8.png"), self.TOOL_TEXT),
+            ("Tool_Point", "≋", "点", get_resource_path("left_sidebar_icons/sidebar_icon9.png"), self.TOOL_POINT),
+            ("Tool_Grid", "⊞", "生成网络", get_resource_path("left_sidebar_icons/sidebar_icon10.png"), self.TOOL_GRID),
+            ("Tool_Delete", "✂", "删除", get_resource_path("left_sidebar_icons/sidebar_icon11.png"), self.TOOL_DELETE),
+            ("Tool_HMirror", "◐", "水平镜像", get_resource_path("left_sidebar_icons/sidebar_icon12.png"), self.TOOL_H_MIRROR),
+            ("Tool_VMirror", "✱", "垂直镜像", get_resource_path("left_sidebar_icons/sidebar_icon13.png"), self.TOOL_V_MIRROR),
+            ("Tool_Dock", "T", "图形停靠", get_resource_path("left_sidebar_icons/sidebar_icon14.png"), self.TOOL_DOCK),
+            ("Tool_Array", "", "阵列复制", get_resource_path("left_sidebar_icons/sidebar_icon15.png"), self.TOOL_ARRAY),
         ]
         
         # 保存所有按钮引用以便后续更新

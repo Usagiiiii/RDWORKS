@@ -70,6 +70,10 @@ def _get_tools_directory() -> str:
     if not os.path.exists(tools_dir):
         tools_dir = os.path.join(os.getcwd(), 'tools')
 
+    # 方法2.5: 从可执行文件所在目录查找 (打包后或者直接运行时)
+    if not os.path.exists(tools_dir) and getattr(sys, 'frozen', False):
+         tools_dir = os.path.join(os.path.dirname(sys.executable), 'tools')
+
     # 方法3: 从可执行文件所在目录查找（打包后）
     if not os.path.exists(tools_dir) and hasattr(sys, '_MEIPASS'):
         tools_dir = os.path.join(sys._MEIPASS, 'tools')
@@ -122,3 +126,22 @@ def _find_tool_in_directory(tool_name: str, tools_dir: str) -> Optional[str]:
                 return match
 
     return None
+
+
+def get_resource_path(relative_path: str) -> str:
+    """
+    获取资源文件的绝对路径。
+    处理 PyInstaller 打包后的路径问题 (_MEIPASS)。
+    """
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller 打包后的临时目录
+        base_path = sys._MEIPASS
+    else:
+        # 开发环境：相对于项目根目录
+        # 假设 tool_utils.py 在 utils/ 目录下，项目根目录是上一级
+        # 但要注意，调用者传入的 relative_path 通常是相对于根目录的，例如 "left_sidebar_icons/..."
+        # 这里我们尝试找到根目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        base_path = os.path.dirname(current_dir) # python-homework
+
+    return os.path.join(base_path, relative_path)
