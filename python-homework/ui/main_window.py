@@ -4,6 +4,7 @@
 主窗口类
 """
 import os
+import math
 from typing import List
 
 from PIL import Image
@@ -23,26 +24,35 @@ from utils.logging_utils import setup_logging
 from utils.tool_utils import check_required_tools
 from ui.whiteboard import Path
 from my_io.gcode.gcode_exporter import export_to_nc, get_default_config, GCodeExporter
+from my_io.exporters.export_dxf import export_to_dxf
 from ui.lead_line_dialog import LeadLineDialog
 from ui.preview_dialog import PreviewDialog
+from ui.fill_bitmap_dialog import FillBitmapDialog
 
 from ui.smooth_curve_dialog import SmoothCurveSimpleDialog, SmoothCurveCustomDialog, chaikin_smooth
 from ui.auto_close_dialog import AutoCloseDialog
 from ui.data_check_dialog import DataCheckDialog
 from ui.bitmap_process_dialog import BitmapProcessDialog
-from ui.fillet_dialog import FilletDialog
 from ui.graphics_items import EditablePathItem
-from edit.commands import SmoothItemCommand
+from edit.commands import SmoothItemCommand, UpdatePathDataCommand
 
 from ui.manufacturer_settings_dialog import ManufacturerPasswordDialog, ManufacturerSettingsDialog
-from ui.system_settings_dialog import SystemSettingsDialog
+from ui.system_settings_dialog import SystemSettingsDialog, load_persisted_settings
+from ui.auto_layout_dialog import AutoLayoutDialog
 from utils.language_manager import language_manager
-from utils.tool_utils import get_resource_path
-from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem, get_item_group_id
 from PyQt5.QtWidgets import QMessageBox
 from ui.array_copy_dialog import ArrayCopyDialog
-from edit.commands import AddItemCommand, MacroCommand, FilletCommand
+from ui.micro_joint_dialog import MicroJointDialog
+from edit.commands import AddItemCommand, MacroCommand
 import copy
+
+from .combined_tools_dialog import CombinedToolsDialog
+from .fillet_dialog import FilletDialog
+
+FILL_SCAN_BITMAP_ROLE = Qt.UserRole + 310
+FILL_SCAN_SOURCE_ID_ROLE = Qt.UserRole + 311
+FILL_SCAN_HIDDEN_SOURCE_ROLE = Qt.UserRole + 312
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -58,10 +68,18 @@ class MainWindow(QMainWindow):
         self.delete_action = None
         self.select_all_action = None
         self._updating_path = False
+        self._fill_scan_busy = False
+        self._fill_scan_pairs = {}
+        self._fillet_dialog = None
+        self._fillet_last_hit = None
 
         self.logger = setup_logging()
         self.logger.info("MainWindow初始化开始")
         self.init_ui()  # 调用 init_ui()，内部会通过 create_central_widget() 创建布局
+        try:
+            load_persisted_settings(self.whiteboard.canvas)
+        except Exception:
+            pass
         check_required_tools(self)
 
         # -------------------------- 删除重复的布局代码！ --------------------------
@@ -156,24 +174,12 @@ class MainWindow(QMainWindow):
             pass
 
     def open_laser_window(self):
-        """打开激光控制界面"""
+        """打开综合工具箱（原激光控制界面位置）"""
         try:
-            import sys
-            import os
-            # Ensure root dir is in path
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            root_dir = os.path.dirname(current_dir)
-            if root_dir not in sys.path:
-                sys.path.append(root_dir)
-                
-            from laser import LaserImageGcodeSender
-            
-            # Keep reference to prevent garbage collection
-            self.laser_window = LaserImageGcodeSender()
-            self.laser_window.show()
-            
+            dlg = CombinedToolsDialog(self, self)
+            dlg.exec_()
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"无法打开激光控制界面: {str(e)}")
+            QMessageBox.critical(self, "错误", f"无法打开工具箱: {str(e)}")
 
     def show_status_message(self, message, timeout=0):
         """
@@ -321,6 +327,10 @@ class MainWindow(QMainWindow):
         self.export_action.triggered.connect(self.export_to_nc) 
         self.file_menu.addAction(self.export_action)
 
+        self.export_dxf_action = QAction('导出为 DXF...', self)
+        self.export_dxf_action.triggered.connect(self.export_to_dxf_file)
+        self.file_menu.addAction(self.export_dxf_action)
+
         gallery_action = QAction('常用图库', self) # 暂未翻译
         gallery_action.triggered.connect(self.common_gallery)
         self.file_menu.addAction(gallery_action)
@@ -453,6 +463,18 @@ class MainWindow(QMainWindow):
         self.select_all_action.setShortcut('Ctrl+A')
         self.select_all_action.triggered.connect(self.whiteboard.canvas.edit_manager.select_all)
         self.edit_menu.addAction(self.select_all_action)
+
+        self.group_action = QAction('群组', self)
+        self.group_action.setShortcut('Ctrl+G')
+        self.group_action.triggered.connect(self.group_selected_items)
+        self.group_action.setEnabled(False)
+        self.edit_menu.addAction(self.group_action)
+
+        self.ungroup_action = QAction('解散群组', self)
+        self.ungroup_action.setShortcut('Ctrl+Shift+G')
+        self.ungroup_action.triggered.connect(self.ungroup_selected_items)
+        self.ungroup_action.setEnabled(False)
+        self.edit_menu.addAction(self.ungroup_action)
         
         # ... select similar actions ...
 
@@ -554,15 +576,9 @@ class MainWindow(QMainWindow):
         self.point_action.triggered.connect(lambda: self._set_tool_from_menu(LeftToolbar.TOOL_POINT))
         self.draw_menu.addAction(self.point_action)
 
-        # 倒圆角
         self.fillet_action = QAction('倒圆角', self)
         self.fillet_action.triggered.connect(self.show_fillet_dialog)
         self.draw_menu.addAction(self.fillet_action)
-
-        # 加码齿
-        self.gear_action = QAction('加码齿', self)
-        self.gear_action.triggered.connect(self.show_gear_dialog)
-        self.draw_menu.addAction(self.gear_action)
 
         self.draw_menu.addSeparator()
 
@@ -709,7 +725,9 @@ class MainWindow(QMainWindow):
         self.settings_menu.addSeparator()
 
         self.fill_scan_action = QAction('填充扫描图形', self)
-        self.fill_scan_action.setEnabled(False) # 暂未实现
+        self.fill_scan_action.setCheckable(True)
+        self.fill_scan_action.setChecked(False)
+        self.fill_scan_action.toggled.connect(self.on_fill_scan_toggled)
         self.settings_menu.addAction(self.fill_scan_action)
 
         self.show_array_action = QAction('显示阵列', self)
@@ -722,7 +740,7 @@ class MainWindow(QMainWindow):
         
         # 保存处理菜单项
         self.process_curve_auto_close_action = add_process_action = QAction('曲线自动闭合', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_auto_close_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_bitmap_handle_action = add_process_action = QAction('位图处理', self)
@@ -734,19 +752,19 @@ class MainWindow(QMainWindow):
         self.process_menu.addAction(add_process_action)
 
         self.process_path_optimize_action = add_process_action = QAction('路径优化', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_cut_optimize_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_merge_lines_action = add_process_action = QAction('合并相连线', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_merge_lines_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_del_dup_lines_action = add_process_action = QAction('删除重线', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_delete_duplicates_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_gen_parallel_action = add_process_action = QAction('生成平行线', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_offset_path_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_data_check_action = add_process_action = QAction('数据检查', self)
@@ -754,15 +772,15 @@ class MainWindow(QMainWindow):
         self.process_menu.addAction(add_process_action)
 
         self.process_fill_to_bitmap_action = add_process_action = QAction('填充成位图', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_fill_bitmap_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_bridge_action = add_process_action = QAction('桥位', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_bridge_dialog)
         self.process_menu.addAction(add_process_action)
 
         self.process_micro_joint_action = add_process_action = QAction('微连', self)
-        add_process_action.setEnabled(False)
+        add_process_action.triggered.connect(self.show_micro_joint_dialog)
         self.process_menu.addAction(add_process_action)
 
         # 工具菜单
@@ -780,7 +798,7 @@ class MainWindow(QMainWindow):
 
         # Auto Nest
         self.tool_auto_nest_action = action = QAction('自动排版', self)
-        action.setEnabled(False)
+        action.triggered.connect(self.show_auto_layout_dialog)
         self.tools_menu.addAction(action)
 
         # EncLas400G
@@ -972,6 +990,8 @@ class MainWindow(QMainWindow):
         self.paste_action.setText(tr('Action_Paste', '粘贴'))
         self.delete_action.setText(tr('Action_Delete', '删除'))
         self.select_all_action.setText(tr('Action_SelectAll', '选择全部'))
+        self.group_action.setText(tr('Action_Group', '群组'))
+        self.ungroup_action.setText(tr('Action_Ungroup', '解散群组'))
         self.move_action.setText(tr('Action_Move', '移动'))
         self.zoom_in_edit_action.setText(tr('Action_ZoomIn', '放大'))
         self.zoom_out_edit_action.setText(tr('Action_ZoomOut', '缩小'))
@@ -995,6 +1015,7 @@ class MainWindow(QMainWindow):
         self.ellipse_action.setText(tr('Action_Ellipse', '椭圆'))
         self.text_action.setText(tr('Action_Text', '文本'))
         self.point_action.setText(tr('Action_Point', '点'))
+        self.fillet_action.setText(tr('Action_Fillet', '倒圆角'))
         self.h_mirror_action.setText(tr('Action_HMirror', '水平镜像'))
         self.v_mirror_action.setText(tr('Action_VMirror', '垂直镜像'))
         self.dock_action.setText(tr('Action_Dock', '图形停靠'))
@@ -1112,25 +1133,25 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.TopToolBarArea, self.toolbar1)
 
         # 左侧新建和打开按钮
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column1.png'), '新建', self.new_file))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column2.png'), '打开', self.open_file))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column3.png'), '保存', self.save_file))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column1.png', '新建', self.new_file))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column2.png', '打开', self.open_file))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column3.png', '保存', self.save_file))
         self.toolbar1.addSeparator()
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column4.png'), '导入', self.import_image, tr_key='Action_Import'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column5.png'), '导出', self.export_to_nc, tr_key='Action_Export'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column4.png', '导入', self.import_image, tr_key='Action_Import'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column5.png', '导出', self.export_to_nc, tr_key='Action_Export'))
         self.toolbar1.addSeparator()
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column6.png'), '撤销', self.undo, tr_key='Action_Undo'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column7.png'), '恢复', self.redo, tr_key='Action_Redo'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column6.png', '撤销', self.undo, tr_key='Action_Undo'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column7.png', '恢复', self.redo, tr_key='Action_Redo'))
         self.toolbar1.addSeparator()
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column8.png'), '平移', self.set_pan_tool, tr_key='Action_Move'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column9.png'), '放大', self.view_zoom_in, tr_key='Action_ZoomIn'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column10.png'), '缩小', self.view_zoom_out, tr_key='Action_ZoomOut'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column11.png'), '页面范围', self.zoom_to_page, tr_key='Action_PageRange'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column12.png'), '数据范围', self.zoom_to_data, tr_key='Action_DataRange'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column13.png'), '显示所有', self.zoom_to_all, tr_key='Action_ShowAll'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column14.png'), '框选查看', self.set_box_zoom_tool, tr_key='Action_BoxZoom'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column8.png', '平移', self.set_pan_tool, tr_key='Action_Move'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column9.png', '放大', self.view_zoom_in, tr_key='Action_ZoomIn'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column10.png', '缩小', self.view_zoom_out, tr_key='Action_ZoomOut'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column11.png', '页面范围', self.zoom_to_page, tr_key='Action_PageRange'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column12.png', '数据范围', self.zoom_to_data, tr_key='Action_DataRange'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column13.png', '显示所有', self.zoom_to_all, tr_key='Action_ShowAll'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column14.png', '框选查看', self.set_box_zoom_tool, tr_key='Action_BoxZoom'))
         self.toolbar1.addSeparator()
-        self.show_path_action = self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column15.png'), '显示路径', self.toggle_show_path, is_checkable=True, tr_key='Action_ShowPath')
+        self.show_path_action = self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column15.png', '显示路径', self.toggle_show_path, is_checkable=True, tr_key='Action_ShowPath')
         self.toolbar1.addAction(self.show_path_action)
         # 连接选择改变信号，以便在选中项改变时更新路径预览
         try:
@@ -1138,14 +1159,33 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column16.png'), '设置引入引出', self.set_lead_line, tr_key='Action_SetLead'))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column17.png'), '设置切割属性', self.set_cut_property_tool))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column16.png', '设置引入引出', self.set_lead_line, tr_key='Action_SetLead'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column17.png', '设置切割属性', self.set_cut_property_tool))
         self.toolbar1.addSeparator()
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column18.png'), '加工预览', self.show_preview_dialog, tr_key='Action_Preview'))
+        self.toolbar1.addAction(self.create_tool_action_with_icon('toolbar_row1_icons/icon1_column18.png', '加工预览', self.show_preview_dialog, tr_key='Action_Preview'))
         self.toolbar1.addSeparator()
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column19.png'), '自动群组', None))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column20.png'), '群组', None))
-        self.toolbar1.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row1_icons/icon1_column21.png'), '解散群组', None))
+        self.auto_group_toolbar_action = self.create_tool_action_with_icon(
+            'toolbar_row1_icons/icon1_column19.png',
+            '自动群组',
+            self.toggle_auto_group,
+            is_checkable=True,
+        )
+        self.auto_group_toolbar_action.setChecked(bool(self.whiteboard.canvas.import_settings.get('auto_group', True)))
+        self.toolbar1.addAction(self.auto_group_toolbar_action)
+        self.group_toolbar_action = self.create_tool_action_with_icon(
+            'toolbar_row1_icons/icon1_column20.png',
+            '群组',
+            self.group_selected_items,
+        )
+        self.group_toolbar_action.setEnabled(False)
+        self.toolbar1.addAction(self.group_toolbar_action)
+        self.ungroup_toolbar_action = self.create_tool_action_with_icon(
+            'toolbar_row1_icons/icon1_column21.png',
+            '解散群组',
+            self.ungroup_selected_items,
+        )
+        self.ungroup_toolbar_action.setEnabled(False)
+        self.toolbar1.addAction(self.ungroup_toolbar_action)
 
 
         # 第二行工具栏
@@ -1158,55 +1198,57 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(Qt.TopToolBarArea, self.toolbar2)
 
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column1.png'), '投影切割', self.new_file))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column2.png'), '', None))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column3.png'), '测量工具', self.set_measure_tool))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column4.png'), 'Mark点定位', None))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column5.png'), '曲线平滑', self.show_smooth_curve_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column1.png', '投影切割', self.new_file))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column2.png', '', None))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column3.png', '测量工具', self.set_measure_tool))
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column4.png', 'Mark点定位', None)
+        action.setEnabled(False)
+        self.toolbar2.addAction(action)
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column5.png', '曲线平滑', self.show_smooth_curve_dialog))
         self.toolbar2.addSeparator()
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column6.png'), '位图处理', self.show_bitmap_process_dialog))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column7.png'), '曲线自动闭合', self.show_auto_close_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column6.png', '位图处理', self.show_bitmap_process_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column7.png', '曲线自动闭合', self.show_auto_close_dialog))
         self.toolbar2.addSeparator()
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column8.png'), '切割优化', self.zoom_in))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column9.png'), '合并相连线', self.zoom_out))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column10.png'), '删除重线', None))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column11.png'), '平行线', self.zoom_reset))
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column12.png'), '数据检查', self.show_data_check_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column8.png', '切割优化', self.show_cut_optimize_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column9.png', '合并相连线', self.show_merge_lines_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column10.png', '删除重线', self.show_delete_duplicates_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column11.png', '平行线', self.show_offset_path_dialog))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column12.png', '数据检查', self.show_data_check_dialog))
         # 视觉/相机相关工具 (设置为禁用)
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column13.png'), '拍照', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column13.png', '拍照', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column14.png'), '框选提边', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column14.png', '框选提边', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
         self.toolbar2.addSeparator()
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column15.png'), '提边设置', self.set_cut_property_tool)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column15.png', '提边设置', self.set_cut_property_tool)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column16.png'), '扶正功能', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column16.png', '扶正功能', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column17.png'), '放置图形', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column17.png', '放置图形', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column18.png'), '底图显示', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column18.png', '底图显示', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
         
-        action = self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/icon2_column19.png'), '画布参数设置', None)
+        action = self.create_tool_action_with_icon('toolbar_row2_icons/icon2_column19.png', '画布参数设置', None)
         action.setEnabled(False)
         self.toolbar2.addAction(action)
 
         
         # 新增：激光连接按钮
         self.toolbar2.addSeparator()
-        self.toolbar2.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row2_icons/lianjie.png'), '图片处理', self.open_laser_window))
+        self.toolbar2.addAction(self.create_tool_action_with_icon('toolbar_row2_icons/lianjie.png', '图片处理', self.open_laser_window))
 
         # 第三行工具栏
         self.toolbar3 = QToolBar('工具栏3')
@@ -1240,7 +1282,7 @@ class MainWindow(QMainWindow):
 
         # 宽度图标
         kuandu_icon = QLabel()
-        kuandu_icon.setPixmap(QIcon(get_resource_path("toolbar_row3_icons/icon3_width.png")).pixmap(QSize(18, 18)))
+        kuandu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_width.png").pixmap(QSize(18, 18)))
         kuandu_icon.setMaximumWidth(20)
         properties_layout.addWidget(kuandu_icon, 0, 3)
 
@@ -1272,7 +1314,7 @@ class MainWindow(QMainWindow):
 
         # 高度图标（光度）
         gaodu_icon = QLabel()
-        gaodu_icon.setPixmap(QIcon(get_resource_path("toolbar_row3_icons/icon3_height.png")).pixmap(QSize(18, 18)))
+        gaodu_icon.setPixmap(QIcon("toolbar_row3_icons/icon3_height.png").pixmap(QSize(18, 18)))
         gaodu_icon.setMaximumWidth(20)
         properties_layout.addWidget(gaodu_icon, 1, 3)
 
@@ -1303,14 +1345,14 @@ class MainWindow(QMainWindow):
         self.percent_input2.returnPressed.connect(lambda: self._apply_percent_scale(False))
 
         # 变换工具
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column1.png'), '锁住', None))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column2.png'), '选择位置坐标基准', None))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column3.png'), '修改尺寸', None))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column1.png', '锁住', None))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column2.png', '选择位置坐标基准', None))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column3.png', '修改尺寸', self.open_resize_dialog))
         self.toolbar3.addSeparator()
 
         # 使用左侧循环箭头图标作为“按输入角度旋转”的快捷按钮
         try:
-            rotate_action = self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column4.png'), '按输入角度旋转选中项', None, True)
+            rotate_action = self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '按输入角度旋转选中项', None, True)
             self.toolbar3.addAction(rotate_action)
             try:
                 rotate_action.triggered.connect(lambda: self.rotate_selected_by_angle())
@@ -1318,7 +1360,7 @@ class MainWindow(QMainWindow):
                 pass
         except Exception:
             # fallback: add original action if creation fails
-            self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column4.png'), '恢复', None, False))
+            self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column4.png', '恢复', None, False))
 
         # 角度输入框和加工序号输入框（合并到一个widget中，防止全屏时分开）
         from PyQt5.QtWidgets import QSizePolicy
@@ -1351,7 +1393,7 @@ class MainWindow(QMainWindow):
         precise_btn.setToolTip('精确旋转...')
         precise_btn.setFixedSize(22, 22) # 减小按钮尺寸
         try:
-            precise_btn.setIcon(QtGui.QIcon(get_resource_path('toolbar_row3_icons/xuanzhuan.png')))
+            precise_btn.setIcon(QtGui.QIcon('toolbar_row3_icons/xuanzhuan.png'))
             precise_btn.setIconSize(QSize(18, 18))
         except Exception:
             precise_btn.setText('...')
@@ -1379,29 +1421,29 @@ class MainWindow(QMainWindow):
 
         self.toolbar3.addWidget(angle_order_widget)
         self.toolbar3.addSeparator()  # 在第五个按钮后添加分隔符
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column6.png'), '左对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('left')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column7.png'), '右对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('right')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column8.png'), '顶端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('top')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column9.png'), '底端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('bottom')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column10.png'), '水平居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('hcenter')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column11.png'), '垂直居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('vcenter')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column6.png', '左对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column7.png', '右对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column8.png', '顶端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('top')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column9.png', '底端对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('bottom')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column10.png', '水平居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('hcenter')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column11.png', '垂直居中对齐', lambda: self.whiteboard.canvas.edit_manager.align_items('vcenter')))
         self.toolbar3.addSeparator()
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column12.png'), '等水平间距 ', lambda: self.whiteboard.canvas.edit_manager.distribute_items('horizontal')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column13.png'), '等垂直间距', lambda: self.whiteboard.canvas.edit_manager.distribute_items('vertical')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column14.png'), '等宽', lambda: self.whiteboard.canvas.edit_manager.make_same_size('width')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column15.png'), '等高', lambda: self.whiteboard.canvas.edit_manager.make_same_size('height')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column16.png'), '等大小', lambda: self.whiteboard.canvas.edit_manager.make_same_size('size')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column12.png', '等水平间距 ', lambda: self.whiteboard.canvas.edit_manager.distribute_items('horizontal')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column13.png', '等垂直间距', lambda: self.whiteboard.canvas.edit_manager.distribute_items('vertical')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column14.png', '等宽', lambda: self.whiteboard.canvas.edit_manager.make_same_size('width')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column15.png', '等高', lambda: self.whiteboard.canvas.edit_manager.make_same_size('height')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column16.png', '等大小', lambda: self.whiteboard.canvas.edit_manager.make_same_size('size')))
         self.toolbar3.addSeparator()
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column17.png'), '左上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_left')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column18.png'), '右上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_right')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column19.png'), '右下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_right')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column20.png'), '左下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_left')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column21.png'), '在页面居中', lambda: self.whiteboard.canvas.edit_manager.align_to_page('center')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column17.png', '左上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column18.png', '右上', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top_right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column19.png', '右下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column20.png', '左下', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom_left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column21.png', '在页面居中', lambda: self.whiteboard.canvas.edit_manager.align_to_page('center')))
         self.toolbar3.addSeparator()
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column22.png'), '移至左边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('left')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column23.png'), '移至右边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('right')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column24.png'), '移至上边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top')))
-        self.toolbar3.addAction(self.create_tool_action_with_icon(get_resource_path('toolbar_row3_icons/icon3_column25.png'), '移至下边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column22.png', '移至左边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('left')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column23.png', '移至右边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('right')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column24.png', '移至上边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('top')))
+        self.toolbar3.addAction(self.create_tool_action_with_icon('toolbar_row3_icons/icon3_column25.png', '移至下边界', lambda: self.whiteboard.canvas.edit_manager.align_to_page('bottom')))
 
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().Expanding, spacer.sizePolicy().Preferred)
@@ -1517,13 +1559,6 @@ class MainWindow(QMainWindow):
         self.whiteboard.canvas.scene.selectionChanged.connect(self._update_position_display)
         # 同时也更新工具栏状态（镜像、阵列等工具仅在有选中时可用）
         self.whiteboard.canvas.scene.selectionChanged.connect(self.update_toolbar_selection_state)
-        
-        # 连接倒圆角请求信号
-        try:
-            self.whiteboard.canvas.filletRequest.disconnect(self.on_fillet_request)
-        except Exception:
-            pass
-        self.whiteboard.canvas.filletRequest.connect(self.on_fillet_request)
 
         # 初始化工具栏状态（默认禁用依赖选择的工具）
         self.update_toolbar_selection_state()
@@ -1565,6 +1600,13 @@ class MainWindow(QMainWindow):
         from ui.graphics_items import EditablePathItem
         selected_paths = [item for item in selected_items if isinstance(item, EditablePathItem) and getattr(item, '_node_edit_enabled', False)]
         
+        # [Fix] 如果没有通过标准选择机制选中的项（因为节点编辑模式下可能清空了Selection），
+        # 尝试获取当前激活的节点编辑对象
+        if not selected_paths and hasattr(self.whiteboard.canvas, '_active_node_edit_item'):
+            active_item = getattr(self.whiteboard.canvas, '_active_node_edit_item', None)
+            if active_item and isinstance(active_item, EditablePathItem) and getattr(active_item, '_node_edit_enabled', False):
+                selected_paths = [active_item]
+
         # 处理连接节点动作 - 支持跨路径连接
         if action_id == NodeEditToolbar.ACTION_CONNECT_NODES:
             if len(selected_paths) == 2:
@@ -1664,13 +1706,51 @@ class MainWindow(QMainWindow):
     def update_toolbar_selection_state(self):
         """更新工具栏状态（根据是否有选中项）"""
         try:
-            # 获取是否有选中的图形项
-            selected = self.whiteboard.canvas.scene.selectedItems()
+            selected = self.whiteboard.canvas.get_selected_items()
             has_selection = bool(selected)
+            can_group = len(selected) >= 2
+            can_ungroup = any(get_item_group_id(item) is not None for item in selected)
             if hasattr(self, 'left_toolbar'):
                 self.left_toolbar.update_selection_dependent_tools(has_selection)
+            if hasattr(self, 'group_toolbar_action'):
+                self.group_toolbar_action.setEnabled(can_group)
+            if hasattr(self, 'ungroup_toolbar_action'):
+                self.ungroup_toolbar_action.setEnabled(can_ungroup)
+            if hasattr(self, 'group_action'):
+                self.group_action.setEnabled(can_group)
+            if hasattr(self, 'ungroup_action'):
+                self.ungroup_action.setEnabled(can_ungroup)
         except Exception:
             pass
+
+    def toggle_auto_group(self, checked):
+        try:
+            self.whiteboard.canvas.import_settings['auto_group'] = bool(checked)
+            self.show_status_message('自动群组: 开' if checked else '自动群组: 关')
+        except Exception:
+            pass
+
+    def group_selected_items(self):
+        try:
+            ok, _ = self.whiteboard.canvas.group_selected_items()
+            if ok:
+                self.show_status_message('已群组')
+            else:
+                self.show_status_message('请至少选择两个对象')
+            self.update_toolbar_selection_state()
+        except Exception as e:
+            self.show_status_message(f'群组失败: {e}')
+
+    def ungroup_selected_items(self):
+        try:
+            ok, _ = self.whiteboard.canvas.ungroup_selected_items()
+            if ok:
+                self.show_status_message('已解散群组')
+            else:
+                self.show_status_message('当前选择不在群组中')
+            self.update_toolbar_selection_state()
+        except Exception as e:
+            self.show_status_message(f'解散群组失败: {e}')
 
     def _clone_item(self, item):
         new_item = None
@@ -2061,6 +2141,1353 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "错误", f"处理平滑曲线时发生错误:\n{str(e)}")
 
+    def show_fillet_dialog(self):
+        """显示倒圆角对话框"""
+        if self._fillet_dialog is None:
+            dlg = FilletDialog(self)
+            dlg.setModal(False)
+            dlg.manualRequested.connect(self._on_fillet_manual_requested)
+            dlg.autoRequested.connect(self._on_fillet_auto_requested)
+            dlg.finished.connect(self._on_fillet_dialog_closed)
+            self._fillet_dialog = dlg
+
+        self._fillet_dialog.show()
+        self._fillet_dialog.raise_()
+        self._fillet_dialog.activateWindow()
+
+    def _on_fillet_dialog_closed(self, _result):
+        self._fillet_dialog = None
+
+    def _on_fillet_manual_requested(self):
+        if not self._fillet_dialog:
+            return
+        radius, min_angle, max_angle = self._fillet_dialog.get_values()
+        self._start_manual_fillet(radius, min_angle, max_angle)
+
+    def _on_fillet_auto_requested(self):
+        if not self._fillet_dialog:
+            return
+        radius, min_angle, max_angle = self._fillet_dialog.get_values()
+        self._apply_auto_fillet(radius, min_angle, max_angle)
+
+    def _sanitize_fillet_params(self, radius, min_angle, max_angle):
+        try:
+            radius = float(radius)
+        except Exception:
+            radius = 0.0
+        try:
+            min_angle = float(min_angle)
+        except Exception:
+            min_angle = 0.0
+        try:
+            max_angle = float(max_angle)
+        except Exception:
+            max_angle = 180.0
+
+        if radius < 0:
+            radius = 0.0
+        min_angle = max(0.0, min(180.0, min_angle))
+        max_angle = max(0.0, min(180.0, max_angle))
+        if min_angle > max_angle:
+            min_angle, max_angle = max_angle, min_angle
+        return radius, min_angle, max_angle
+
+    def _apply_auto_fillet(self, radius, min_angle, max_angle):
+        radius, min_angle, max_angle = self._sanitize_fillet_params(radius, min_angle, max_angle)
+        if radius <= 0:
+            QMessageBox.warning(self, "提示", "圆角半径必须大于0")
+            return
+
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先选择图形")
+            return
+
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        if not target_items:
+            QMessageBox.warning(self, "提示", "所选对象不支持倒圆角")
+            return
+
+        commands = []
+        for item in target_items:
+            new_data, applied = self._build_fillet_path_data(item.points(), radius, min_angle, max_angle)
+            if new_data and applied > 0:
+                cmd = UpdatePathDataCommand(item, new_data, desc="倒圆角")
+                cmd.redo()
+                commands.append(cmd)
+
+        if not commands:
+            QMessageBox.information(self, "提示", "没有符合角度范围的角点")
+            return
+
+        if len(commands) == 1:
+            self.whiteboard.canvas.edit_manager.push_undo(commands[0])
+        else:
+            macro = MacroCommand("倒圆角")
+            macro.desc = "倒圆角"
+            for cmd in commands:
+                macro.add_command(cmd)
+            self.whiteboard.canvas.edit_manager.push_undo(macro)
+
+    def _start_manual_fillet(self, radius, min_angle, max_angle):
+        radius, min_angle, max_angle = self._sanitize_fillet_params(radius, min_angle, max_angle)
+        if radius <= 0:
+            QMessageBox.warning(self, "提示", "圆角半径必须大于0")
+            return
+
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        if not target_items:
+            QMessageBox.warning(self, "提示", "请先选择图形")
+            return
+
+        self._fillet_last_hit = None
+
+        def probe(pos):
+            info = self._find_fillet_corner(pos, radius, min_angle, max_angle)
+            self._fillet_last_hit = info
+            return bool(info)
+
+        def apply_at(pos):
+            info = self._find_fillet_corner(pos, radius, min_angle, max_angle)
+            if not info:
+                info = self._fillet_last_hit
+            if not info:
+                self.show_status_message('未命中角点')
+                return False
+            item = info['item']
+            index = info['index']
+            try:
+                base_path_data = item.get_path_data()
+            except Exception:
+                base_path_data = None
+            new_data, applied = self._build_fillet_path_data(
+                item.points(),
+                radius,
+                min_angle,
+                max_angle,
+                target_index=index,
+                base_path_data=base_path_data
+            )
+            if not new_data or applied <= 0:
+                self.show_status_message('未能倒圆角：半径过大或角度不在范围内')
+                return False
+            cmd = UpdatePathDataCommand(item, new_data, desc="倒圆角")
+            cmd.redo()
+            self.whiteboard.canvas.edit_manager.push_undo(cmd)
+            try:
+                self.whiteboard.canvas.scene.update()
+            except Exception:
+                pass
+            self.show_status_message('倒圆角完成')
+            return True
+
+        self.whiteboard.canvas.enable_fillet_pick(probe, apply_at)
+        self.show_status_message('手动倒圆角：移动到角点出现小孔后点击，右键退出')
+
+    def _find_fillet_corner(self, pos, radius, min_angle, max_angle):
+        try:
+            scale = self.whiteboard.canvas.transform().m11()
+        except Exception:
+            scale = 1.0
+        tol = 5.0 / scale if scale > 0 else 5.0
+        tol_fallback = 12.0 / scale if scale > 0 else 12.0
+
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        if not target_items:
+            return None
+
+        best = None
+        best_dist = None
+        for item in target_items:
+            try:
+                in_bounds = item.sceneBoundingRect().contains(pos)
+            except Exception:
+                in_bounds = False
+            pts, closed = self._normalize_path_points(item.points())
+            n = len(pts)
+            if n < 3:
+                continue
+
+            indices = range(n) if closed else range(1, n - 1)
+            for i in indices:
+                bx, by = pts[i]
+                dx = pos.x() - bx
+                dy = pos.y() - by
+                dist = math.hypot(dx, dy)
+                if dist > tol:
+                    if not in_bounds or dist > tol_fallback:
+                        continue
+                if dist > tol and not in_bounds:
+                    continue
+                info = self._compute_fillet_corner(pts, i, closed, radius)
+                if not info:
+                    continue
+                if info['angle_deg'] < min_angle or info['angle_deg'] > max_angle:
+                    continue
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best = {'item': item, 'index': i}
+
+        return best
+
+    def _normalize_fillet_path_data(self, path_data):
+        try:
+            pts_raw, segs_raw, cps_raw = path_data
+        except Exception:
+            return None
+
+        pts, closed = self._normalize_path_points(pts_raw)
+        n = len(pts)
+        if n < 2:
+            return None
+
+        seg_count = n if closed else (n - 1)
+
+        segs = [0] * seg_count
+        try:
+            src_segs = list(segs_raw) if segs_raw is not None else []
+        except Exception:
+            src_segs = []
+        for i in range(min(seg_count, len(src_segs))):
+            segs[i] = 1 if bool(src_segs[i]) else 0
+
+        cps = {}
+        try:
+            src_cps = dict(cps_raw) if cps_raw is not None else {}
+        except Exception:
+            src_cps = {}
+        for k, v in src_cps.items():
+            try:
+                idx = int(k)
+            except Exception:
+                continue
+            if not (0 <= idx < seg_count):
+                continue
+            try:
+                cp1, cp2 = v
+                cps[idx] = ((float(cp1[0]), float(cp1[1])), (float(cp2[0]), float(cp2[1])))
+            except Exception:
+                continue
+
+        return pts, closed, segs, cps
+
+    def _normalize_path_points(self, points):
+        if len(points) >= 2:
+            x0, y0 = points[0]
+            x1, y1 = points[-1]
+            if math.hypot(x0 - x1, y0 - y1) < 1e-6:
+                return points[:-1], True
+        return points[:], False
+
+    def _compute_fillet_corner(self, pts, index, closed, radius):
+        n = len(pts)
+        if n < 3:
+            return None
+
+        if closed:
+            prev_idx = (index - 1) % n
+            next_idx = (index + 1) % n
+        else:
+            if index <= 0 or index >= n - 1:
+                return None
+            prev_idx = index - 1
+            next_idx = index + 1
+
+        ax, ay = pts[prev_idx]
+        bx, by = pts[index]
+        cx, cy = pts[next_idx]
+
+        v1x, v1y = bx - ax, by - ay
+        v2x, v2y = cx - bx, cy - by
+        len1 = math.hypot(v1x, v1y)
+        len2 = math.hypot(v2x, v2y)
+        if len1 < 1e-6 or len2 < 1e-6:
+            return None
+
+        d1x, d1y = v1x / len1, v1y / len1
+        d2x, d2y = v2x / len2, v2y / len2
+
+        dot = max(-1.0, min(1.0, d1x * d2x + d1y * d2y))
+        angle_between = math.acos(dot)
+        interior = math.pi - angle_between
+        if interior <= 1e-6 or interior >= math.pi - 1e-6:
+            return None
+
+        t = radius * math.tan(interior / 2.0)
+        if t <= 1e-6 or t > len1 - 1e-6 or t > len2 - 1e-6:
+            return None
+
+        p1 = (bx - d1x * t, by - d1y * t)
+        p2 = (bx + d2x * t, by + d2y * t)
+
+        control_dist = (4.0 / 3.0) * math.tan(angle_between / 4.0) * radius
+        cp1 = (p1[0] + d1x * control_dist, p1[1] + d1y * control_dist)
+        cp2 = (p2[0] - d2x * control_dist, p2[1] - d2y * control_dist)
+
+        return {
+            'p1': p1,
+            'p2': p2,
+            'cp1': cp1,
+            'cp2': cp2,
+            'angle_deg': math.degrees(interior)
+        }
+
+    def _build_fillet_path_data(self, points, radius, min_angle, max_angle, target_index=None, base_path_data=None):
+        pts, closed = self._normalize_path_points(points)
+        n = len(pts)
+        if n < 3:
+            return None, 0
+
+        if target_index is not None and base_path_data is not None:
+            normalized = self._normalize_fillet_path_data(base_path_data)
+            if normalized:
+                pts2, closed2, base_seg_types, base_control_points = normalized
+                if len(pts2) >= 3:
+                    pts, closed = pts2, closed2
+                    n = len(pts)
+
+                info = self._compute_fillet_corner(pts, target_index, closed, radius)
+                if not info or info['angle_deg'] < min_angle or info['angle_deg'] > max_angle:
+                    return None, 0
+
+                prev_idx = (target_index - 1) % n
+                next_idx = (target_index + 1) % n
+                prev_label = ('v', prev_idx)
+                next_label = ('v', next_idx)
+                p1_label = ('p1', target_index)
+                p2_label = ('p2', target_index)
+
+                new_pts_unique = []
+                new_labels = []
+                for old_idx in range(n):
+                    if old_idx == target_index:
+                        new_pts_unique.append(info['p1'])
+                        new_labels.append(p1_label)
+                        new_pts_unique.append(info['p2'])
+                        new_labels.append(p2_label)
+                    else:
+                        new_pts_unique.append(pts[old_idx])
+                        new_labels.append(('v', old_idx))
+
+                if closed:
+                    segment_total = len(new_pts_unique)
+                else:
+                    segment_total = max(0, len(new_pts_unique) - 1)
+
+                new_seg_types = []
+                new_control_points = {}
+
+                for seg_idx in range(segment_total):
+                    a_label = new_labels[seg_idx]
+                    if closed:
+                        b_label = new_labels[(seg_idx + 1) % len(new_labels)]
+                    else:
+                        b_label = new_labels[seg_idx + 1]
+
+                    seg_type = 0
+                    cp = None
+
+                    if a_label == prev_label and b_label == p1_label:
+                        seg_type = 0
+                    elif a_label == p1_label and b_label == p2_label:
+                        seg_type = 1
+                        cp = (info['cp1'], info['cp2'])
+                    elif a_label == p2_label and b_label == next_label:
+                        seg_type = 0
+                    elif a_label[0] == 'v' and b_label[0] == 'v':
+                        a_idx = a_label[1]
+                        b_idx = b_label[1]
+                        if closed:
+                            valid_old_edge = (b_idx == ((a_idx + 1) % n))
+                        else:
+                            valid_old_edge = (b_idx == (a_idx + 1))
+
+                        if valid_old_edge and 0 <= a_idx < len(base_seg_types):
+                            seg_type = 1 if bool(base_seg_types[a_idx]) else 0
+                            if seg_type == 1 and a_idx in base_control_points:
+                                cp = base_control_points[a_idx]
+
+                    new_seg_types.append(seg_type)
+                    if seg_type == 1 and cp is not None:
+                        new_control_points[len(new_seg_types) - 1] = cp
+
+                new_pts = new_pts_unique[:]
+                if closed and new_pts:
+                    new_pts.append(new_pts[0])
+
+                return (new_pts, new_seg_types, new_control_points), 1
+
+        def add_point(new_pts, seg_types, control_points, pt, seg_type=0, cp=None):
+            if not new_pts:
+                new_pts.append(pt)
+                return
+            lx, ly = new_pts[-1]
+            if math.hypot(lx - pt[0], ly - pt[1]) < 1e-6:
+                return
+            new_pts.append(pt)
+            seg_types.append(seg_type)
+            if seg_type == 1 and cp:
+                control_points[len(seg_types) - 1] = cp
+
+        new_pts = []
+        seg_types = []
+        control_points = {}
+        applied = 0
+
+        indices = range(n) if closed else range(1, n - 1)
+
+        if not closed:
+            new_pts.append(pts[0])
+
+        for i in indices:
+            if (target_index is not None) and (i != target_index):
+                if closed or (i != 0 and i != n - 1):
+                    add_point(new_pts, seg_types, control_points, pts[i], seg_type=0)
+                continue
+
+            info = self._compute_fillet_corner(pts, i, closed, radius)
+            if not info or info['angle_deg'] < min_angle or info['angle_deg'] > max_angle:
+                if closed or (i != 0 and i != n - 1):
+                    add_point(new_pts, seg_types, control_points, pts[i], seg_type=0)
+                continue
+
+            add_point(new_pts, seg_types, control_points, info['p1'], seg_type=0)
+            add_point(new_pts, seg_types, control_points, info['p2'], seg_type=1, cp=(info['cp1'], info['cp2']))
+            applied += 1
+
+        if not closed:
+            add_point(new_pts, seg_types, control_points, pts[-1], seg_type=0)
+        else:
+            if new_pts:
+                sx, sy = new_pts[0]
+                ex, ey = new_pts[-1]
+                if math.hypot(sx - ex, sy - ey) > 1e-6:
+                    add_point(new_pts, seg_types, control_points, (sx, sy), seg_type=0)
+
+        if applied <= 0:
+            return None, 0
+
+        return (new_pts, seg_types, control_points), applied
+
+    def show_delete_duplicates_dialog(self):
+        """显示删除重线对话框"""
+        # 检查是否有选中项
+        items = self.whiteboard.canvas.scene.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "提示", "请先选择图形")
+            return
+            
+        from .delete_duplicates_dialog import DeleteDuplicatesDialog
+        dlg = DeleteDuplicatesDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            tolerance = dlg.get_tolerance()
+            self._delete_duplicates(items, tolerance)
+
+    def _delete_duplicates(self, selected_items, tolerance):
+        """执行删除重线逻辑"""
+        if not selected_items:
+            return
+
+        from edit.commands import DeleteItemsCommand
+        from ui.graphics_items import EditablePathItem
+        import math
+        
+        to_delete = []
+        n = len(selected_items)
+        if n < 2:
+            QMessageBox.information(self, "提示", "至少需要选中2个图形才能进行重线检查")
+            return
+            
+        processed = [False] * n
+
+        def is_same_points(pts1, pts2, tol):
+            if len(pts1) != len(pts2):
+                return False
+            # 正向比较
+            match_forward = True
+            for i in range(len(pts1)):
+                d = math.hypot(pts1[i][0] - pts2[i][0], pts1[i][1] - pts2[i][1])
+                if d > tol:
+                    match_forward = False
+                    break
+            if match_forward: return True
+            
+            # 反向比较
+            match_backward = True
+            for i in range(len(pts1)):
+                d = math.hypot(pts1[i][0] - pts2[len(pts2)-1-i][0], pts1[i][1] - pts2[len(pts2)-1-i][1])
+                if d > tol:
+                    match_backward = False
+                    break
+            return match_backward
+        
+        for i in range(n):
+            if processed[i]:
+                continue
+            item_a = selected_items[i]
+            # 只有 EditablePathItem 参与比较
+            if not isinstance(item_a, EditablePathItem):
+                continue
+            pts_a = item_a.points()
+            
+            for j in range(i + 1, n):
+                if processed[j]:
+                    continue
+                item_b = selected_items[j]
+                if not isinstance(item_b, EditablePathItem):
+                    continue
+                pts_b = item_b.points()
+                
+                if is_same_points(pts_a, pts_b, tolerance):
+                    to_delete.append(item_b)
+                    processed[j] = True
+        
+        if to_delete:
+            cmd = DeleteItemsCommand(self.whiteboard.canvas.scene, to_delete)
+            cmd.redo()
+            self.whiteboard.canvas.edit_manager.push_undo(cmd)
+            
+        QMessageBox.warning(self, "Laser", f"已删除重叠线数:{len(to_delete)}")
+
+    def show_bridge_dialog(self):
+        """显示桥位对话框"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        from ui.graphics_items import EditablePathItem
+        selected_paths = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        
+        if not selected_paths:
+            QMessageBox.warning(self, "提示", "请选择曲线对象")
+            return
+            
+        from .bridge_dialog import BridgeDialog
+        dlg = BridgeDialog(self, selected_paths)
+        if dlg.exec_() == QDialog.Accepted:
+            # Get bridge definitions: Map { item: [d1, d2, ...] }
+            bridge_map = dlg.get_result_bridges()
+            width = dlg.get_width()
+            self._apply_bridges(bridge_map, width)
+
+    def _is_micro_joint_target(self, item):
+        from PyQt5.QtWidgets import (
+            QGraphicsItem, QGraphicsPathItem, QGraphicsEllipseItem,
+            QGraphicsRectItem, QGraphicsLineItem, QGraphicsPolygonItem,
+            QGraphicsPixmapItem, QGraphicsTextItem
+        )
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+
+        if item is None:
+            return False
+        try:
+            if item.parentItem() is not None:
+                return False
+        except Exception:
+            return False
+
+        try:
+            if not (item.flags() & QGraphicsItem.ItemIsSelectable):
+                return False
+        except Exception:
+            return False
+
+        canvas = self.whiteboard.canvas
+        for system_item in (
+            getattr(canvas, '_work_item', None),
+            getattr(canvas, '_fiducial_item', None),
+            getattr(canvas, '_path_preview_item', None),
+            getattr(canvas, '_node_select_rect_item', None),
+        ):
+            if system_item is not None and item is system_item:
+                return False
+
+        return isinstance(item, (
+            EditablePathItem,
+            EditableEllipseItem,
+            TextGraphicsItem,
+            QGraphicsPathItem,
+            QGraphicsEllipseItem,
+            QGraphicsRectItem,
+            QGraphicsLineItem,
+            QGraphicsPolygonItem,
+            QGraphicsPixmapItem,
+            QGraphicsTextItem,
+        ))
+
+    def _get_micro_joint_marker_anchor(self, item):
+        from PyQt5.QtGui import QPainterPath
+        from PyQt5.QtWidgets import (
+            QGraphicsPathItem, QGraphicsLineItem, QGraphicsRectItem,
+            QGraphicsEllipseItem, QGraphicsPolygonItem
+        )
+
+        try:
+            if isinstance(item, QGraphicsPathItem):
+                path = item.path()
+                if not path.isEmpty():
+                    return path.pointAtPercent(0.0)
+
+            if isinstance(item, QGraphicsLineItem):
+                return item.line().p1()
+
+            if isinstance(item, QGraphicsRectItem):
+                return item.rect().topLeft()
+
+            if isinstance(item, QGraphicsEllipseItem):
+                path = QPainterPath()
+                path.addEllipse(item.rect())
+                if not path.isEmpty():
+                    return path.pointAtPercent(0.0)
+
+            if isinstance(item, QGraphicsPolygonItem):
+                poly = item.polygon()
+                if poly.count() > 0:
+                    return poly[0]
+
+            if hasattr(item, 'shape'):
+                shape = item.shape()
+                if not shape.isEmpty():
+                    return shape.pointAtPercent(0.0)
+
+            rect = item.boundingRect()
+            if rect.isValid():
+                return rect.topLeft()
+        except Exception:
+            pass
+        return None
+
+    def _remove_micro_joint_marker(self, item):
+        marker = getattr(item, '_micro_joint_marker_item', None)
+        if marker is None:
+            return
+        try:
+            scene = marker.scene()
+            if scene:
+                scene.removeItem(marker)
+        except Exception:
+            pass
+        try:
+            marker.setParentItem(None)
+        except Exception:
+            pass
+        try:
+            delattr(item, '_micro_joint_marker_item')
+        except Exception:
+            item._micro_joint_marker_item = None
+
+    def _sync_micro_joint_marker(self, item):
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QPainterPath, QPen, QBrush
+        from PyQt5.QtWidgets import QGraphicsItem, QGraphicsPathItem
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem
+
+        config = getattr(item, 'micro_joint_config', None)
+        enabled = bool(config and config.get('enabled', False))
+
+        if isinstance(item, (EditablePathItem, EditableEllipseItem)):
+            self._remove_micro_joint_marker(item)
+            return
+
+        if not enabled:
+            self._remove_micro_joint_marker(item)
+            return
+
+        marker_pos = self._get_micro_joint_marker_anchor(item)
+        if marker_pos is None:
+            self._remove_micro_joint_marker(item)
+            return
+
+        marker = getattr(item, '_micro_joint_marker_item', None)
+        if marker is None or marker.scene() is None:
+            cross_size = 4.0
+            cross = QPainterPath()
+            cross.moveTo(-cross_size, -cross_size)
+            cross.lineTo(cross_size, cross_size)
+            cross.moveTo(-cross_size, cross_size)
+            cross.lineTo(cross_size, -cross_size)
+
+            marker = QGraphicsPathItem(cross, item)
+            pen = QPen(Qt.blue, 2.0)
+            pen.setCosmetic(True)
+            marker.setPen(pen)
+            marker.setBrush(QBrush(Qt.NoBrush))
+            marker.setZValue(1000000)
+            marker.setAcceptedMouseButtons(Qt.NoButton)
+            marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+            item._micro_joint_marker_item = marker
+
+        marker.setPos(marker_pos)
+        marker.setVisible(True)
+
+    def show_micro_joint_dialog(self):
+        """显示微连对话框"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        selected_paths = [item for item in selected_items if self._is_micro_joint_target(item)]
+        
+        # User request: "Enable Micro-joint" is selectable if items are selected. 
+        # But per latest request, controls are ALWAYS enabled in UI.
+        # But we still need to know if we are in "Edit Mode" (applying to current selection)
+        # or "Find Mode" (selecting new items).
+        
+        has_selection = len(selected_paths) > 0
+        
+        dlg = MicroJointDialog(self)
+        
+        # We don't need to set_has_selection visually anymore as controls are always enabled.
+        # But we might want to check the box if the SELECTED item already has micro-joint enabled?
+        # That would be a nice touch.
+        if has_selection:
+            # Check the first item
+            first_item = selected_paths[0]
+            if hasattr(first_item, 'micro_joint_config') and first_item.micro_joint_config:
+                cfg = first_item.micro_joint_config
+                dlg.cb_enable.setChecked(cfg.get('enabled', False))
+                dlg.spin_qty.setValue(int(cfg.get('qty', 1)))
+                dlg.spin_dist.setValue(float(cfg.get('dist', 1.0)))
+                dlg.spin_width.setValue(float(cfg.get('width', 2.0)))
+                mode = cfg.get('mode', 'qty')
+                if mode == 'qty': dlg.rb_qty.setChecked(True)
+                else: dlg.rb_dist.setChecked(True)
+                
+                dlg.update_ui_state()
+        
+        # Connect signal before exec
+        dlg.apply_micro_joint.connect(lambda cfg, flt: self._handle_micro_joint_apply(cfg, flt, dlg))
+        
+        dlg.exec_()
+
+    def _handle_micro_joint_apply(self, config, filters, dlg_instance):
+        _ = dlg_instance
+        scene = self.whiteboard.canvas.scene
+        selected_items = scene.selectedItems()
+        target_items = [item for item in selected_items if self._is_micro_joint_target(item)]
+        
+        # Logic: 
+        # If we have selection, apply to it.
+        # If we have NO selection, find items based on filters, SELECT them.
+        # But user says: "After clicking 'Select'... objects are selected... (or maybe not)".
+        # This implies: Always try to filter-select if current selection is empty?
+        # Or always respect filters?
+        # Usually: If I manually selected items, I want to apply to THEM, ignoring filters.
+        # If I selected nothing, I implies I want to use the filters to find items.
+        
+        did_search = False
+        if not target_items:
+            # Search mode
+            did_search = True
+            found_items = []
+            for item in scene.items():
+                if self._is_micro_joint_target(item):
+                    rect = item.sceneBoundingRect()
+                    w = rect.width()
+                    h = rect.height()
+                    
+                    # Logic
+                    sm_w = filters['small_max_w']
+                    sm_h = filters['small_max_h']
+                    lm_w = filters['large_min_w']
+                    lm_h = filters['large_min_h']
+                    
+                    is_small = (w <= sm_w and h <= sm_h)
+                    is_large = (w >= lm_w and h >= lm_h)
+                    is_mid = (not is_small) and (not is_large)
+                    
+                    select_it = False
+                    if filters['check_small'] and is_small: select_it = True
+                    if filters['check_mid'] and is_mid: select_it = True
+                    if filters['check_large'] and is_large: select_it = True
+                    
+                    if select_it:
+                        found_items.append(item)
+            
+            # Select them
+            if found_items:
+                scene.clearSelection()
+                for item in found_items:
+                    item.setSelected(True)
+                target_items = found_items
+            else:
+                 QMessageBox.information(self, "提示", "未找到符合条件的图形")
+                 return # Nothing to apply to
+
+        # Now apply the config to target_items
+        # But only if user checked "Enable"?
+        # User said: "Enable is selected AFTER objects are selected".
+        # If I click Select (and items are found), the checkbox should become CHECKED?
+        # Or user manually checks it?
+        # "Selected... (checkbox) becomes bright". Bright means "Enabled state" (clickable).
+        # My UI fix made it ALWAYS clickable.
+        
+        # If I click "Select", I am saying "Apply these settings".
+        # The settings include "Enable Micro-joint: True/False".
+        # If the user UNCHECKED "Enable", they mean "Disable Micro-joint on these items".
+        # If the user CHECKED "Enable", they mean "Enable it".
+        
+        # CAUTION: If I am in "Search Mode" (did_search=True), 
+        # the user might just want to SEE what is selected first, BEFORE applying micro-joints?
+        # User says: "Click Select... objects are selected... (checkbox) becomes bright."
+        # This implies the first click on "Select" MIGHT just be for Selection if nothing is selected?
+        # And then user checks "Enable" and clicks "Select" again?
+        
+        # But current "Select" button triggers `_handle_micro_joint_apply`.
+        # If I just selected items, do I also apply the config immediately?
+        # If config['enabled'] is False (default), applying it means "Clear Micro-joints".
+        # If I just found items, I probably don't want to clear their joints immediately if they had any.
+        
+        # Let's interpret "Select" button as:
+        # 1. Update Selection (if empty).
+        # 2. Apply parameters (if enabled is checked OR if we want to enforce current state).
+        
+        # If I change selection, I should probably STOP there and let user Check "Enable".
+        if did_search:
+             # Just updated selection.
+             # User expects checkbox to become "Bright" (it is always bright now).
+             # User might expect it to Auto-Check? No, "Select objects... then Enable".
+             # So we stop here?
+             # But if I already had "Enable" checked for search?
+             # Probably apply if checked.
+             pass
+        
+        # Apply Logic
+        if config.get('enabled', False):
+            for item in target_items:
+                item.micro_joint_config = config.copy()
+                self._sync_micro_joint_marker(item)
+                item.update()
+        else:
+            # If Disabled, and we are targeting items.
+            # Should we clear?
+            # User unchecks Enable -> Click Select -> Clears joints.
+            # Sounds correct.
+            # But if we just did a search (did_search=True) and Enable was False (default),
+            # we shouldn't wipe existing joints?
+            # Let's assume search mode shouldn't destructively modify unless explicitly enabled.
+            if not did_search:
+                for item in target_items:
+                    item.micro_joint_config = None
+                    self._sync_micro_joint_marker(item)
+                    item.update()
+
+    def show_offset_path_dialog(self):
+        """显示生成平行线对话框"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        from ui.graphics_items import EditablePathItem
+        selected_paths = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        
+        if not selected_paths:
+            QMessageBox.warning(self, "提示", "请选择曲线对象")
+            return
+
+        from .offset_path_dialog import OffsetPathDialog
+        dlg = OffsetPathDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            data = dlg.get_data()
+            self._apply_offset_path(selected_paths, data)
+
+    def _apply_offset_path(self, items, data):
+        """应用平行线生成"""
+        try:
+            dist = float(data['distance'])
+        except:
+            return
+
+        mode = data['mode']
+        delete_original = data['delete_original']
+        round_corners = data['round_corners']
+        
+        if dist == 0: return
+
+        from PyQt5.QtGui import QPainterPathStroker, QPainterPath, QColor
+        from PyQt5.QtCore import Qt
+        from edit.commands import AddItemCommand, DeleteItemsCommand, MacroCommand
+        from ui.graphics_items import EditablePathItem
+        
+        commands = []
+        new_cnt = 0
+        
+        for item in items:
+            # Reconstruct path to ensure it is topologically closed if geometrically closed
+            pts_src = item.points()
+            if not pts_src or len(pts_src) < 2: continue
+            
+            # 1. Clean consecutive duplicates
+            cleaned_pts = [pts_src[0]]
+            for pt in pts_src[1:]:
+                # Check squared distance
+                if (pt[0]-cleaned_pts[-1][0])**2 + (pt[1]-cleaned_pts[-1][1])**2 > 1e-9:
+                    cleaned_pts.append(pt)
+
+            path = QPainterPath()
+            if not cleaned_pts: continue
+            path.moveTo(*cleaned_pts[0])
+            
+            # Check closure
+            is_closed = False
+            if len(cleaned_pts) > 2:
+                if (cleaned_pts[0][0]-cleaned_pts[-1][0])**2 + (cleaned_pts[0][1]-cleaned_pts[-1][1])**2 < 1e-9:
+                    is_closed = True
+                    # Remove last point which is duplicate of first
+                    cleaned_pts.pop() 
+
+            # Build QPainterPath
+            if is_closed:
+                for pt in cleaned_pts[1:]:
+                    path.lineTo(*pt)
+                path.closeSubpath()
+            else:
+                for pt in cleaned_pts[1:]:
+                    path.lineTo(*pt)
+            
+            stroker = QPainterPathStroker()
+            stroker.setWidth(abs(dist) * 2)
+            stroker.setCapStyle(Qt.RoundCap if round_corners else Qt.FlatCap)
+            stroker.setJoinStyle(Qt.RoundJoin if round_corners else Qt.MiterJoin)
+            stroker.setMiterLimit(2.0)
+            
+            stroke_path = stroker.createStroke(path).simplified()
+            sub_polys = stroke_path.toSubpathPolygons()
+            
+            if not sub_polys: continue
+            
+            # Sort by Area
+            annotated = []
+            for p in sub_polys:
+                rect = p.boundingRect()
+                area = rect.width() * rect.height()
+                # Use signed area or similar if needed, but bounding box area is okay for basic determining outer/inner for simple loop
+                annotated.append((area, p))
+            
+            # Sort descending: Largest (Outer) -> Smallest (Inner)
+            annotated.sort(key=lambda x: x[0], reverse=True)
+            
+            target_polys = []
+            sorted_polys = [p for a, p in annotated]
+            
+            if mode == 'both':
+                target_polys = sorted_polys
+            elif mode == 'outside' or mode == 'auto':
+                # Largest is usually outer for a simple closed shape
+                if sorted_polys:
+                    target_polys.append(sorted_polys[0])
+            elif mode == 'inside':
+                # Smallest or all except largest
+                # For a simple rect loop, sorted_polys has 2 elements. [Outer, Inner].
+                # Inner is index 1.
+                if len(sorted_polys) > 1:
+                    target_polys.append(sorted_polys[1])
+                elif len(sorted_polys) == 1 and not is_closed:
+                    # If open path, stroke produces 1 poly (the outline). 
+                    # Inside doesn't make sense really.
+                    pass
+            
+            # Determine color
+            color = QColor(Qt.black)
+            if hasattr(item, 'pen'):
+                color = item.pen().color()
+            elif hasattr(item, '_color'):
+                color = item._color
+
+            for poly in target_polys:
+                # Convert QPolygonF to pts list [[x,y], ...]
+                pts = [[poly.at(i).x(), poly.at(i).y()] for i in range(poly.count())]
+                
+                # Close the loop
+                if len(pts) > 2:
+                     if pts[0] != pts[-1]:
+                         pts.append(pts[0])
+                
+                new_item = EditablePathItem(pts, color)
+                commands.append(AddItemCommand(self.whiteboard.canvas, new_item))
+                new_cnt += 1
+
+        if delete_original and commands:
+             commands.append(DeleteItemsCommand(self.whiteboard.canvas, items))
+             
+        if commands:
+            macro = MacroCommand("生成平行线")
+            macro.commands = commands
+            macro.redo()
+            self.whiteboard.canvas.edit_manager.push_undo(macro)
+            self.whiteboard.canvas.scene.update()
+            self.show_status_message(f"生成了 {new_cnt} 条平行线")
+
+    def _apply_bridges(self, bridge_map, width):
+        """应用桥位"""
+        if not bridge_map: return
+        
+        from edit.bridge_commands import ReplaceItemsCommand
+        from ui.graphics_items import EditablePathItem
+        import math
+        from PyQt5.QtGui import QColor
+
+        scene = self.whiteboard.canvas.scene
+        old_items = []
+        new_items = []
+        
+        for item, cuts in bridge_map.items():
+            if not cuts: continue
+            
+            old_items.append(item)
+            pts = item.points()
+            is_closed = item.is_closed()
+            
+            # Helper to calculate total length and segments
+            segments = [] # [(len, p1, p2)]
+            total_len = 0.0
+            
+            path_len = 0.0
+            seg_info = [] # (start_d, length, p1, p2)
+            
+            for i in range(len(pts)-1):
+                p1 = pts[i]
+                p2 = pts[i+1]
+                l = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                seg_info.append( (path_len, l, p1, p2) )
+                path_len += l
+            
+            # Define keep intervals
+            cuts.sort()
+            
+            # Map cuts to intervals to remove
+            remove_intervals = []
+            for c in cuts:
+                s = c - width/2
+                e = c + width/2
+                
+                if is_closed:
+                    if s < 0:
+                        remove_intervals.append( (s + path_len, path_len) )
+                        remove_intervals.append( (0, e) )
+                    elif e > path_len:
+                        remove_intervals.append( (s, path_len) )
+                        remove_intervals.append( (0, e - path_len) )
+                    else:
+                        remove_intervals.append( (s, e) )
+                else:
+                    s = max(0, s)
+                    e = min(path_len, e)
+                    if s < e:
+                         remove_intervals.append( (s, e) )
+                         
+            remove_intervals.sort()
+            merged = []
+            if remove_intervals:
+                curr_s, curr_e = remove_intervals[0]
+                for i in range(1, len(remove_intervals)):
+                    ns, ne = remove_intervals[i]
+                    if ns < curr_e: 
+                        curr_e = max(curr_e, ne)
+                    else:
+                        merged.append((curr_s, curr_e))
+                        curr_s, curr_e = ns, ne
+                merged.append((curr_s, curr_e))
+            remove_intervals = merged
+            
+            keep_intervals = []
+            curr = 0.0
+            for s, e in remove_intervals:
+                if s > curr:
+                    keep_intervals.append((curr, s))
+                curr = max(curr, e)
+            
+            if curr < path_len:
+                keep_intervals.append((curr, path_len))
+                
+            final_intervals = keep_intervals
+            if is_closed and len(remove_intervals) > 0:
+                 if len(keep_intervals) > 1 and \
+                    abs(keep_intervals[0][0] - 0) < 1e-9 and \
+                    abs(keep_intervals[-1][1] - path_len) < 1e-9:
+                      first = keep_intervals[0]
+                      last = keep_intervals[-1]
+                      merged_int = (last[0], path_len + first[1])
+                      final_intervals = keep_intervals[1:-1] + [merged_int]
+            
+            
+            def get_point_at(d):
+                if d > path_len: d -= path_len
+                
+                cur_Accum = 0.0
+                for start_d, l, p1_t, p2_t in seg_info:
+                    if d <= start_d + l + 1e-9:
+                        remain = d - start_d
+                        t = remain / l if l > 0 else 0
+                        x = p1_t[0] + (p2_t[0] - p1_t[0]) * t
+                        y = p1_t[1] + (p2_t[1] - p1_t[1]) * t
+                        return (x, y)
+                    cur_Accum += l
+                return pts[-1]
+            
+            def extract_subpath(d1, d2):
+                sub_pts = []
+                start_p = get_point_at(d1)
+                sub_pts.append(start_p)
+                
+                effective_d2 = d2
+                wrapped = False
+                if d2 > path_len: 
+                    effective_d2 = path_len
+                    wrapped = True
+                
+                for i in range(len(pts)-1):
+                     v_d = seg_info[i][0]
+                     if v_d > d1 + 1e-5 and v_d < effective_d2 - 1e-5:
+                         sub_pts.append(pts[i])
+
+                if effective_d2 == path_len and not wrapped:
+                    pass # Don't add last point if loop ends? Wait.
+                
+                end_p = get_point_at(effective_d2)
+                sub_pts.append(end_p)
+                
+                if wrapped:
+                    real_d2 = d2 - path_len
+                    for i in range(len(pts)-1):
+                        v_d = seg_info[i][0]
+                        if v_d > 1e-5 and v_d < real_d2 - 1e-5:
+                            sub_pts.append(pts[i])
+                    sub_pts.append(get_point_at(real_d2))
+                
+                return sub_pts
+            
+            for s, e in final_intervals:
+                # If interval is too small (bridge too close to corner/start?), skip?
+                if abs(s-e) < 1e-5: continue
+                new_pts = extract_subpath(s, e)
+                if len(new_pts) >= 2:
+                    new_item = EditablePathItem(new_pts, item.color(), getattr(item, '_smooth', False))
+                    new_items.append(new_item)
+                    
+        if new_items:
+            cmd = ReplaceItemsCommand(scene, old_items, new_items)
+            self.whiteboard.canvas.edit_manager.push_undo(cmd)
+            cmd.redo()
+
+    def show_cut_optimize_dialog(self):
+        """显示切割优化对话框"""
+        from .cut_optimize_dialog import CutOptimizeDialog
+        dlg = CutOptimizeDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            settings = dlg.get_settings()
+            self.optimize_path(settings)
+
+    def optimize_path(self, settings):
+        """执行切割路径优化"""
+        scene = self.whiteboard.canvas.scene
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+        from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
+        import math
+        from PyQt5.QtCore import QPointF
+        import heapq
+        from collections import defaultdict
+        
+        # 1. 获取所有 path items (按照当前 Z 序，或者无关)
+        items = list(scene.items())
+        path_items = [item for item in items if isinstance(item, (EditablePathItem, EditableEllipseItem, TextGraphicsItem, QGraphicsPixmapItem, QGraphicsTextItem))]
+        
+        if not path_items:
+             QMessageBox.information(self, "提示", "没有可优化的路径对象")
+             return
+
+        current_list = path_items[:] 
+        
+        # --- 策略 1: 按图层顺序 ---
+        # 优先级数大的先加工 -> Descending Sort by Layer Priority
+        if settings['layer_order']:
+            # 尝试获取RightPanel的Layer Map
+            try:
+                # self.right_panel has layer logic?
+                # RightPanel is self.right_panel in MainWindow
+                if hasattr(self, 'right_panel'):
+                    # 假设 right_panel 有 items() 或者 rows 包含 priority
+                    # 参考 right_panel.py: LayerTable uses items. Each row represents a layer.
+                    # QTableWidget items don't strictly bind to color unless we parse them.
+                    # right_panel 应该有一个数据源维护 LayerParams.
+                    # Searching `layer_params_map` didn't work. But `params.priority` exists.
+                    # Let's assume right_panel.table (LayerTable) holds the truth.
+                    
+                    # 构建 Color -> Priority Map
+                    color_priority_map = {}
+                    table = self.right_panel.table
+                    rowCount = table.rowCount()
+                    for r in range(rowCount):
+                        # Col 0: Color (Background)
+                        item0 = table.item(r, 0)
+                        if not item0: continue
+                        brush = item0.background()
+                        if not brush: continue
+                        color = brush.color() # QColor
+                        color_key = (color.red(), color.green(), color.blue())
+                        
+                        # Wait, priority is in which column?
+                        # In right_panel.py: `self.priority_spin` is used to edit.
+                        # Does table show priority?
+                        # Probably not in table directly as value, or maybe in hidden column?
+                        # Or maybe we rely on `DeviceManager` or `config`? 
+                        
+                        # 但是用户在 right panel 编辑 priority.
+                        # 当选中一行时, priority_spin 显示 priority.
+                        # 这意味着 priority 存储在某个地方。
+                        # Item Data? 
+                        # `LayerParams` class has `priority`.
+                        # `item0` might store `LayerParams` object in `Qt.UserRole`?
+                        # Let's check `right_panel.py` -> `update_row` or `add_row`
+                        pass
+                        
+                        # 暂时方案：如果不确定，尝试从 UserRole 获取 params
+                        layer_params = item0.data(Qt.UserRole)
+                        if layer_params and hasattr(layer_params, 'priority'):
+                            color_priority_map[color_key] = layer_params.priority
+                    
+                    # Sort function
+                    def layer_sort_key(item):
+                        # Get item color
+                        pen = item.pen()
+                        c = pen.color()
+                        k = (c.red(), c.green(), c.blue())
+                        return color_priority_map.get(k, 0) # Default 0
+                    
+                    # Reverse=True allows Larger Priority -> First
+                    current_list.sort(key=layer_sort_key, reverse=True)
+            except Exception as e:
+                print(f"Sort by layer failed: {e}")
+
+        # --- 策略：分块处理 ---
+        h = settings['block_height']
+        direction = settings['block_direction']
+        
+        def get_center(item):
+            return item.sceneBoundingRect().center()
+            
+        def block_key(item):
+            if h <= 0: return 0 
+            c = get_center(item)
+            
+            if direction in ["从上到下", "从下到上"]:
+                  # 水平分条
+                  row_idx = int(c.y() / h)
+                  prim = row_idx if direction == "从上到下" else -row_idx
+                  sec = c.x() # 默认左到右
+                  return (prim, sec)
+            else:
+                  # 垂直分条
+                  col_idx = int(c.x() / h)
+                  prim = col_idx if direction == "从左到右" else -col_idx
+                  sec = c.y() # 默认上到下
+                  return (prim, sec)
+                  
+        if h > 0:
+            current_list.sort(key=block_key)
+            
+        # --- 策略: 拓扑排序 (由内到外 vs 由外到内/默认) ---
+        # 如果勾选 "由内到外", 执行 Inner -> Outer.
+        # 如果未勾选, 执行 Outer -> Inner (作为默认加工逻辑?). 
+        # 用户需求: "如果不勾选这两项...默认的‘由外到内’".
+        
+        deps = defaultdict(list)
+        indegree = {item: 0 for item in current_list}
+        
+        # 建立依赖关系
+        # if Inside-Out checked: Inner comes before Outer. Edge Inner -> Outer.
+        # if Inside-Out Unchecked (Default Outside-In): Outer comes before Inner. Edge Outer -> Inner.
+        is_inside_out = settings['inside_out']
+        
+        for i, first in enumerate(current_list):
+            first_rect = first.sceneBoundingRect()
+            first_path = first.shape()
+            
+            for j, second in enumerate(current_list):
+                if i == j: continue
+                second_rect = second.sceneBoundingRect()
+                
+                # Check if first contains second
+                if first_rect.contains(second_rect):
+                    if first_path.contains(second_rect.center()):
+                        # 'first' contains 'second' (first is Outer, second is Inner)
+                        
+                        if is_inside_out:
+                            # Inner(second) -> Outer(first)
+                            deps[second].append(first)
+                            indegree[first] += 1
+                        else:
+                            # Outer(first) -> Inner(second)
+                            # Default Logic as requested
+                            deps[first].append(second)
+                            indegree[second] += 1
+
+        # 使用优先级队列进行拓扑排序，优先级由 Block Sort (或 Layer Sort) 决定 (即 original index 越小越先)
+        order_map = {item: i for i, item in enumerate(current_list)}
+        
+        queue = []
+        for item in current_list:
+             if indegree[item] == 0:
+                 # Priority Queue sorts by first element of tuple.
+                 # Python's heap is min-heap. Smaller index -> processed first.
+                 heapq.heappush(queue, (order_map[item], id(item), item)) 
+                 
+        sorted_result = []
+        while queue:
+             _, _, u = heapq.heappop(queue)
+             sorted_result.append(u)
+             
+             for v in deps[u]:
+                 indegree[v] -= 1
+                 if indegree[v] == 0:
+                     heapq.heappush(queue, (order_map[v], id(v), v))
+         
+        # Handle cycles (though unlikely for containment) or disconnected items not added
+        if len(sorted_result) == len(current_list):
+             current_list = sorted_result
+        else:
+             # Fallback if topological sort failed (cycle?)
+             # Just append what's missing
+             processed = set(sorted_result)
+             remaining = [item for item in current_list if item not in processed]
+             sorted_result.extend(remaining)
+             current_list = sorted_result
+
+        # --- 策略: 寻找切割点 ---
+
+        # --- 策略: 寻找切割点 ---
+        need_start_opt = (settings['inside_out_mode'] == "单个由内到外，寻找切割点") or settings['optimize_start'] or settings['auto_start_dir']
+        
+        if need_start_opt and len(current_list) > 0:
+            last_pos = QPointF(0, 0)
+            
+            for item in current_list:
+                # 1. 优化闭合图形起点
+                if hasattr(item, 'is_closed') and item.is_closed() and hasattr(item, 'points'):
+                    pts = item.points()
+                    if len(pts) > 1:
+                        best_idx = 0
+                        min_d = float('inf')
+                        # 忽略重复的尾点
+                        check_len = len(pts) - 1 if len(pts) > 2 else len(pts)
+                        
+                        for k in range(check_len):
+                            p = pts[k]
+                            d = (p[0]-last_pos.x())**2 + (p[1]-last_pos.y())**2
+                            if d < min_d:
+                                min_d = d
+                                best_idx = k
+                        
+                        if best_idx != 0:
+                            if hasattr(item, 'change_start_point'):
+                                item.change_start_point(best_idx)
+
+                # 2. 更新终点位置
+                if hasattr(item, 'points'):
+                    pts = item.points()
+                    if pts:
+                        last_pos = QPointF(*pts[-1])
+
+        # --- 应用顺序: 设置 Z-Values ---
+        for i, item in enumerate(current_list):
+            item.setZValue(i)
+        
+        scene.update()
+        QMessageBox.information(self, "完成", f"已优化 {len(current_list)} 个对象的切割路径")
+
     def show_auto_close_dialog(self):
         """显示曲线自动闭合对话框"""
         # 获取选中项
@@ -2128,10 +3555,233 @@ class MainWindow(QMainWindow):
             else:
                 self.show_status_message("没有曲线需要闭合")
 
+
+    def show_merge_lines_dialog(self):
+        """显示合并相连线对话框"""
+        # 获取选中项
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        target_items = [item for item in selected_items if isinstance(item, EditablePathItem)]
+        
+        if len(target_items) != 2:
+            QMessageBox.warning(self, "提示", "请选择两条待合并的曲线路径")
+            return
+
+        # 显示对话框
+        from ui.merge_lines_dialog import MergeLinesDialog
+        dlg = MergeLinesDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+            
+        tolerance = dlg.get_tolerance()
+        
+        item1 = target_items[0]
+        item2 = target_items[1]
+        
+        ptsA = item1.points()
+        ptsB = item2.points()
+        
+        import math
+        def dist(p1, p2):
+            return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
+            
+        d_es = dist(ptsA[-1], ptsB[0])  # Tail A -> Head B
+        d_se = dist(ptsA[0], ptsB[-1])  # Head A -> Tail B
+        d_ee = dist(ptsA[-1], ptsB[-1]) # Tail A -> Tail B
+        d_ss = dist(ptsA[0], ptsB[0])   # Head A -> Head B
+        
+        best_d = float('inf')
+        # mode: (swap_order, reverse_source1, reverse_source2)
+        # source1 和 source2 指的是经过 swap_order 后的第一条和第二条曲线
+        # 也就是说，最终是: (source1_maybe_reversed) -> 连接 -> (source2_maybe_reversed)
+        mode = None 
+        
+        # 1. A + B (Tail A -> Head B): Keep A, Keep B. Order: A, B.
+        if d_es < best_d: best_d, mode = d_es, (False, False, False)
+        
+        # 2. B + A (Tail B -> Head A): Keep B, Keep A. Order: B, A.
+        if d_se < best_d: best_d, mode = d_se, (True, False, False)
+        
+        # 3. A + Rev(B) (Tail A -> Tail B): Keep A, Reverse B. Order: A, B.
+        if d_ee < best_d: best_d, mode = d_ee, (False, False, True)
+        
+        # 4. Rev(A) + B (Head A -> Head B): Reverse A, Keep B. Order: A, B.
+        if d_ss < best_d: best_d, mode = d_ss, (False, True, False)
+        
+        if best_d > tolerance:
+             QMessageBox.warning(self, "提示", f"无法合并：端点最近距离 ({best_d:.4f}) 超过容差")
+             return
+             
+        # Merge
+        swap, rev1, rev2 = mode
+        source1 = item2 if swap else item1
+        source2 = item1 if swap else item2
+        
+        # 如果 source1 是 item2 (swap=True)，那么 rev1 对应的是 item2 的反转状态
+        # 所以这里的 rev1, rev2 直接用于 source1, source2 是正确的
+        
+        def get_data(itm, rev):
+            pts = itm.points()
+            segs = getattr(itm, '_segment_types', [])
+            cps = getattr(itm, '_control_points', {})
+            
+            expected_segs = max(0, len(pts)-1)
+            if len(segs) < expected_segs:
+                segs.extend([1]*(expected_segs-len(segs)))
+            segs = segs[:expected_segs]
+
+            data = (pts, segs, cps)
+            if rev:
+                data = EditablePathItem.reverse_path_data(data)
+            return data
+            
+        p1, s1, c1 = get_data(source1, rev1)
+        p2, s2, c2 = get_data(source2, rev2)
+        
+        new_pts = p1 + p2
+        # 连接处使用曲线(type=1)
+        new_segs = s1 + [1] + s2
+        
+        shift = len(s1) + 1
+        new_cps = c1.copy()
+        for k, v in c2.items():
+            new_cps[k + shift] = v
+           
+        merged_item = EditablePathItem(new_pts, source1._color, smooth=True)
+        merged_item._segment_types = new_segs
+        merged_item._control_points = new_cps
+        merged_item._update_path()
+        merged_item.setPen(source1.pen())
+        
+        # 使用 MergeItemsCommand 支持撤销
+        from edit.merge_command import MergeItemsCommand
+        cmd = MergeItemsCommand(self.whiteboard.canvas, item1, item2, merged_item)
+        cmd.redo()
+        self.whiteboard.canvas.edit_manager.push_undo(cmd)
+
     def show_data_check_dialog(self):
         """显示数据检查对话框"""
         dlg = DataCheckDialog(self.whiteboard.canvas, self)
         dlg.exec_()
+
+    def show_fill_bitmap_dialog(self):
+        """显示填充成位图对话框"""
+        selected_items = self.whiteboard.canvas.scene.selectedItems()
+        if not selected_items:
+            # QMessageBox.warning(self, "提示", "请先选择要填充的对象")
+            return
+
+        # 检查闭合性
+        from ui.graphics_items import EditablePathItem
+        for item in selected_items:
+            if isinstance(item, EditablePathItem):
+                if not item.is_closed():
+                    QMessageBox.warning(self, "Laser", "无闭合曲线!")
+                    return
+
+        dlg = FillBitmapDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+            
+        dpi = float(dlg.get_dpi())
+        
+        # Calculate bounding rect
+        rect = None
+        target_items = []
+        for item in selected_items:
+            # 过滤掉非图形项，只保留路径和椭圆等矢量项
+             if hasattr(item, 'path') or isinstance(item, QtWidgets.QGraphicsRectItem) or isinstance(item, QtWidgets.QGraphicsEllipseItem):
+                 target_items.append(item)
+                 if rect is None:
+                     rect = item.sceneBoundingRect()
+                 else:
+                     rect = rect.united(item.sceneBoundingRect())
+                     
+        if rect is None or not target_items:
+            return
+            
+        # Create Image
+        # rect attributes are in scene units (mm)
+        scale_factor = dpi / 25.4
+        width_px = int(rect.width() * scale_factor) + 2 # Add buffer
+        height_px = int(rect.height() * scale_factor) + 2
+        
+        if width_px <= 0 or height_px <= 0:
+            return
+
+        image = QtGui.QImage(width_px, height_px, QtGui.QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False) # Vector fill doesn't need AA if high res
+        
+        # Transform Logic:
+        # We want to map Scene Coords to Image Pixels.
+        # Image(0,0) corresponds to Scene(rect.x, rect.y).
+        # And 1 Scene Unit = scale_factor Pixels.
+        # So: Pixel = (Scene - Offset) * Scale
+        
+        painter.scale(scale_factor, scale_factor)
+        painter.translate(-rect.x(), -rect.y())
+        
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(Qt.black)
+        
+        # Draw items
+        for item in target_items:
+            if hasattr(item, 'path'): # QGraphicsPathItem, EditablePathItem
+                path = item.path()
+                scene_path = item.mapToScene(path)
+                painter.drawPath(scene_path)
+            elif isinstance(item, QtWidgets.QGraphicsRectItem):
+                path = QtGui.QPainterPath()
+                path.addRect(item.rect())
+                scene_path = item.mapToScene(path)
+                painter.drawPath(scene_path)
+            elif isinstance(item, QtWidgets.QGraphicsEllipseItem):
+                 path = QtGui.QPainterPath()
+                 path.addEllipse(item.rect())
+                 scene_path = item.mapToScene(path)
+                 painter.drawPath(scene_path)
+            
+        painter.end()
+        
+        # Create Pixmap Item
+        pixmap = QtGui.QPixmap.fromImage(image)
+        pix_item = QGraphicsPixmapItem(pixmap)
+        
+        # Set Position (Scene coords)
+        pix_item.setPos(rect.x(), rect.y())
+        
+        # Scale back to scene units
+        # Pixmap item displays pixels. We scaled up by scale_factor.
+        # So we must scale down by 1/scale_factor to match scene size.
+        pix_item.setScale(1.0 / scale_factor)
+        
+        pix_item.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, True)
+        pix_item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+        
+        # Set Layer Data
+        LAYER_COLOR_ROLE = Qt.UserRole + 100
+        pix_item.setData(LAYER_COLOR_ROLE, QColor(Qt.black))
+        
+        self.whiteboard.canvas.scene.addItem(pix_item)
+        pix_item.setSelected(True)
+        
+        # Deselect vector items
+        for item in selected_items:
+            item.setSelected(False)
+        pix_item.setSelected(True)
+        
+        # Update Layers
+        self.right_panel.update_layer_list(force=True)
+        
+        black_hex = QColor(Qt.black).name().upper()
+        if black_hex in self.right_panel.layer_data:
+            params = self.right_panel.layer_data[black_hex]
+            params.name = "BMP"
+            params.mode = "激光扫描"
+            # Refresh table
+            self.right_panel.update_layer_list(force=True)
 
     def show_bitmap_process_dialog(self):
         """显示位图处理对话框"""
@@ -2222,475 +3872,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.logger.error(f"Error opening bitmap dialog: {e}", exc_info=True)
             QMessageBox.critical(self, "错误", f"打开位图处理对话框时发生错误:\n{e}")
-
-    def start_manual_fillet_mode(self, values):
-        """进入手动倒圆角模式"""
-        if not hasattr(self.whiteboard, 'set_tool'):
-            # 兼容性处理：如果 whiteboard 是 WhiteboardWidget，需要调用 canvas.set_tool
-             # 但 WhiteboardWidget 没有 set_tool 方法，它通过左侧工具栏控制
-             # 我们这里直接调用 canvas 的 set_tool
-             self.whiteboard.canvas.set_tool(self.whiteboard.canvas.Tool.FILLET)
-        else:
-             self.whiteboard.set_tool(self.whiteboard.canvas.Tool.FILLET)
-             
-        self.fillet_params = values
-        self.show_status_message("手动倒圆角模式：请点击画布上的角点进行倒圆角")
-        
-    def end_manual_fillet_mode(self):
-        """退出手动倒圆角模式"""
-        # 恢复选择工具
-        if hasattr(self, 'left_toolbar'):
-             # 触发选择工具按钮点击
-             for btn in self.left_toolbar.button_group.buttons():
-                 if btn.property('tool_id') == self.left_toolbar.TOOL_SELECT:
-                     btn.click()
-                     break
-        self.show_status_message("已退出倒圆角模式")
-            
-    def on_fillet_request(self, item, corner_idx):
-        """响应倒圆角请求"""
-        # 确保我们在倒圆角模式且有参数
-        if self.whiteboard.canvas.get_tool() != self.whiteboard.canvas.Tool.FILLET:
-             return
-
-        # 获取参数，如果没有则使用默认值或上次的值
-        params = getattr(self, 'fillet_params', {'radius': 1.0, 'min_angle': 0.0, 'max_angle': 180.0})
-        
-        radius = params.get('radius', 1.0)
-        min_angle = params.get('min_angle', 0.0)
-        max_angle = params.get('max_angle', 180.0)
-        
-        try:
-            points = item.points()
-            if len(points) < 3:
-                return
-                
-            # 执行倒圆角
-            new_points = self._fillet_path(
-                points, 
-                radius, 
-                min_angle, 
-                max_angle, 
-                selected_indices=[corner_idx]
-            )
-            
-            if new_points and len(new_points) != len(points):
-                # 创建命令
-                cmd = FilletCommand(item, points, new_points)
-                # 直接执行 redo，因为 FilletCommand 已经封装了修改逻辑
-                # 但我们需要先推入撤销栈
-                cmd.redo()
-                self.whiteboard.canvas.edit_manager.push_undo(cmd)
-                # 可选：更新状态栏
-                # self.show_status_message(f"已倒圆角，半径 {radius}mm")
-                
-        except Exception as e:
-            self.logger.error(f"Error applying single fillet: {e}")
-
-    def show_fillet_dialog(self):
-        """显示倒圆角对话框并执行倒圆角操作"""
-        try:
-            # 检查是否已存在实例，避免重复创建
-            if not hasattr(self, '_fillet_dialog') or self._fillet_dialog is None:
-                self._fillet_dialog = FilletDialog(self)
-                # 窗口关闭时清理引用
-                def on_closed(result): # finished signal emits result code
-                    try:
-                        self.end_manual_fillet_mode()
-                    except: pass
-                
-                # 必须用强引用防止被 GC，同时连接信号
-                self._fillet_dialog.finished.connect(on_closed)
-                # 不要在 finished 里置 None，否则可能在关闭动画中访问空引用
-                # 只有在 destroyed 时置 None
-                # self._fillet_dialog.destroyed.connect(lambda: setattr(self, '_fillet_dialog', None))
-                # 实际上非模态窗口我们通常保留实例，下次直接 show()，这里为了简单每次重置也可以，但要注意 destroyed
-                # 更好的方式是保留实例
-            
-            self._fillet_dialog.show()
-            self._fillet_dialog.raise_()
-            self._fillet_dialog.activateWindow()
-
-        except Exception as e:
-            self.logger.error(f"Error in fillet dialog: {e}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开倒圆角对话框失败:\n{e}")
-    
-    def apply_manual_fillet(self, radius, min_angle, max_angle):
-        """手动倒圆角：对选中的路径在指定角点处倒圆角"""
-        # 兼容旧逻辑，这里不再使用。
-        # 现在的"手动倒圆角"是点击模式。
-        pass
-    
-    def apply_auto_fillet(self, radius, min_angle, max_angle):
-        """自动倒圆角：对所有路径自动查找符合条件的角点并倒圆角"""
-        from ui.graphics_items import EditablePathItem
-        
-        all_items = []
-        for item in self.whiteboard.canvas.scene.items():
-            if isinstance(item, EditablePathItem):
-                all_items.append(item)
-        
-        if not all_items:
-            QMessageBox.information(self, "提示", "画布中没有路径")
-            return
-        
-        commands = []
-        filleted_count = 0
-        total_corners = 0
-        processed_corners = 0
-        
-        for item in all_items:
-            try:
-                points = item.points()
-                if len(points) < 3:
-                    continue
-                
-                # 统计角点数量
-                num_vertices = len(points)
-                # 检查是否闭合
-                is_closed = False
-                if num_vertices >= 3:
-                    import math
-                    dist_to_close = math.sqrt((points[0][0] - points[-1][0])**2 + (points[0][1] - points[-1][1])**2)
-                    is_closed = dist_to_close < 1e-6
-                
-                if is_closed:
-                    total_corners += num_vertices
-                else:
-                    total_corners += max(0, num_vertices - 2)  # 开放路径，首尾点不是角点
-                
-                new_points = self._fillet_path(points, radius, min_angle, max_angle)
-                if new_points and len(new_points) != len(points):
-                    # 计算实际处理的角点数量（通过点数变化估算）
-                    original_segments = len(points) - (0 if is_closed else 1)
-                    new_segments = len(new_points) - (0 if is_closed else 1)
-                    if new_segments > original_segments:
-                        processed_corners += (new_segments - original_segments) // 2  # 粗略估算
-                    
-                    cmd = FilletCommand(item, points, new_points)
-                    commands.append(cmd)
-                    filleted_count += 1
-            except Exception as e:
-                self.logger.error(f"Error applying auto fillet to item: {e}", exc_info=True)
-                continue
-        
-        if commands:
-            if len(commands) == 1:
-                cmd = commands[0]
-                cmd.redo()
-                self.whiteboard.canvas.edit_manager.push_undo(cmd)
-            else:
-                macro_cmd = MacroCommand("自动倒圆角")
-                for cmd in commands:
-                    macro_cmd.add_command(cmd)
-                macro_cmd.redo()
-                self.whiteboard.canvas.edit_manager.push_undo(macro_cmd)
-            QMessageBox.information(self, "成功", f"已对 {filleted_count} 条路径进行自动倒圆角处理\n总角点数: {total_corners}")
-        else:
-            QMessageBox.information(self, "提示", "没有找到可倒圆角的路径")
-    
-    def _fillet_path(self, points, radius, min_angle, max_angle, selected_indices=None):
-        """对路径进行倒圆角处理"""
-        import math
-        
-        if len(points) < 3:
-            return points[:]
-        
-        # 转换为场景坐标（如果需要）
-        def get_xy(pt):
-            if isinstance(pt, (tuple, list)) and len(pt) >= 2:
-                return float(pt[0]), float(pt[1])
-            return float(pt.x()), float(pt.y())
-        
-        # 转换所有点
-        pts = [get_xy(p) for p in points]
-        
-        # 检查路径是否闭合（首尾点距离很近）
-        is_closed = False
-        had_closure_point = False
-        if len(pts) >= 3:
-            dist_to_close = math.sqrt((pts[0][0] - pts[-1][0])**2 + (pts[0][1] - pts[-1][1])**2)
-            is_closed = dist_to_close < 1e-6
-            if is_closed:
-                # 避免重复闭合点导致的退化角点
-                had_closure_point = True
-                pts = pts[:-1]
-        
-        new_points = []
-        
-        # 处理每个角点（对于闭合路径，处理所有点；对于开放路径，跳过首尾点）
-        num_vertices = len(pts)
-        
-        # 对于闭合路径，处理所有点；对于开放路径，跳过首尾点
-        if is_closed:
-            # 闭合路径：处理所有点（包括最后一个点，它连接到第一个点）
-            vertex_indices = list(range(num_vertices))
-            # 对于闭合路径，不预先添加点，让第一个角点处理时决定起始点
-        else:
-            # 开放路径：跳过首尾点（它们不是角点）
-            vertex_indices = list(range(1, num_vertices - 1))
-            # 添加第一个点
-            new_points.append(pts[0])
-        
-        for i in vertex_indices:
-            # 确定前一个点、当前点和后一个点
-            if is_closed:
-                # 闭合路径：使用模运算处理首尾连接
-                prev_idx = (i - 1) % num_vertices
-                next_idx = (i + 1) % num_vertices
-                p0 = pts[prev_idx]
-                p1 = pts[i]
-                p2 = pts[next_idx]
-            else:
-                # 开放路径：直接使用相邻索引
-                p0 = pts[i - 1]
-                p1 = pts[i]
-                p2 = pts[i + 1]
-            
-            
-            # 若指定了选择角点，仅处理选中的角点
-            if selected_indices is not None:
-                # selected_indices 可能是列表，转换为整数集合
-                if isinstance(selected_indices, (list, tuple)):
-                    selected_set = {int(idx) for idx in selected_indices}
-                else:
-                    selected_set = {int(selected_indices)}
-                
-                # 如果当前索引不在选中范围内，跳过
-                if i not in selected_set:
-                    new_points.append(p1)
-                    continue
-            
-            # 计算向量（从p1指向p0和p2）
-            v1 = (p0[0] - p1[0], p0[1] - p1[1])  # p1 -> p0
-            v2 = (p2[0] - p1[0], p2[1] - p1[1])  # p1 -> p2
-            
-            # 计算向量长度
-            len1 = math.sqrt(v1[0]**2 + v1[1]**2)
-            len2 = math.sqrt(v2[0]**2 + v2[1]**2)
-            
-            if len1 < 1e-6 or len2 < 1e-6:
-                new_points.append(p1)
-                continue
-            
-            # 归一化向量
-            u1 = (v1[0] / len1, v1[1] / len1)  # 从p1指向p0的单位向量
-            u2 = (v2[0] / len2, v2[1] / len2)  # 从p1指向p2的单位向量
-            
-            # 计算夹角（使用点积）
-            dot_product = u1[0] * u2[0] + u1[1] * u2[1]
-            dot_product = max(-1.0, min(1.0, dot_product))  # 限制在[-1, 1]范围内
-            angle = math.acos(dot_product)
-            angle_deg = math.degrees(angle)
-            
-            # 计算叉积以确定路径方向（用于确定圆弧方向）
-            cross_product = u1[0] * u2[1] - u1[1] * u2[0]  # 2D叉积
-            
-            # 计算内角（对于凸角，内角 = angle；对于凹角，内角 = 2π - angle）
-            # 通过叉积判断：如果叉积为正，路径是逆时针，内角就是angle；如果叉积为负，路径是顺时针，内角是2π - angle
-            # 但更简单的方法：内角就是两个向量之间的夹角，范围是[0, π]
-            # 对于倒圆角，我们通常处理的是内角小于180度的角（凸角）
-            inner_angle_deg = angle_deg  # 内角（0-180度）
-            
-            # 检查内角是否在范围内
-            # 注意：对于矩形等图形，所有角点都是90度，应该在0-180度范围内
-            if inner_angle_deg < min_angle or inner_angle_deg > max_angle:
-                # 角度不在范围内，保留原角点
-                # 对于闭合路径，需要确保角点之间的连接
-                if len(new_points) == 0:
-                    # 这是第一个角点，但角度不在范围内
-                    # 对于闭合路径，需要添加前一个点（最后一个点）作为起点
-                    if is_closed:
-                        prev_vertex_idx = (i - 1) % num_vertices
-                        prev_pt = pts[prev_vertex_idx]
-                        # 检查前一个角点是否被处理
-                        # 如果前一个角点没有被处理，它应该已经被添加为 p1
-                        # 但这里 new_points 是空的，说明前一个角点也没有被处理
-                        # 所以我们需要添加前一个点作为起点
-                        new_points.append(prev_pt)
-                new_points.append(p1)
-                continue
-            
-            # 对于接近180度的角（几乎直线），不进行倒圆角
-            # 但允许在max_angle范围内的角
-            if inner_angle_deg > 179.0 and max_angle < 179.0:
-                new_points.append(p1)
-                continue
-            
-            # 检查半径是否太大（不能超过线段长度）
-            min_seg_len = min(len1, len2)
-            # 确保半径不超过线段长度的45%，留出足够空间
-            max_radius = min_seg_len * 0.45
-            if radius > max_radius:
-                # 半径太大，使用最大允许值
-                radius_actual = max_radius
-                # 如果最大允许值太小，跳过这个角点
-                if radius_actual < 1e-6:
-                    new_points.append(p1)
-                    continue
-            else:
-                radius_actual = radius
-            
-            # 计算倒圆角的两个切点
-            # 计算角平分线方向（指向角内部）
-            bisector = (u1[0] + u2[0], u1[1] + u2[1])
-            bisector_len = math.sqrt(bisector[0]**2 + bisector[1]**2)
-            if bisector_len < 1e-6:
-                new_points.append(p1)
-                continue
-            
-            bisector = (bisector[0] / bisector_len, bisector[1] / bisector_len)
-            
-            # 计算圆心到角点的距离
-            half_angle = angle / 2.0
-            if abs(math.sin(half_angle)) < 1e-6:
-                new_points.append(p1)
-                continue
-            
-            dist_to_center = radius_actual / math.sin(half_angle)
-            
-            # 圆心位置（在角平分线上，距离角点dist_to_center）
-            # 需要确定圆心在角的内侧还是外侧
-            # 对于凸角，圆心在角的内侧（沿角平分线方向）
-            center = (p1[0] + bisector[0] * dist_to_center, 
-                     p1[1] + bisector[1] * dist_to_center)
-            
-            # 计算切点
-            # 切点1：在p0->p1线段上，距离p1为dist1（向p0方向）
-            dist1 = radius_actual / math.tan(half_angle)
-            # 确保切点不会超出线段范围
-            if dist1 > len1 * 0.85:
-                dist1 = len1 * 0.85  # 限制在85%以内，留出安全边距
-            if dist1 < 1e-6:
-                # 距离太小，跳过这个角点
-                new_points.append(p1)
-                continue
-            # u1是从p1指向p0，所以p1 + u1 * dist1是从p1向p0方向移动
-            t1 = (p1[0] + u1[0] * dist1, p1[1] + u1[1] * dist1)
-            
-            # 切点2：在p1->p2线段上，距离p1为dist2（向p2方向）
-            dist2 = radius_actual / math.tan(half_angle)
-            # 确保切点不会超出线段范围
-            if dist2 > len2 * 0.85:
-                dist2 = len2 * 0.85  # 限制在85%以内，留出安全边距
-            if dist2 < 1e-6:
-                # 距离太小，跳过这个角点
-                new_points.append(p1)
-                continue
-            # u2是从p1指向p2，所以p1 + u2 * dist2是从p1向p2方向移动
-            t2 = (p1[0] + u2[0] * dist2, p1[1] + u2[1] * dist2)
-            
-            # 添加第一个切点（如果与上一个点不同）
-            if len(new_points) == 0:
-                # 这是第一个被处理的角点
-                # 对于闭合路径，不需要添加最后一个点作为起点
-                # 让路径自然闭合，在处理完所有角点后检查
-                new_points.append(t1)
-            else:
-                # 检查是否需要添加连接线段
-                last_pt = new_points[-1]
-                dist_to_last = math.sqrt((t1[0] - last_pt[0])**2 + (t1[1] - last_pt[1])**2)
-                if dist_to_last > 1e-6:
-                    # 对于闭合路径，如果上一个角点没有被处理，可能需要添加连接线段
-                    if is_closed:
-                        # 检查上一个角点（索引 i-1）是否被处理
-                        # 如果上一个角点没有被处理，它应该已经被添加为 p1
-                        # 但为了确保路径连续，我们需要检查是否需要添加中间点
-                        prev_vertex_idx = (i - 1) % num_vertices
-                        prev_vertex_pt = pts[prev_vertex_idx]
-                        dist_to_prev_vertex = math.sqrt((last_pt[0] - prev_vertex_pt[0])**2 + (last_pt[1] - prev_vertex_pt[1])**2)
-                        if dist_to_prev_vertex > 1e-6:
-                            # 上一个角点没有被处理，但 last_pt 不是 prev_vertex_pt
-                            # 这意味着上一个角点被处理了，但 t2 和当前 t1 之间有间隙
-                            # 这种情况不应该发生，但为了安全，我们直接添加 t1
-                            pass
-                    new_points.append(t1)
-            
-            # 生成圆弧点
-            # 计算从圆心到切点的角度
-            vec_t1 = (t1[0] - center[0], t1[1] - center[1])
-            vec_t2 = (t2[0] - center[0], t2[1] - center[1])
-            
-            angle1 = math.atan2(vec_t1[1], vec_t1[0])
-            angle2 = math.atan2(vec_t2[1], vec_t2[0])
-            
-            # 确定圆弧方向
-            # 根据路径方向（通过叉积判断）确定圆弧是顺时针还是逆时针
-            angle_diff = angle2 - angle1
-            # 标准化角度差到[-pi, pi]
-            while angle_diff > math.pi:
-                angle_diff -= 2 * math.pi
-            while angle_diff < -math.pi:
-                angle_diff += 2 * math.pi
-            
-            # 如果叉积为正，路径是逆时针，圆弧应该逆时针；如果叉积为负，路径是顺时针，圆弧应该顺时针
-            # 但我们需要确保圆弧连接两个切点，所以需要检查角度差的方向
-            if abs(angle_diff) < 1e-6:
-                # 角度差太小，直接连接两个切点
-                new_points.append(t2)
-                continue
-            
-            # 生成圆弧点
-            num_arc_points = max(4, int(math.degrees(abs(angle_diff)) / 5))  # 每5度一个点
-            for j in range(1, num_arc_points):
-                t = j / num_arc_points
-                arc_angle = angle1 + angle_diff * t
-                arc_x = center[0] + radius_actual * math.cos(arc_angle)
-                arc_y = center[1] + radius_actual * math.sin(arc_angle)
-                new_points.append((arc_x, arc_y))
-            
-            # 添加第二个切点
-            new_points.append(t2)
-        
-        # 处理路径的结束
-        if is_closed:
-            # 闭合路径：确保路径闭合
-            if len(new_points) == 0:
-                # 如果没有角点被处理，返回原路径并保持闭合
-                closed_pts = pts[:]
-                if not closed_pts:
-                    return closed_pts
-                if math.hypot(closed_pts[0][0] - closed_pts[-1][0], closed_pts[0][1] - closed_pts[-1][1]) > 1e-6:
-                    closed_pts.append(closed_pts[0])
-                return closed_pts
-            
-            # 对于闭合路径，确保首尾闭合点存在
-            first_pt = new_points[0]
-            last_pt = new_points[-1]
-            dist_to_first = math.sqrt((last_pt[0] - first_pt[0])**2 + (last_pt[1] - first_pt[1])**2)
-            if dist_to_first > 1e-6:
-                new_points.append(first_pt)
-            elif had_closure_point:
-                # 若原路径显式闭合，确保闭合点存在（避免精度误差丢失）
-                new_points[-1] = first_pt
-        else:
-            # 非闭合路径：添加最后一个点
-            if len(pts) > 0:
-                last_pt = pts[-1]
-                if len(new_points) == 0:
-                    # 如果没有角点被处理，添加起点和终点
-                    new_points.append(pts[0])
-                    new_points.append(last_pt)
-                else:
-                    last_new_pt = new_points[-1]
-                    dist_to_last = math.sqrt((last_new_pt[0] - last_pt[0])**2 + (last_new_pt[1] - last_pt[1])**2)
-                    if dist_to_last > 1e-6:
-                        new_points.append(last_pt)
-        
-        # 确保至少有两个点
-        if len(new_points) < 2:
-            if is_closed and pts:
-                closed_pts = pts[:]
-                if math.hypot(closed_pts[0][0] - closed_pts[-1][0], closed_pts[0][1] - closed_pts[-1][1]) > 1e-6:
-                    closed_pts.append(closed_pts[0])
-                return closed_pts
-            return pts[:]
-        
-        return new_points
-    
-    def show_gear_dialog(self):
-        """显示加码齿对话框"""
-        QMessageBox.information(self, "提示", "加码齿功能暂未实现")
 
     def open_file(self):
         """打开RLD文件"""
@@ -2783,20 +3964,154 @@ class MainWindow(QMainWindow):
         return QColor(0, 0, 0)
 
     def import_image(self):
-        """
-        打开文件选择对话框并导入文件
-        """
-        SUPPORTED_FILTER_LOCAL = SUPPORTED_FILTER
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, '导入', filter=SUPPORTED_FILTER_LOCAL)
-        if path:
-            self.load_image_file(path)
+        self._import_image_impl()
+        # 修复导入后无法框选的问题：强制重置为选择工具
+        try:
+            from ui.left_toolbar import LeftToolbar
+            self._set_tool_from_menu(LeftToolbar.TOOL_SELECT)
+        except Exception as e:
+            self.logger.error(f"重置工具失败: {e}")
 
-    def load_image_file(self, path):
+    def _import_image_impl(self):
         """
-        实际加载文件逻辑
+        文件导入总入口函数：负责文件选择和显示加载进度条
         """
+        # 复用原 SUPPORTED_FILTER 常量
+        SUPPORTED_FILTER_LOCAL = SUPPORTED_FILTER
+
+        # --------------------------- 文件选择逻辑 ---------------------------
+        from ui.import_preview_dialog import PreviewFileDialog
+        dlg = PreviewFileDialog(self, "导入", filter=SUPPORTED_FILTER_LOCAL)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            files = dlg.selectedFiles()
+            path = files[0] if files else None
+        else:
+            path = None
+
         if not path:
             return
+
+        # ================== 导入加载框 (新增) ==================
+        # 即使操作很快，显示加载框也能提供良好的用户反馈
+        progress_dialog = QtWidgets.QProgressDialog("正导入文件,请稍侯..", None, 0, 100, self)
+        progress_dialog.setWindowTitle("导入")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0) # 立即显示
+        progress_dialog.setCancelButton(None) # 移除取消按钮
+        
+        # 样式美化
+        progress_dialog.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #76797C;
+                border-radius: 4px;
+                text-align: center;
+                color: black;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #05B8CC;
+                width: 1px; 
+            }
+        """)
+        progress_dialog.setValue(10) # 起始进度
+        progress_dialog.show()
+        QtWidgets.QApplication.processEvents() # 强制刷新
+        # =======================================================
+
+        try:
+            # 调用核心处理逻辑
+            self._import_process_file_internal(path)
+        finally:
+            # 确保无论成功还是失败，进度条都会填满并关闭
+            progress_dialog.setValue(100)
+            QtWidgets.QApplication.processEvents() # 稍微展示一下100%
+            import time
+            # 可选：稍微停顿一下（例如0.2秒）让用户看到100%，不然闪太快
+            # time.sleep(0.1) 
+            progress_dialog.close()
+
+    def _import_process_file_internal(self, path):
+        """
+        核心文件导入逻辑（由 _import_image_impl 调用）
+        """
+
+        def _calc_import_offset(paths_list):
+            # 计算包围盒并返回偏移量
+            min_x, min_y, max_x, max_y = float('inf'), float('inf'), float('-inf'), float('-inf')
+            has_pts = False
+            for path_pts in paths_list:
+                for px, py in path_pts:
+                    if px < min_x:
+                        min_x = px
+                    if py < min_y:
+                        min_y = py
+                    if px > max_x:
+                        max_x = px
+                    if py > max_y:
+                        max_y = py
+                    has_pts = True
+
+            if not has_pts:
+                return 0.0, 0.0
+
+            canvas_w = getattr(self.whiteboard.canvas, '_work_w', 400.0)
+            canvas_h = getattr(self.whiteboard.canvas, '_work_h', 300.0)
+
+            imp_settings = getattr(self.whiteboard.canvas, 'import_settings', {})
+            dock_pos = imp_settings.get('dock_pos', '中心')
+            if not dock_pos:
+                dock_pos = '中心'
+
+            cur_w = max_x - min_x
+            cur_h = max_y - min_y
+            cur_cx = min_x + cur_w / 2
+            cur_cy = min_y + cur_h / 2
+
+            dx, dy = 0.0, 0.0
+            should_move = True
+
+            if dock_pos == '无' or dock_pos == '按坐标':
+                if min_x > canvas_w * 2 or max_x < -canvas_w or min_y > canvas_h * 2 or max_y < -canvas_h:
+                    self.show_status_message("提示: 图形坐标超出范围，已自动移至画布中心", 5000)
+                    dock_pos = '中心'
+                else:
+                    should_move = False
+
+            if should_move:
+                if dock_pos == '中心':
+                    target_x = canvas_w / 2
+                    target_y = canvas_h / 2
+                    dx = target_x - cur_cx
+                    dy = target_y - cur_cy
+                elif dock_pos == '左上':
+                    dx = 0 - min_x
+                    dy = 0 - min_y
+                elif dock_pos == '右上':
+                    dx = canvas_w - max_x
+                    dy = 0 - min_y
+                elif dock_pos == '右下':
+                    dx = canvas_w - max_x
+                    dy = canvas_h - max_y
+                elif dock_pos == '左下':
+                    dx = 0 - min_x
+                    dy = canvas_h - max_y
+
+            return dx, dy
+
+        def _dedupe_layer_name(name, existing_names):
+            if name not in existing_names:
+                existing_names.add(name)
+                return name
+
+            base = name
+            idx = 2
+            while True:
+                candidate = f"{base}_{idx}"
+                if candidate not in existing_names:
+                    existing_names.add(candidate)
+                    return candidate
+                idx += 1
+
 
         lower = path.lower()
         self.logger.info(f"开始导入文件: {path}")  # 记录导入的文件路径
@@ -2804,6 +4119,7 @@ class MainWindow(QMainWindow):
         try:
             # --------------------------- HPGL/PLT文件导入部分 - 保留原简化版逻辑 ---------------------------
             if lower.endswith(('.plt', '.hpgl')):
+
                 # 基础文件检查
                 if not os.path.exists(path):
                     self.show_status_message(f"HPGL/PLT文件不存在: {os.path.basename(path)}", 5000)
@@ -3161,9 +4477,8 @@ class MainWindow(QMainWindow):
                     # 处理其他位图
                     try:
                         im = Image.open(path)
-                        # 不要强制转为RGBA，保持原样以便判断模式，但为了Qt显示兼容性，需确保是Qt支持的格式
-                        if im.mode not in ('RGB', 'RGBA', 'L', '1'):
-                            im = im.convert('RGBA')
+                        # 自动转换为灰度图 (L模式)
+                        im = im.convert('L')
 
                         self._current_bitmap = im
                         pix = pil_to_qpixmap(im)
@@ -3280,6 +4595,72 @@ class MainWindow(QMainWindow):
                         # 生成新图层颜色
                         layer_color = self.get_next_layer_color()
 
+                        # ----------------------- 自动归一化逻辑（缩放并居中） -----------------------
+                        # 计算原始包围盒
+                        min_x, min_y = float('inf'), float('inf')
+                        max_x, max_y = float('-inf'), float('-inf')
+                        has_points = False
+                        for pts in paths:
+                            for x, y in pts:
+                                min_x = min(min_x, x)
+                                min_y = min(min_y, y)
+                                max_x = max(max_x, x)
+                                max_y = max(max_y, y)
+                                has_points = True
+                        
+                        if has_points:
+                            path_w = max_x - min_x
+                            path_h = max_y - min_y
+                            
+                            # 获取画布尺寸（默认为600x400，如果有配置则读取配置）
+                            canvas_w = getattr(self.whiteboard.canvas, '_work_w', 600.0)
+                            canvas_h = getattr(self.whiteboard.canvas, '_work_h', 400.0)
+                            
+                            # 1. 单位转换（Points -> mm）
+                            # AI/PDF 默认单位为 Point (1/72 inch = 0.352778 mm)
+                            # RDWorks 通常使用 mm。如果直接用 Points 数值当 mm 用，会放大约 2.83 倍。
+                            # 通常我们希望保持物理尺寸一致，或者用户就是想要“填充画布”。
+                            # 鉴于用户之前的请求是“处在画布内”，我们优先保证可见性。
+                            # 这里引入一个基础转换系数，如果不合适后续可以调整。
+                            unit_scale = 0.352778 
+                            
+                            # 2. 计算缩放比例 (留出5%边距)
+                            # 先应用单位转换后的尺寸
+                            phys_w = path_w * unit_scale
+                            phys_h = path_h * unit_scale
+                            
+                            scale_x = (canvas_w * 0.9) / phys_w if phys_w > 0 else 1.0
+                            scale_y = (canvas_h * 0.9) / phys_h if phys_h > 0 else 1.0
+                            
+                            # 决定最终缩放:
+                            # 如果图形比画布大，必须缩小 (scale < 1.0)
+                            # 如果图形比画布小，通常保持 1.0 (即仅应用 unit_scale)，除非用户强制要求“充满”。
+                            # 这里采用：如果太大则缩小，如果太小则保持原物理尺寸（scale=1.0 relative to unit_scale）
+                            fit_scale = min(scale_x, scale_y)
+                            final_scale = unit_scale * (fit_scale if fit_scale < 1.0 else 1.0)
+                            
+                            # 3. 计算居中平移
+                            center_x = min_x + path_w / 2
+                            center_y = min_y + path_h / 2
+                            
+                            target_x = canvas_w / 2
+                            target_y = canvas_h / 2
+                            
+                            # 修正所有点的坐标
+                            new_paths = []
+                            for pts in paths:
+                                new_pts = []
+                                for x, y in pts:
+                                    # 先归一化到原点相对坐标，再缩放，再平移到目标
+                                    nx = (x - center_x) * final_scale + target_x
+                                    ny = (y - center_y) * final_scale + target_y
+                                    new_pts.append((nx, ny))
+                                new_paths.append(new_pts)
+                            paths = new_paths
+                            
+                            self.logger.info(f"路径已自动归一化: FinalScale={final_scale:.4f} (Original WxH={path_w:.1f}x{path_h:.1f} pts -> Fits Canvas {canvas_w}x{canvas_h})")
+                        # ----------------------- 自动归一化逻辑结束 -----------------------
+
                         # 绘制所有路径（红色，确保可见）
                         for idx, pts in enumerate(paths):
                             if len(pts) < 2:
@@ -3330,10 +4711,34 @@ class MainWindow(QMainWindow):
             # --------------------------- 其他格式：原 import_file_any 核心逻辑 ---------------------------
             paths: List[Path] = []
             try:
-                # 处理 DXF 格式
-                if lower.endswith(('.dxf',)):
-                    from my_io.importers.import_dxf import import_dxf
-                    paths = import_dxf(path)
+                # 处理 DWG/DXF 格式
+                if lower.endswith(('.dwg', '.dxf')):
+                    if lower.endswith('.dwg'):
+                        from my_io.importers.import_dwg import import_dwg
+                    else:
+                        from my_io.importers.import_dxf import import_dxf
+                    
+                    scale_val = None
+                    try:
+                        imp = getattr(self.whiteboard.canvas, 'import_settings', {})
+                        d_unit = imp.get('dxf_unit')
+                        if d_unit == "毫米": 
+                            scale_val = 1.0
+                        elif d_unit == "厘米": 
+                            scale_val = 10.0
+                        elif d_unit == "英寸": 
+                            scale_val = 25.4
+                        elif d_unit == "自定义": 
+                            scale_val = float(imp.get('dxf_custom_unit', 1.0))
+                    except Exception:
+                        pass
+
+                    if lower.endswith('.dwg'):
+                        paths = import_dwg(path, unit_scale=scale_val)
+                    else:
+                        # 使用分图层导入
+                        from my_io.importers.import_dxf import import_dxf_by_layer
+                        paths = import_dxf_by_layer(path, unit_scale=scale_val)
                 # 处理 SVG 格式
                 elif lower.endswith(('.svg',)):
                     from my_io.importers.import_svg import import_svg
@@ -3429,46 +4834,73 @@ class MainWindow(QMainWindow):
                 else:
                     raise e  # 转换失败，抛出原始错误
 
+            # --------------------------- DWG/DXF 图层导入处理 ---------------------------
+            if isinstance(paths, dict):
+                layer_groups = paths
+                if not layer_groups:
+                    self.show_status_message(f'未从 {os.path.basename(path)} 中找到可导入的图形', 5000)
+                    return
+
+                all_paths = []
+                for info in layer_groups.values():
+                    all_paths.extend(info.get("paths", []))
+
+                try:
+                    dx, dy = _calc_import_offset(all_paths)
+                except Exception as e:
+                    self.logger.error(f"自动停靠处理出错: {e}")
+                    dx, dy = 0.0, 0.0
+
+                existing_names = set()
+                for params in self.right_panel.layer_data.values():
+                    if getattr(params, "name", ""):
+                        existing_names.add(params.name)
+
+                for layer_name, info in layer_groups.items():
+                    layer_color = self.get_next_layer_color()
+
+                    adjusted_paths = []
+                    for pts in info.get("paths", []):
+                        if dx != 0.0 or dy != 0.0:
+                            adjusted_paths.append([(px + dx, py + dy) for px, py in pts])
+                        else:
+                            adjusted_paths.append(pts)
+
+                    for pts in adjusted_paths:
+                        self.whiteboard.canvas.add_polyline(pts, layer_color)
+
+                    self.right_panel.update_layer_list(force=True)
+                    hex_color = layer_color.name().upper()
+                    if hex_color in self.right_panel.layer_data:
+                        base_name = layer_name or os.path.basename(path)
+                        deduped = _dedupe_layer_name(base_name, existing_names)
+                        params = self.right_panel.layer_data[hex_color]
+                        if not params.name:
+                            params.name = deduped
+                        self.right_panel.update_layer_list(force=True)
+
+                self.whiteboard.canvas.fit_all()
+                self.show_status_message(f'已导入: {os.path.basename(path)} / 图层数={len(layer_groups)}', 5000)
+                return
+
             # --------------------------- 其他格式导入结果处理 - 保留原逻辑 ---------------------------
             if paths:
-                # 生成新图层颜色 (修改为强制使用黑色)
-                # layer_color = self.get_next_layer_color() 
-                layer_color = QColor(0, 0, 0) # 强制黑色
+                # ----------------- 自动居中/停靠处理 -----------------
+                try:
+                    dx, dy = _calc_import_offset(paths)
+                    if dx != 0.0 or dy != 0.0:
+                        new_paths = []
+                        for path_pts in paths:
+                            new_paths.append([(px + dx, py + dy) for px, py in path_pts])
+                        paths = new_paths
+                except Exception as e:
+                    self.logger.error(f"自动停靠处理出错: {e}")
 
-                # 计算路径的包围盒
-                min_x, min_y = float('inf'), float('inf')
-                max_x, max_y = float('-inf'), float('-inf')
-                for pts in paths:
-                    for x, y in pts:
-                        min_x = min(min_x, x)
-                        min_y = min(min_y, y)
-                        max_x = max(max_x, x)
-                        max_y = max(max_y, y)
-
-                # 计算偏移量以居中
-                offset_x, offset_y = 0.0, 0.0
-                if min_x != float('inf'):
-                    path_w = max_x - min_x
-                    path_h = max_y - min_y
-                    path_cx = min_x + path_w / 2
-                    path_cy = min_y + path_h / 2
-                    
-                    # 获取画布中心（假设工作区大小为 _work_w, _work_h，或者默认为 0,0）
-                    # 通常工作区是 (0,0) 到 (W, H)，中心是 (W/2, H/2)
-                    # 如果 _work_w 未定义，使用默认值
-                    work_w = getattr(self.whiteboard.canvas, '_work_w', 600.0)
-                    work_h = getattr(self.whiteboard.canvas, '_work_h', 400.0)
-                    
-                    target_cx = work_w / 2
-                    target_cy = work_h / 2
-                    
-                    offset_x = target_cx - path_cx
-                    offset_y = target_cy - path_cy
+                # 生成新图层颜色
+                layer_color = self.get_next_layer_color()
 
                 for pts in paths:
-                    # 应用偏移
-                    new_pts = [(x + offset_x, y + offset_y) for x, y in pts]
-                    self.whiteboard.canvas.add_polyline(new_pts, layer_color)
+                    self.whiteboard.canvas.add_polyline(pts, layer_color)
                 
                 # 更新图层名称
                 self.right_panel.update_layer_list(force=True)
@@ -3541,15 +4973,55 @@ class MainWindow(QMainWindow):
                     return
 
             # 选择保存文件路径
-            filename, _ = QFileDialog.getSaveFileName(
+            filename, sel_filter = QFileDialog.getSaveFileName(
                 self,
-                '导出为NC文件',
+                '导出为NC/AI/PLT文件',
                 '',
-                'NC文件 (*.nc);;G代码文件 (*.gcode);;所有文件 (*)'
+                'NC文件 (*.nc);;G代码文件 (*.gcode);;AI文件 (*.ai);;PLT文件 (*.plt);;所有文件 (*)'
             )
 
             if not filename:
                 return  # 用户取消
+
+            lower_name = filename.lower()
+            # 简单后缀补全
+            if '.' not in os.path.basename(filename):
+                if 'AI' in sel_filter:
+                    filename += '.ai'
+                    lower_name += '.ai'
+                elif 'PLT' in sel_filter:
+                    filename += '.plt'
+                    lower_name += '.plt'
+                elif 'G代码' in sel_filter:
+                    filename += '.gcode'
+                    lower_name += '.gcode' 
+
+            # 获取允许导出的颜色层
+            allowed_colors = None
+            if hasattr(self, 'right_panel'):
+                allowed_colors = self.right_panel.get_output_enabled_colors()
+
+            # --- AI/PLT 导出分支 ---
+            if lower_name.endswith('.ai'):
+                from my_io.exporters.export_ai import export_to_ai
+                if export_to_ai(self.whiteboard.canvas, filename, allowed_colors):
+                     self.show_status_message(f'成功导出AI文件: {os.path.basename(filename)}', 5000)
+                     QMessageBox.information(self, "导出成功", f"成功导出AI文件: {filename}")
+                else:
+                     self.show_status_message(f'AI文件导出失败', 5000)
+                     QMessageBox.warning(self, "导出失败", "AI文件导出失败，详情请查看日志")
+                return
+
+            elif lower_name.endswith('.plt'):
+                from my_io.exporters.export_plt import export_to_plt
+                if export_to_plt(self.whiteboard.canvas, filename, allowed_colors):
+                     self.show_status_message(f'成功导出PLT文件: {os.path.basename(filename)}', 5000)
+                     QMessageBox.information(self, "导出成功", f"成功导出PLT文件: {filename}")
+                else:
+                     self.show_status_message(f'PLT文件导出失败', 5000)
+                     QMessageBox.warning(self, "导出失败", "PLT文件导出失败，详情请查看日志")
+                return
+            # -----------------------
 
             # 确保文件扩展名
             if not filename.lower().endswith(('.nc', '.gcode')):
@@ -3569,24 +5041,27 @@ class MainWindow(QMainWindow):
 
             # 执行导出
             allowed_colors = None
-            layer_params_map = None
+            layer_settings = None
+            export_settings = getattr(self.whiteboard.canvas, 'export_settings', {})
+            optimize_settings = getattr(self.whiteboard.canvas, 'optimize_settings', {})
             if hasattr(self, 'right_panel'):
                 allowed_colors = self.right_panel.get_output_enabled_colors()
-                # 从 RightPanel.layer_data 构建一个简化的图层参数字典，传给导出器
-                try:
-                    layer_params_map = {}
-                    for hex_color, p in self.right_panel.layer_data.items():
-                        key = str(hex_color).upper()
-                        layer_params_map[key] = {
-                            'seal_gap': getattr(p, 'seal_gap', 0.0),
-                            'laser_on_delay': getattr(p, 'laser_on_delay', 0),
-                            'laser_off_delay': getattr(p, 'laser_off_delay', 0),
-                            'mode': getattr(p, 'mode', '激光切割'),
-                        }
-                except Exception:
-                    layer_params_map = None
+                layer_settings = self.right_panel.layer_data
 
-            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors, layer_params_map)
+            scan_direction = export_settings.get('scan_direction')
+            if scan_direction:
+                config['scan_direction'] = scan_direction
+            gap_comp_optimize = (optimize_settings or {}).get(
+                'gap_comp_optimize',
+                (export_settings or {}).get('gap_comp_optimize', None)
+            )
+            if gap_comp_optimize is not None:
+                config['gap_comp_optimize'] = gap_comp_optimize
+            small_circle_enable = (export_settings or {}).get('small_circle_enable', None)
+            if small_circle_enable is not None:
+                config['small_circle_enable'] = small_circle_enable
+
+            success = export_to_nc(self.whiteboard.canvas, filename, config, allowed_colors, layer_settings)
 
             if success:
                 # 读取生成的文件以获取更多信息
@@ -3625,9 +5100,46 @@ class MainWindow(QMainWindow):
             self.show_status_message('导出错误', 5000)
             QMessageBox.critical(self, "导出错误", error_msg)
 
+    def export_to_dxf_file(self):
+        """导出为DXF文件"""
+        try:
+             # 选择保存文件路径
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                '导出为 DXF 文件',
+                '',
+                'DXF 文件 (*.dxf)'
+            )
+
+            if not filename:
+                return
+
+            if not filename.lower().endswith('.dxf'):
+                filename += '.dxf'
+
+            self.show_status_message("正在导出 DXF...")
+            
+            # 允许的颜色
+            allowed_colors = None
+            if hasattr(self, 'right_panel'):
+                allowed_colors = self.right_panel.get_output_enabled_colors()
+
+            count = export_to_dxf(self.whiteboard.canvas, filename, allowed_colors)
+            
+            if count is not None and count > 0:
+                QMessageBox.information(self, "导出成功", f"成功导出 {count} 个对象到 DXF 文件。")
+                self.show_status_message(f"已导出 DXF: {filename}")
+            elif count == 0:
+                QMessageBox.warning(self, "导出警告", "没有导出任何对象，请检查画布内容或图层设置。")
+                self.show_status_message("导出 DXF 结束 (无内容)")
+
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出 DXF 失败: {str(e)}")
+            self.show_status_message("导出 DXF 失败")
+
     def _analyze_canvas_content(self):
         """详细分析画布内容（增强版）"""
-        from PyQt5.QtWidgets import QGraphicsPixmapItem
+        from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsPathItem
 
         info = {
             'has_paths': False,
@@ -3647,7 +5159,7 @@ class MainWindow(QMainWindow):
                 if hasattr(self.whiteboard.canvas, '_fiducial_item') and item == self.whiteboard.canvas._fiducial_item:
                     continue
 
-                # 矢量路径
+                # 矢量路径 (EditablePathItem 或 标准 QGraphicsPathItem)
                 if hasattr(item, '_points') and hasattr(item, 'points'):
                     try:
                         points = item.points()
@@ -3657,6 +5169,14 @@ class MainWindow(QMainWindow):
                             info['total_points'] += len(points)
                     except Exception as e:
                         self.logger.warning(f"获取路径点时出错: {e}")
+                elif isinstance(item, QGraphicsPathItem) and not isinstance(item, QGraphicsPixmapItem):
+                    # 处理 TextGraphicsItem 和其他普通 PathItem
+                    path = item.path()
+                    if not path.isEmpty():
+                        info['has_paths'] = True
+                        info['path_count'] += 1
+                        # 估算点数 (简单按元素数量)
+                        info['total_points'] += path.elementCount()
 
                 # 位图图片
                 elif isinstance(item, QGraphicsPixmapItem):
@@ -3840,27 +5360,97 @@ class MainWindow(QMainWindow):
                     
                     from ui.graphics_items import EditablePathItem, EditableEllipseItem
                     from ui.whiteboard import RotateHandle
+                    # Add import for VirtualArrayItem
+                    try:
+                        from ui.virtual_array_item import VirtualArrayItem
+                    except ImportError:
+                        VirtualArrayItem = type(None) # Dummy if not found
+                    
                     from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem
 
                     # 辅助函数：获取项的颜色Hex
                     def get_item_color_hex(item):
-                        color = None
-                        if isinstance(item, (EditablePathItem, EditableEllipseItem)):
-                            color = item.pen().color()
-                        elif isinstance(item, QGraphicsTextItem):
-                            color = item.defaultTextColor()
-                        
-                        if color:
-                            return color.name().upper()
-                        return None
+                        layer_color_role = Qt.UserRole + 100
+                        color_hex = None
+
+                        if hasattr(item, 'data'):
+                            color_data = item.data(layer_color_role)
+                            if isinstance(color_data, QColor):
+                                color_hex = color_data.name().upper()
+                            elif isinstance(color_data, str):
+                                color_hex = color_data.upper()
+
+                        if not color_hex and hasattr(item, '_color'):
+                            c = getattr(item, '_color')
+                            if isinstance(c, QColor):
+                                color_hex = c.name().upper()
+                            elif isinstance(c, str):
+                                color_hex = c.upper()
+
+                        if not color_hex and hasattr(item, 'pen'):
+                            try:
+                                pen = item.pen()
+                                if pen and pen.color().isValid():
+                                    color_hex = pen.color().name().upper()
+                            except Exception:
+                                pass
+
+                        if not color_hex and hasattr(item, 'defaultTextColor'):
+                            try:
+                                color = item.defaultTextColor()
+                                if color and color.isValid():
+                                    color_hex = color.name().upper()
+                            except Exception:
+                                pass
+
+                        return color_hex
+
+                    def get_layer_state(item):
+                        color_hex = get_item_color_hex(item)
+                        if color_hex and color_hex in layer_data:
+                            params = layer_data[color_hex]
+                            return color_hex, params, bool(params.is_output), int(params.priority)
+                        return color_hex, None, True, 9999
 
                     # 收集有效项
                     for item in items:
-                        # 排除不可见项
-                        if not item.isVisible(): continue
+                        color_hex, layer_params, is_output_enabled, priority = get_layer_state(item)
+                        try:
+                            visible = bool(item.isVisible())
+                        except Exception:
+                            visible = True
+                        # 仅当该项关联图层且该层允许输出时，隐藏项也参与路径
+                        if (not visible) and layer_params is None:
+                            continue
+                        if not is_output_enabled:
+                            continue
 
                         # 排除非顶层项（如子项、手柄图标等）
                         if item.parentItem() is not None: continue
+                        
+                        # --- 处理虚阵列 (VirtualArrayItem) ---
+                        if isinstance(item, VirtualArrayItem):
+                            # 这里我们需要提取其内部的“实线”子项用于路径显示
+                            # 而“虚线”部分通常不作为切割路径输出
+                            if hasattr(item, 'real_items'):
+                                for sub_item in item.real_items:
+                                    sub_color_hex, sub_layer_params, sub_output_enabled, sub_priority = get_layer_state(sub_item)
+                                    try:
+                                        sub_visible = bool(sub_item.isVisible())
+                                    except Exception:
+                                        sub_visible = True
+                                    if (not sub_visible) and sub_layer_params is None:
+                                        continue
+                                    if not sub_output_enabled:
+                                        continue
+                                    
+                                    # 递归检查类型 (只支持路径/图片/文字)
+                                    if not isinstance(sub_item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
+                                        continue
+
+                                    valid_items.append((sub_item, sub_priority))
+                            continue
+                        # ------------------------------------
 
                         # 排除辅助项
                         if item.zValue() >= 9999: continue # Preview items
@@ -3874,22 +5464,11 @@ class MainWindow(QMainWindow):
                         if isinstance(item, RotateHandle): continue
 
                         # 仅包含用户内容类型
-                        if not isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
+                        # 更新：包含 TextGraphicsItem (自定义文字项)
+                        if not isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
                             continue
 
-                        color_hex = get_item_color_hex(item)
-                        if color_hex:
-                            # 检查图层设置
-                            if color_hex in layer_data:
-                                params = layer_data[color_hex]
-                                if params.is_output:
-                                    valid_items.append((item, params.priority))
-                            else:
-                                # 未知图层，默认输出，优先级最低
-                                valid_items.append((item, 9999))
-                        else:
-                            # 无颜色项（如图片），默认输出
-                            valid_items.append((item, 9999))
+                        valid_items.append((item, priority))
                     
                     # 排序：优先级越小越靠前
                     # scene.items() 返回的是 stacking order (top first). 
@@ -3908,8 +5487,394 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_path = False
 
+    def on_fill_scan_toggled(self, checked):
+        """切换“填充扫描图形”实时预览"""
+        if checked:
+            added, _removed = self._sync_fill_scan_pairs()
+            if added > 0:
+                self.show_status_message(f"填充扫描图形：已填充 {added} 个闭合路径", 2500)
+            else:
+                self.show_status_message("填充扫描图形已开启", 2000)
+        else:
+            restored = self._restore_all_fill_scan_pairs()
+            self.show_status_message(f"填充扫描图形已关闭，已恢复 {restored} 个路径", 2500)
+
+        if self.show_path_action.isChecked():
+            self.toggle_show_path()
+
+    def _is_item_alive(self, item):
+        try:
+            item.scene()
+            return True
+        except Exception:
+            return False
+
+    def _source_id(self, item):
+        return int(id(item))
+
+    def _is_fill_scan_generated_bitmap(self, item):
+        try:
+            return bool(item.data(FILL_SCAN_BITMAP_ROLE))
+        except Exception:
+            return False
+
+    def _get_item_layer_color(self, item):
+        """提取图元所属图层颜色"""
+        try:
+            if hasattr(item, 'pen'):
+                c = item.pen().color()
+                if c and c.isValid():
+                    return c
+        except Exception:
+            pass
+
+        try:
+            if hasattr(item, 'defaultTextColor'):
+                c = item.defaultTextColor()
+                if c and c.isValid():
+                    return c
+        except Exception:
+            pass
+
+        try:
+            color_data = item.data(Qt.UserRole + 100)
+            if isinstance(color_data, QColor):
+                return color_data
+            if isinstance(color_data, str):
+                c = QColor(color_data)
+                if c.isValid():
+                    return c
+        except Exception:
+            pass
+
+        return None
+
+    def _is_scene_path_closed(self, scene_path):
+        """判断场景路径是否为闭合路径（所有子路径首尾闭合）"""
+        try:
+            polys = scene_path.toSubpathPolygons()
+        except Exception:
+            return False
+
+        if not polys:
+            return False
+
+        for poly in polys:
+            if poly.count() < 3:
+                return False
+            first = poly.at(0)
+            last = poly.at(poly.count() - 1)
+            if abs(first.x() - last.x()) > 1e-6 or abs(first.y() - last.y()) > 1e-6:
+                return False
+        return True
+
+    def _build_closed_scene_path(self, item):
+        """仅为闭合矢量图元构建场景路径"""
+        if isinstance(item, EditablePathItem):
+            if not item.is_closed():
+                return None
+            local_path = item.path()
+            if local_path.isEmpty():
+                return None
+            return item.mapToScene(local_path)
+
+        if isinstance(item, EditableEllipseItem):
+            local_path = QtGui.QPainterPath()
+            local_path.addEllipse(item.rect())
+            return item.mapToScene(local_path)
+
+        if isinstance(item, QtWidgets.QGraphicsPathItem):
+            local_path = item.path()
+            if local_path.isEmpty():
+                return None
+            scene_path = item.mapToScene(local_path)
+            if not self._is_scene_path_closed(scene_path):
+                return None
+            return scene_path
+
+        return None
+
+    def _create_filled_bitmap_item(self, scene_path, fill_color, source_id, z_value=0.0):
+        """将场景路径光栅化为同色位图图元"""
+        rect = scene_path.boundingRect()
+        if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0:
+            return None
+
+        dpi = 300.0
+        scale_factor = dpi / 25.4
+        width_px = int(math.ceil(rect.width() * scale_factor)) + 2
+        height_px = int(math.ceil(rect.height() * scale_factor)) + 2
+        if width_px <= 0 or height_px <= 0:
+            return None
+
+        image = QtGui.QImage(width_px, height_px, QtGui.QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.scale(scale_factor, scale_factor)
+        painter.translate(-rect.x(), -rect.y())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(fill_color)
+        painter.drawPath(scene_path)
+        painter.end()
+
+        pixmap = QtGui.QPixmap.fromImage(image)
+        if pixmap.isNull():
+            return None
+
+        pix_item = QGraphicsPixmapItem(pixmap)
+        pix_item.setPos(rect.x(), rect.y())
+        pix_item.setScale(1.0 / scale_factor)
+        pix_item.setTransformationMode(Qt.SmoothTransformation)
+        pix_item.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, False)
+        pix_item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
+        pix_item.setAcceptedMouseButtons(Qt.NoButton)
+        pix_item.setZValue(z_value)
+        pix_item.setData(Qt.UserRole + 100, QColor(fill_color))
+        pix_item.setData(FILL_SCAN_BITMAP_ROLE, True)
+        pix_item.setData(FILL_SCAN_SOURCE_ID_ROLE, int(source_id))
+        return pix_item
+
+    def _restore_one_fill_scan_pair(self, source_id):
+        pair = self._fill_scan_pairs.pop(source_id, None)
+        if not pair:
+            return 0
+
+        src = pair.get('source')
+        bmp = pair.get('bitmap')
+
+        try:
+            if self._is_item_alive(bmp):
+                bmp_scene = bmp.scene()
+                if bmp_scene is not None:
+                    bmp_scene.removeItem(bmp)
+        except Exception:
+            pass
+
+        try:
+            if self._is_item_alive(src):
+                src.setData(FILL_SCAN_HIDDEN_SOURCE_ROLE, False)
+
+                visible = bool(pair.get('source_visible_before', True))
+                color = self._get_item_layer_color(src)
+                if color and color.isValid() and hasattr(self, 'right_panel'):
+                    color_hex = color.name().upper()
+                    params = getattr(self.right_panel, 'layer_data', {}).get(color_hex)
+                    if params is not None:
+                        visible = bool(getattr(params, 'is_visible', True))
+                src.setVisible(visible)
+
+                if bool(pair.get('source_selected_before', False)) and visible:
+                    try:
+                        if src.flags() & QtWidgets.QGraphicsItem.ItemIsSelectable:
+                            src.setSelected(True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return 1
+
+    def _restore_all_fill_scan_pairs(self):
+        if self._fill_scan_busy:
+            return 0
+        restored = 0
+        self._fill_scan_busy = True
+        try:
+            for source_id in list(self._fill_scan_pairs.keys()):
+                restored += self._restore_one_fill_scan_pair(source_id)
+        finally:
+            self._fill_scan_busy = False
+
+        try:
+            self.right_panel.update_layer_list(force=True)
+        except Exception:
+            pass
+
+        return restored
+
+    def _sync_fill_scan_pairs(self):
+        """实时同步：扫描图层闭合路径 <-> 填充位图"""
+        if self._fill_scan_busy:
+            return (0, 0)
+        if not hasattr(self, 'fill_scan_action') or not self.fill_scan_action.isChecked():
+            return (0, self._restore_all_fill_scan_pairs())
+        if not hasattr(self, 'right_panel') or not hasattr(self.right_panel, 'layer_data'):
+            return (0, 0)
+
+        scene = self.whiteboard.canvas.scene
+        layer_data = self.right_panel.layer_data or {}
+
+        added = 0
+        removed = 0
+
+        self._fill_scan_busy = True
+        try:
+            # 清理失效映射
+            for source_id, pair in list(self._fill_scan_pairs.items()):
+                src = pair.get('source')
+                bmp = pair.get('bitmap')
+                src_scene = src.scene() if self._is_item_alive(src) else None
+                bmp_scene = bmp.scene() if self._is_item_alive(bmp) else None
+
+                if src_scene is not scene:
+                    if bmp_scene is not None:
+                        try:
+                            bmp_scene.removeItem(bmp)
+                        except Exception:
+                            pass
+                    self._fill_scan_pairs.pop(source_id, None)
+                    continue
+
+                if bmp_scene is not scene:
+                    self._fill_scan_pairs.pop(source_id, None)
+                    try:
+                        src.setData(FILL_SCAN_HIDDEN_SOURCE_ROLE, False)
+                        src.setVisible(True)
+                    except Exception:
+                        pass
+
+            eligible = {}
+            for item in scene.items(order=Qt.AscendingOrder):
+                if item is getattr(self.whiteboard.canvas, '_drawing_tmp', None):
+                    continue
+                if item is getattr(self.whiteboard.canvas, '_cursor_preview', None):
+                    continue
+                if item.zValue() >= 9999:
+                    continue
+                if item.parentItem() is not None:
+                    continue
+                if self._is_fill_scan_generated_bitmap(item):
+                    continue
+                if isinstance(item, QGraphicsPixmapItem):
+                    continue
+                if not isinstance(item, (EditablePathItem, EditableEllipseItem, QtWidgets.QGraphicsPathItem)):
+                    continue
+
+                color = self._get_item_layer_color(item)
+                if color is None or not color.isValid():
+                    continue
+
+                color_hex = color.name().upper()
+                params = layer_data.get(color_hex)
+                if params is None:
+                    continue
+                if getattr(params, 'mode', '') != "激光扫描":
+                    continue
+
+                scene_path = self._build_closed_scene_path(item)
+                if scene_path is None or scene_path.isEmpty():
+                    continue
+
+                eligible[self._source_id(item)] = (item, scene_path, color, params)
+
+            # 移除不再满足条件的映射
+            for source_id in list(self._fill_scan_pairs.keys()):
+                if source_id not in eligible:
+                    removed += self._restore_one_fill_scan_pair(source_id)
+
+            # 新增/修复满足条件的映射
+            for source_id, (src_item, scene_path, color, params) in eligible.items():
+                color_hex = color.name().upper()
+                pair = self._fill_scan_pairs.get(source_id)
+
+                if pair:
+                    bmp_item = pair.get('bitmap')
+                    rebuild = False
+
+                    if not self._is_item_alive(bmp_item) or bmp_item.scene() is not scene:
+                        rebuild = True
+                    if pair.get('color_hex') != color_hex:
+                        rebuild = True
+
+                    # 勾选状态下，原路径必须隐藏
+                    try:
+                        src_item.setData(FILL_SCAN_HIDDEN_SOURCE_ROLE, True)
+                        src_item.setVisible(False)
+                        src_item.setSelected(False)
+                    except Exception:
+                        pass
+
+                    if rebuild:
+                        try:
+                            if self._is_item_alive(bmp_item) and bmp_item.scene() is not None:
+                                bmp_item.scene().removeItem(bmp_item)
+                        except Exception:
+                            pass
+
+                        new_bmp = self._create_filled_bitmap_item(
+                            scene_path=scene_path,
+                            fill_color=color,
+                            source_id=source_id,
+                            z_value=src_item.zValue(),
+                        )
+                        if new_bmp is None:
+                            continue
+                        scene.addItem(new_bmp)
+                        new_bmp.setVisible(bool(getattr(params, 'is_visible', True)))
+                        pair['bitmap'] = new_bmp
+                        pair['color_hex'] = color_hex
+                    else:
+                        try:
+                            bmp_item.setZValue(src_item.zValue())
+                            bmp_item.setVisible(bool(getattr(params, 'is_visible', True)))
+                            bmp_item.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, False)
+                            bmp_item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
+                            bmp_item.setAcceptedMouseButtons(Qt.NoButton)
+                            bmp_item.setData(FILL_SCAN_BITMAP_ROLE, True)
+                            bmp_item.setData(FILL_SCAN_SOURCE_ID_ROLE, int(source_id))
+                        except Exception:
+                            pass
+                    continue
+
+                source_selected_before = bool(src_item.isSelected())
+                source_visible_before = bool(src_item.isVisible())
+
+                bmp_item = self._create_filled_bitmap_item(
+                    scene_path=scene_path,
+                    fill_color=color,
+                    source_id=source_id,
+                    z_value=src_item.zValue(),
+                )
+                if bmp_item is None:
+                    continue
+
+                scene.addItem(bmp_item)
+                bmp_item.setVisible(bool(getattr(params, 'is_visible', True)))
+
+                src_item.setData(FILL_SCAN_HIDDEN_SOURCE_ROLE, True)
+                src_item.setSelected(False)
+                src_item.setVisible(False)
+
+                self._fill_scan_pairs[source_id] = {
+                    'source': src_item,
+                    'bitmap': bmp_item,
+                    'color_hex': color_hex,
+                    'source_selected_before': source_selected_before,
+                    'source_visible_before': source_visible_before,
+                }
+                added += 1
+        finally:
+            self._fill_scan_busy = False
+
+        try:
+            self.right_panel.update_layer_list(force=True)
+        except Exception:
+            pass
+
+        return (added, removed)
+
     def on_scene_changed(self, changes=None):
         """场景变化处理"""
+        if self._fill_scan_busy:
+            return
+
+        if hasattr(self, 'fill_scan_action') and self.fill_scan_action.isChecked():
+            self._sync_fill_scan_pairs()
+        elif self._fill_scan_pairs:
+            self._restore_all_fill_scan_pairs()
+
         # 如果路径预览开启，则更新路径
         if self.show_path_action.isChecked():
             self.toggle_show_path()
@@ -4037,31 +6002,130 @@ class MainWindow(QMainWindow):
             # 获取选中项
             selected_items_set = set(self.whiteboard.canvas.scene.selectedItems())
             
-            # 如果没有选中任何对象，则预览列表为空（显示黑屏）
-            # 如果有选中对象，则只预览选中的对象
-            target_items = []
+            # 如果有选中对象，则只预览选中对象；否则预览所有对象
             if selected_items_set:
-                for item in all_items:
-                    if item in selected_items_set:
-                        target_items.append(item)
+                target_items = [item for item in all_items if item in selected_items_set]
             else:
-                # 没有选中对象，列表为空
-                target_items = []
+                target_items = list(all_items)
             
-            # 过滤掉非图形项（如辅助线、手柄等）
+            # 过滤掉非图形项（如辅助线、手柄等），并遵循图层输出设置
             valid_items = []
             from ui.graphics_items import EditablePathItem, EditableEllipseItem
-            from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
+            from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItemGroup
             
-            for item in target_items:
-                if not item.isVisible(): continue
-                if item.parentItem() is not None: continue
-                if item.zValue() >= 9999: continue # Preview items
-                if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
-                if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
-                
-                if isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem)):
-                    valid_items.append(item)
+            # Try import VirtualArrayItem
+            try:
+                from ui.virtual_array_item import VirtualArrayItem
+            except ImportError:
+                VirtualArrayItem = type(None)
+            
+            # 获取图层数据
+            layer_data = self.right_panel.layer_data if hasattr(self, 'right_panel') else {}
+
+            def get_item_color_hex(item):
+                layer_color_role = Qt.UserRole + 100
+                color_hex = None
+
+                if hasattr(item, 'data'):
+                    color_data = item.data(layer_color_role)
+                    if color_data:
+                        if isinstance(color_data, QColor):
+                            color_hex = color_data.name().upper()
+                        elif isinstance(color_data, str):
+                            color_hex = color_data.upper()
+
+                if not color_hex and hasattr(item, '_color'):
+                    c = getattr(item, '_color')
+                    if isinstance(c, QColor):
+                        color_hex = c.name().upper()
+                    elif isinstance(c, str):
+                        color_hex = c.upper()
+
+                if not color_hex and hasattr(item, 'pen'):
+                    try:
+                        pen = item.pen()
+                        if pen and pen.color().isValid():
+                            color_hex = pen.color().name().upper()
+                    except Exception:
+                        pass
+
+                if not color_hex and hasattr(item, 'brush'):
+                    try:
+                        brush = item.brush()
+                        if brush and brush.color().isValid():
+                            color_hex = brush.color().name().upper()
+                    except Exception:
+                        pass
+
+                if not color_hex and hasattr(item, 'defaultTextColor'):
+                    try:
+                        color = item.defaultTextColor()
+                        if color and color.isValid():
+                            color_hex = color.name().upper()
+                    except Exception:
+                        pass
+
+                return color_hex
+
+            def is_output_enabled(item):
+                if not layer_data:
+                    return True
+                color_hex = get_item_color_hex(item)
+                if color_hex and color_hex in layer_data:
+                    return layer_data[color_hex].is_output
+                return True
+
+            def can_include_for_process(item):
+                color_hex = get_item_color_hex(item)
+                layer = layer_data.get(color_hex) if (color_hex and color_hex in layer_data) else None
+                if layer is not None and not layer.is_output:
+                    return False
+                try:
+                    visible = bool(item.isVisible())
+                except Exception:
+                    visible = True
+                if visible:
+                    return True
+                # 隐藏项仅在关联图层且图层输出开启时参与预览路径
+                return layer is not None and bool(layer.is_output)
+
+            def collect_items(items):
+                results = []
+                for item in items:
+                    if not can_include_for_process(item): continue
+                    if item.zValue() >= 9999: continue # Preview items
+                    if item is getattr(self.whiteboard.canvas, '_work_item', None): continue
+                    if item is getattr(self.whiteboard.canvas, '_cursor_preview', None): continue
+                    
+                    # Support VirtualArrayItem
+                    if isinstance(item, VirtualArrayItem):
+                        if hasattr(item, 'real_items'):
+                            results.extend(collect_items(item.real_items))
+                        continue
+
+                    if isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
+                        if is_output_enabled(item):
+                            results.append(item)
+                    elif isinstance(item, QGraphicsItemGroup) or (item.childItems() and not isinstance(item, (EditablePathItem, EditableEllipseItem, TextGraphicsItem))):
+                         # Recursively collect children for Groups or unknown containers
+                         # Exclude known types from recursion to avoid picking up handles/helpers
+                         results.extend(collect_items(item.childItems()))
+                return results
+
+            valid_items = collect_items(target_items)
+
+            if layer_data:
+                def get_priority(item):
+                    color_hex = get_item_color_hex(item)
+                    if color_hex and color_hex in layer_data:
+                        return layer_data[color_hex].priority
+                    return 9999
+
+                valid_items = sorted(
+                    enumerate(valid_items),
+                    key=lambda x: (get_priority(x[1]), x[0])
+                )
+                valid_items = [item for _, item in valid_items]
             
             # 获取工作区尺寸
             work_w = self.whiteboard.canvas._work_w
@@ -4075,7 +6139,10 @@ class MainWindow(QMainWindow):
             
             # 延迟弹出，避免事件冲突
             def open_dlg():
-                dlg = PreviewDialog(valid_items, (work_w, work_h), layer_data, self, laser_pos=laser_pos)
+                export_settings = getattr(self.whiteboard.canvas, 'export_settings', {})
+                scan_direction = export_settings.get('scan_direction')
+                dlg = PreviewDialog(valid_items, (work_w, work_h), layer_data, self, laser_pos=laser_pos,
+                                    scan_direction=scan_direction)
                 # dlg.showFullScreen() # 移除全屏
                 dlg.exec_()
                 
@@ -4084,6 +6151,334 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error showing preview: {e}")
             self.show_status_message(f"预览出错: {e}")
+
+    def show_auto_layout_dialog(self):
+        """显示自动排版对话框"""
+        items = list(self.whiteboard.canvas.scene.selectedItems())
+        # Filter valid items
+        from ui.graphics_items import EditablePathItem
+        from PyQt5.QtWidgets import QGraphicsPathItem
+        
+        valid_items = [i for i in items if isinstance(i, (EditablePathItem, QGraphicsPathItem))]
+        
+        if not valid_items:
+            QMessageBox.information(self, "提示", "请先选择要排版的对象")
+            return
+            
+        work_w = getattr(self.whiteboard.canvas, '_work_w', 1200)
+        work_h = getattr(self.whiteboard.canvas, '_work_h', 800)
+        
+        dlg = AutoLayoutDialog(valid_items, (work_w, work_h), self)
+        dlg.apply_layout_signal.connect(self.apply_auto_layout)
+        dlg.exec_()
+
+    def apply_auto_layout(self, mode, params):
+        """执行自动排版"""
+        items = list(self.whiteboard.canvas.scene.selectedItems())
+        from ui.graphics_items import EditablePathItem
+        from PyQt5.QtWidgets import QGraphicsPathItem
+        valid_items = [i for i in items if isinstance(i, (EditablePathItem, QGraphicsPathItem))]
+        
+        if not valid_items:
+            return
+        
+        # Calculate bounding box of selection to determine relative positions
+        from PyQt5.QtCore import QRectF, QPointF
+        from PyQt5.QtGui import QTransform
+        
+        rect = QRectF()
+        first = True
+        for item in valid_items:
+            br = item.sceneBoundingRect()
+            if first:
+                rect = br
+                first = False
+            else:
+                rect = rect.united(br)
+        
+        start_x = rect.left()
+        start_y = rect.top()
+        item_w = rect.width()
+        item_h = rect.height()
+        
+        rows = params['rows']
+        cols = params['cols']
+        odd_r_s = params.get('odd_r_s', 0.0)
+        even_r_s = params.get('even_r_s', 0.0)
+        odd_c_s = params.get('odd_c_s', 0.0)
+        even_c_s = params.get('even_c_s', 0.0)
+        r_offset = params.get('r_offset', 0.0)
+        c_offset = params.get('c_offset', 0.0)
+        row_mirror_h = params.get('row_mirror_h', False)
+        row_mirror_v = params.get('row_mirror_v', False)
+        col_mirror_h = params.get('col_mirror_h', False)
+        col_mirror_v = params.get('col_mirror_v', False)
+
+        from edit.commands import MacroCommand, AddItemCommand
+        commands = []
+        
+        current_y = start_y
+        
+        for r in range(rows):
+            is_even_row = ((r + 1) % 2 == 0)
+            row_spacing = even_r_s if is_even_row else odd_r_s
+            
+            current_x = start_x
+            if is_even_row:
+                current_x += r_offset
+            
+            # Row Mirror flags
+            mr_x_row = False
+            mr_y_row = False
+            if row_mirror_h and is_even_row: mr_x_row = True
+            if row_mirror_v and is_even_row: mr_y_row = True
+                
+            for c in range(cols):
+                is_even_col = ((c + 1) % 2 == 0)
+                col_spacing = even_c_s if is_even_col else odd_c_s
+                
+                y_pos = current_y
+                if is_even_col:
+                    y_pos += c_offset
+                
+                # Combine Mirror flags
+                mirror_x = mr_x_row
+                mirror_y = mr_y_row
+                
+                if col_mirror_h and is_even_col: mirror_x = not mirror_x
+                if col_mirror_v and is_even_col: mirror_y = not mirror_y
+                
+                # Center of this cell
+                cell_cx = current_x + item_w / 2
+                cell_cy = y_pos + item_h / 2
+                
+                # Create clones
+                for template in valid_items:
+                    new_item = None
+                    if isinstance(template, EditablePathItem):
+                        try:
+                            # Clone internal state manually
+                            new_item = EditablePathItem(list(template._points), template._color, template._smooth)
+                            if hasattr(template, '_segment_types'):
+                                new_item._segment_types = list(template._segment_types)
+                            if hasattr(template, '_control_points'):
+                                new_item._control_points = dict(template._control_points)
+                            new_item.setPen(template.pen())
+                            new_item.setBrush(template.brush())
+                        except:
+                             new_item = None
+                    
+                    if new_item is None:
+                        # Fallback
+                        if hasattr(template, 'path'):
+                             new_item = QGraphicsPathItem(template.path())
+                             new_item.setPen(template.pen())
+                             new_item.setBrush(template.brush())
+
+                    if new_item:
+                        # Construct Transform
+                        center_src = rect.center()
+                         
+                        t = QTransform()
+                        t.translate(cell_cx, cell_cy) 
+                        t.scale(-1 if mirror_x else 1, -1 if mirror_y else 1)
+                        t.translate(-center_src.x(), -center_src.y()) 
+                        
+                        final_transform = template.sceneTransform() * t
+                        
+                        new_item.setPos(0,0)
+                        new_item.setTransform(final_transform)
+                        
+                        if mode == 'virtual':
+                            pen = new_item.pen()
+                            pen.setStyle(Qt.DashLine)
+                            new_item.setPen(pen)
+                            new_item.setFlag(QGraphicsPathItem.ItemIsSelectable, False)
+                        
+                        commands.append(AddItemCommand(self.whiteboard.canvas, new_item))
+                
+                current_x += item_w + col_spacing
+            
+            current_y += item_h + row_spacing
+
+        if mode == 'virtual':
+            # 虚阵列逻辑：
+            # 1. 创建包含所有新生成虚线项和所有原项克隆的 VirtualArrayItem
+            # 2. 从场景中移除原项（通过 Undoable command）
+            # 3. 将 VirtualArrayItem 添加到场景
+            
+            # 由于前面的循环已经把虚线项加到 commands 列表准备添加（但还没加），以及一些克隆项。
+            # 刚才的循环对于 virtual 模式是生成了虚线项作为 new_item。
+            # 对于原始的 "template" items (0,0 位置)，我们没动。
+            # 我们需要把原始项和虚线项打包。
+            
+            # 让我们重写一下逻辑，上面的循环对于 real 模式是好的。
+            # 对于 virtual 模式，我们不需要把每个虚线项单独 AddItemCommand。
+            pass
+
+        if mode == 'real':
+            # 实阵列简单直接添加所有项
+            if commands:
+                cmd = MacroCommand("自动排版", commands)
+                cmd.redo() 
+                self.whiteboard.canvas.edit_manager.push_undo(cmd)
+                self.whiteboard.canvas.update()
+        
+        elif mode == 'virtual':
+            # 重新构建 virtual 逻辑
+            # 1. 克隆选中的原项 (保持相对位置)
+            from ui.virtual_array_item import VirtualArrayItem
+            from edit.commands import DeleteItemsCommand, AddItemCommand
+            
+            real_clones = []
+            virtual_parts = []
+            
+            # 获取原项的中心，用于构建组的参考系
+            # rect 是所有选中项的包围盒
+            group_center = rect.center()
+            
+            # 克隆原项 -> real_clones
+            # 实际上，VirtualArrayItem 需要接收已经是子项坐标系的对象。
+            # 我们希望 VirtualArrayItem 放在 group_center 位置？
+            # 或者放在 (0,0) 位置？
+            # 最好放在 rect.topLeft() 或者 (0,0)。如果放在 (0,0)，所有子项保持 scenePos 转换后的 coordinates.
+            
+            # 方案：VirtualArrayItem 放在 (0,0)
+            
+            # Step A: Clone Real Items
+            for item in valid_items:
+                clone = self._clone_item(item)
+                if clone:
+                    # clone 现在的 pos/transform 和原项一样 (Scene 坐标)
+                    # 如果作为子项加到 VirtualArrayItem(pos=0,0)，位置正确。
+                    real_clones.append(clone)
+            
+            # Step B: Generate Virtual Items
+            # Logic similar to loop but generate items into list, not commands
+            current_y = start_y
+            
+            for r in range(rows):
+                is_even_row = ((r + 1) % 2 == 0)
+                row_spacing = even_r_s if is_even_row else odd_r_s
+                
+                current_x = start_x
+                if is_even_row:
+                    current_x += r_offset
+                
+                # Row Mirror flags
+                mr_x_row = False
+                mr_y_row = False
+                if row_mirror_h and is_even_row: mr_x_row = True
+                if row_mirror_v and is_even_row: mr_y_row = True
+                    
+                for c in range(cols):
+                    is_even_col = ((c + 1) % 2 == 0)
+                    col_spacing = even_c_s if is_even_col else odd_c_s
+                    
+                    y_pos = current_y
+                    if is_even_col:
+                        y_pos += c_offset
+                    
+                    # Combine Mirror flags
+                    mirror_x = mr_x_row
+                    mirror_y = mr_y_row
+                    
+                    if col_mirror_h and is_even_col: mirror_x = not mirror_x
+                    if col_mirror_v and is_even_col: mirror_y = not mirror_y
+                    
+                    # Skip the first block if it overlaps with original?
+                    # Auto layout typically means filling the board.
+                    # Screenshot 1 shows original items are part of the array.
+                    # If we generate everything, we duplicate original items position.
+                    # Should we skip if r=0 and c=0? 
+                    # Actually, the loop generates positions. Is the original items included in the loop?
+                    # Yes, (start_x, start_y) corresponds to 0,0.
+                    # If we generate a virtual item at 0,0, it overlaps real items.
+                    # We should SKIP creating virtual items that overlap real items.
+                    # Assuming (0,0) is the original set.
+                    # But if offsets are used, maybe not exactly.
+                    # Let's assume we skip r=0, c=0 for simplicity if no complex offsets.
+                    
+                    skip = (r == 0 and c == 0)
+                    if skip:
+                        current_x += item_w + col_spacing
+                        continue
+
+                    cell_cx = current_x + item_w / 2
+                    cell_cy = y_pos + item_h / 2
+                    
+                    for template in valid_items:
+                        v_clone = self._clone_item(template)
+                        if v_clone:
+                            # Apply Transform
+                            center_src = rect.center()
+                            t = QTransform()
+                            t.translate(cell_cx, cell_cy)
+                            t.scale(-1 if mirror_x else 1, -1 if mirror_y else 1)
+                            t.translate(-center_src.x(), -center_src.y())
+                            
+                            final_transform = template.sceneTransform() * t
+                            v_clone.setPos(0,0)
+                            v_clone.setTransform(final_transform)
+                            
+                            # Set Style
+                            pen = v_clone.pen()
+                            pen.setStyle(Qt.DashLine)
+                            v_clone.setPen(pen)
+                            v_clone.setFlag(QGraphicsPathItem.ItemIsSelectable, False)
+                            
+                            virtual_parts.append(v_clone)
+                    
+                    current_x += item_w + col_spacing
+                current_y += item_h + row_spacing
+
+            # Step C: Create VirtualArrayItem
+            # We pass items. The class should handle setting parent.
+            # But items must not be in scene yet. (Our clones are not)
+            virtual_group = VirtualArrayItem(real_clones, virtual_parts)
+            
+            # Step D: Commands
+            # 1. Remove original items
+            del_cmd = DeleteItemsCommand(self.whiteboard.canvas, valid_items)
+            # 2. Add virtual group
+            add_cmd = AddItemCommand(self.whiteboard.canvas, virtual_group)
+            
+            macro = MacroCommand("虚阵列排版")
+            macro.add_command(del_cmd)
+            macro.add_command(add_cmd)
+            
+            macro.redo()
+            self.whiteboard.canvas.edit_manager.push_undo(macro)
+            self.whiteboard.canvas.update()
+
+    def _clone_item(self, template):
+        from ui.graphics_items import EditablePathItem
+        from PyQt5.QtWidgets import QGraphicsPathItem
+        
+        new_item = None
+        if isinstance(template, EditablePathItem):
+            try:
+                new_item = EditablePathItem(list(template._points), template._color, template._smooth)
+                if hasattr(template, '_segment_types'):
+                    new_item._segment_types = list(template._segment_types)
+                if hasattr(template, '_control_points'):
+                    new_item._control_points = dict(template._control_points)
+                new_item.setPen(template.pen())
+                new_item.setBrush(template.brush())
+                # Copy Transform and Pos
+                new_item.setPos(template.pos())
+                new_item.setTransform(template.transform())
+            except:
+                new_item = None
+        
+        if new_item is None:
+            if hasattr(template, 'path'):
+                new_item = QGraphicsPathItem(template.path())
+                new_item.setPen(template.pen())
+                new_item.setBrush(template.brush())
+                new_item.setPos(template.pos())
+                new_item.setTransform(template.transform())
+        return new_item
 
     def open_system_settings(self):
         """打开系统设置对话框"""
@@ -4307,6 +6702,188 @@ class MainWindow(QMainWindow):
             self.logger.error(f"检查未保存更改时出错: {e}")
             # 出错时保守处理，提示用户保存
             return True
+
+    def _get_selection_bounding_rect(self):
+        """返回当前选中项的联合包围盒（场景坐标）。"""
+        try:
+            selected_items = self.whiteboard.canvas.scene.selectedItems()
+            if not selected_items:
+                return None
+
+            bounding_rect = None
+            for item in selected_items:
+                try:
+                    br = item.sceneBoundingRect()
+                except Exception:
+                    continue
+                if not br.isValid():
+                    continue
+                if bounding_rect is None:
+                    bounding_rect = br
+                else:
+                    bounding_rect = bounding_rect.united(br)
+
+            if bounding_rect is None or not bounding_rect.isValid():
+                return None
+            return bounding_rect
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_positive_float(text):
+        """解析正浮点数；非法时返回 None。"""
+        try:
+            value = float(str(text).strip())
+        except Exception:
+            return None
+        if value <= 0 or math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    def open_resize_dialog(self):
+        """打开“修改尺寸”对话框，按输入宽高缩放当前选中对象。"""
+        from PyQt5.QtWidgets import (
+            QDialog,
+            QVBoxLayout,
+            QGridLayout,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QCheckBox,
+            QPushButton,
+        )
+        from PyQt5.QtGui import QDoubleValidator
+
+        selection_rect = self._get_selection_bounding_rect()
+        if selection_rect is None:
+            QMessageBox.information(self, "修改尺寸", "请先选中需要修改尺寸的对象。")
+            return
+
+        original_width = selection_rect.width()
+        original_height = selection_rect.height()
+        if original_width <= 0 or original_height <= 0:
+            QMessageBox.warning(self, "修改尺寸", "当前选中对象的宽度或高度无效。")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修改尺寸")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(420)
+
+        root = QVBoxLayout(dialog)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        root.addLayout(grid)
+
+        grid.addWidget(QLabel(""), 0, 0)
+        lbl_old = QLabel("原始尺寸")
+        lbl_new = QLabel("修改尺寸")
+        lbl_old.setAlignment(Qt.AlignCenter)
+        lbl_new.setAlignment(Qt.AlignCenter)
+        grid.addWidget(lbl_old, 0, 1)
+        grid.addWidget(lbl_new, 0, 2)
+
+        grid.addWidget(QLabel("宽度:"), 1, 0)
+        old_width_edit = QLineEdit(f"{original_width:.3f}")
+        old_width_edit.setReadOnly(True)
+        old_width_edit.setFocusPolicy(Qt.NoFocus)
+        old_width_edit.setStyleSheet("QLineEdit { background: #f0f0f0; color: #666; }")
+        grid.addWidget(old_width_edit, 1, 1)
+        new_width_edit = QLineEdit(f"{original_width:.3f}")
+        grid.addWidget(new_width_edit, 1, 2)
+
+        grid.addWidget(QLabel("高度:"), 2, 0)
+        old_height_edit = QLineEdit(f"{original_height:.3f}")
+        old_height_edit.setReadOnly(True)
+        old_height_edit.setFocusPolicy(Qt.NoFocus)
+        old_height_edit.setStyleSheet("QLineEdit { background: #f0f0f0; color: #666; }")
+        grid.addWidget(old_height_edit, 2, 1)
+        new_height_edit = QLineEdit(f"{original_height:.3f}")
+        grid.addWidget(new_height_edit, 2, 2)
+
+        lock_ratio = QCheckBox("锁定比例")
+        lock_ratio.setChecked(True)
+        grid.addWidget(lock_ratio, 3, 2, 1, 1, Qt.AlignLeft)
+
+        validator = QDoubleValidator(0.0, 1e9, 3, dialog)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        new_width_edit.setValidator(validator)
+        new_height_edit.setValidator(validator)
+
+        ratio = original_width / original_height if original_height > 0 else 1.0
+        syncing = {"busy": False}
+
+        def _sync_height_from_width():
+            if syncing["busy"] or not lock_ratio.isChecked():
+                return
+            width_value = self._parse_positive_float(new_width_edit.text())
+            if width_value is None or ratio <= 0:
+                return
+            syncing["busy"] = True
+            new_height_edit.setText(f"{width_value / ratio:.3f}")
+            syncing["busy"] = False
+
+        def _sync_width_from_height():
+            if syncing["busy"] or not lock_ratio.isChecked():
+                return
+            height_value = self._parse_positive_float(new_height_edit.text())
+            if height_value is None or ratio <= 0:
+                return
+            syncing["busy"] = True
+            new_width_edit.setText(f"{height_value * ratio:.3f}")
+            syncing["busy"] = False
+
+        new_width_edit.textEdited.connect(lambda _text: _sync_height_from_width())
+        new_height_edit.textEdited.connect(lambda _text: _sync_width_from_height())
+
+        def _on_lock_toggled(checked):
+            if not checked:
+                return
+            if new_height_edit.hasFocus():
+                _sync_width_from_height()
+            else:
+                _sync_height_from_width()
+
+        lock_ratio.toggled.connect(_on_lock_toggled)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        apply_btn = QPushButton("修改")
+        apply_btn.setMinimumWidth(110)
+        apply_btn.setDefault(True)
+        button_row.addWidget(apply_btn)
+        root.addLayout(button_row)
+
+        def _apply_resize():
+            new_width = self._parse_positive_float(new_width_edit.text())
+            new_height = self._parse_positive_float(new_height_edit.text())
+            if new_width is None or new_height is None:
+                QMessageBox.warning(dialog, "输入错误", "宽度和高度必须是大于 0 的数字。")
+                return
+
+            current_rect = self._get_selection_bounding_rect()
+            if current_rect is None:
+                QMessageBox.information(dialog, "修改尺寸", "当前没有可用的选中对象。")
+                return
+
+            # 复用现有参数化缩放逻辑：保持当前中心，仅替换目标宽高。
+            self.x_input.setText(f"{current_rect.center().x():.6f}")
+            self.y_input.setText(f"{current_rect.center().y():.6f}")
+            self.width_input.setText(f"{new_width:.6f}")
+            self.height_input.setText(f"{new_height:.6f}")
+            self._apply_position_and_size_changes()
+            self.show_status_message(f"已修改尺寸: {new_width:.3f} x {new_height:.3f} mm")
+            dialog.accept()
+
+        apply_btn.clicked.connect(_apply_resize)
+        new_width_edit.returnPressed.connect(_apply_resize)
+        new_height_edit.returnPressed.connect(_apply_resize)
+
+        new_width_edit.setFocus()
+        new_width_edit.selectAll()
+        dialog.exec_()
 
     def _update_position_display(self):
         """更新工具栏3中X、Y位置以及宽度、高度（横向和纵向间距）的显示"""

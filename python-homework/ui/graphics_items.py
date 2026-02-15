@@ -5,12 +5,55 @@
 """
 
 
-from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem, QStyle
+from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem, QGraphicsSimpleTextItem, QGraphicsTextItem, QGraphicsPixmapItem, QStyle
 from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF
 from PyQt5.QtGui import QPainterPath, QPen, QColor, QBrush, QMouseEvent, QFont, QTransform, QFontMetrics, QFontDatabase, QFontMetricsF
 
 import math
 import traceback
+
+GROUP_ID_ROLE = Qt.UserRole + 500
+
+
+def get_item_group_id(item):
+    try:
+        value = item.data(GROUP_ID_ROLE)
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def set_item_group_id(item, group_id: int):
+    try:
+        item.setData(GROUP_ID_ROLE, int(group_id))
+    except Exception:
+        pass
+
+
+def clear_item_group_id(item):
+    try:
+        item.setData(GROUP_ID_ROLE, None)
+    except Exception:
+        pass
+
+
+def should_suppress_selection_outline(item) -> bool:
+    try:
+        scene = item.scene()
+        if scene is not None:
+            if bool(getattr(scene, "_suppress_item_selection_outline", False)):
+                return True
+            try:
+                for view in scene.views():
+                    if bool(getattr(view, "_suppress_item_selection_outline", False)):
+                        return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return False
 
 class EditablePathItem(QGraphicsPathItem):
     def __init__(self, pts, color: QColor, smooth: bool = False):
@@ -163,10 +206,16 @@ class EditablePathItem(QGraphicsPathItem):
             self._update_handles_positions()
 
     def paint(self, painter, option, widget=None):
+        original_state = option.state
+        if should_suppress_selection_outline(self):
+            option.state &= ~QStyle.State_Selected
+
         super().paint(painter, option, widget)
         # Draw Micro-joints markers (Visual only)
         if hasattr(self, 'micro_joint_config') and self.micro_joint_config and self.micro_joint_config.get('enabled', False):
             self._draw_micro_joints(painter)
+
+        option.state = original_state
 
     def _draw_micro_joints(self, painter):
         path = self.path()
@@ -445,7 +494,7 @@ class EditablePathItem(QGraphicsPathItem):
         original_state = option.state
         
         # 如果处于节点编辑模式，临时移除 Selected 状态，防止 Qt 绘制虚线选框
-        if getattr(self, '_node_edit_enabled', False):
+        if getattr(self, '_node_edit_enabled', False) or should_suppress_selection_outline(self):
             option.state &= ~QStyle.State_Selected
 
         super().paint(painter, option, widget)
@@ -1492,5 +1541,30 @@ class TextGraphicsItem(QGraphicsPathItem):
             import traceback
             traceback.print_exc()
             print(f"Error: {e}")
+
+    def paint(self, painter, option, widget=None):
+        original_state = option.state
+        if should_suppress_selection_outline(self):
+            option.state &= ~QStyle.State_Selected
+        super().paint(painter, option, widget)
+        option.state = original_state
+
+
+class EditableTextItem(QGraphicsTextItem):
+    def paint(self, painter, option, widget=None):
+        original_state = option.state
+        if should_suppress_selection_outline(self):
+            option.state &= ~QStyle.State_Selected
+        super().paint(painter, option, widget)
+        option.state = original_state
+
+
+class EditablePixmapItem(QGraphicsPixmapItem):
+    def paint(self, painter, option, widget=None):
+        original_state = option.state
+        if should_suppress_selection_outline(self):
+            option.state &= ~QStyle.State_Selected
+        super().paint(painter, option, widget)
+        option.state = original_state
 
 

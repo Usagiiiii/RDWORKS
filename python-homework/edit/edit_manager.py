@@ -5,7 +5,7 @@ from PyQt5.QtGui import QTransform
 from typing import List, Any
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
-from ui.graphics_items import EditablePathItem, EditableEllipseItem
+from ui.graphics_items import EditablePathItem, EditableEllipseItem, EditablePixmapItem, EditableTextItem, TextGraphicsItem
 from edit.commands import DeleteItemsCommand, AddItemCommand, AlignItemsCommand, MoveItemsCommand, MacroCommand
 
 class EditManager(QObject):
@@ -277,7 +277,16 @@ class EditManager(QObject):
             new_item = EditableEllipseItem(cx, cy, rx, ry, color)
             
         elif isinstance(item, QGraphicsPixmapItem):
-            new_item = QGraphicsPixmapItem(item.pixmap())
+            new_item = EditablePixmapItem(item.pixmap())
+        elif isinstance(item, TextGraphicsItem):
+            new_item = TextGraphicsItem(item.text_data, item.settings)
+        elif isinstance(item, QGraphicsTextItem):
+            new_item = EditableTextItem(item.toPlainText())
+            try:
+                new_item.setDefaultTextColor(item.defaultTextColor())
+                new_item.setFont(item.font())
+            except Exception:
+                pass
             
         # 复制通用变换属性
         if new_item:

@@ -1,4 +1,5 @@
 import logging
+import re
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import QApplication
 from pymodbus.client import ModbusTcpClient, ModbusSerialClient
@@ -318,10 +319,10 @@ class LaserCommunicator(QObject):
             self.error_occurred.emit(f"指令发送异常: {str(e)}")
 
     def send_custom_command(self, fc, data_str):
-        """发送自定义指令 (FC35/36/33等)"""
+        """发送自定义指令 (FC35/36/33等)，返回 (ok, response_text)。"""
         if not self.is_connected:
             self.error_occurred.emit("未连接设备")
-            return
+            return False, ""
 
         try:
             req = None
@@ -331,16 +332,39 @@ class LaserCommunicator(QObject):
                 req = SystemCommandRequest(address=0, data=data_str)
             else:
                 self.error_occurred.emit(f"不支持的功能码: {fc}")
-                return
+                return False, ""
 
             req.slave_id = 1
             resp = self._execute_request(req)
             
             if resp.isError():
                  self.error_occurred.emit(f"指令(FC{fc})执行错误: {resp}")
+                 return False, ""
+
+            response_text = self._decode_response_text(resp)
+            if response_text:
+                self.log_message.emit(f"FC{fc} 响应: {response_text}")
+            return True, response_text
             
         except Exception as e:
             self.error_occurred.emit(f"自定义指令发送异常: {e}")
+            return False, ""
+
+    def send_system_command(self, command: str):
+        """发送系统指令(FC36)，返回 (ok, response_text)。"""
+        return self.send_custom_command(36, command)
+
+    def _decode_response_text(self, resp) -> str:
+        """将自定义响应对象解析为文本。"""
+        try:
+            payload = getattr(resp, "data", b"")
+            if payload is None:
+                return ""
+            if isinstance(payload, (bytes, bytearray)):
+                return bytes(payload).decode("utf-8", errors="ignore").strip("\x00\r\n ")
+            return str(payload).strip()
+        except Exception:
+            return ""
 
     def _execute_request(self, req):
         """Helper to execute request safely"""
@@ -366,27 +390,53 @@ class LaserCommunicator(QObject):
         
         self.sending_finished.emit()
 
+    @staticmethod
+    def _sanitize_command_line(line: str) -> str:
+        """去掉注释和空白，仅保留可发送控制指令。"""
+        txt = str(line or "").strip()
+        if not txt:
+            return ""
+        # 去掉分号注释与括号注释
+        txt = txt.split(";", 1)[0]
+        txt = re.sub(r"\(.*?\)", "", txt)
+        txt = txt.strip()
+        return txt
+
+    @staticmethod
+    def _is_runnable_line(line: str) -> bool:
+        """判断该行是否应通过 FC35 下发。"""
+        if not line:
+            return False
+        token = line.split()[0].upper()
+
+        # 跳过程序头/尾与编号标记等。
+        if token in {"%", "O1000", "O0000"}:
+            return False
+        if token.startswith("O") and token[1:].isdigit():
+            return False
+
+        if token.startswith("G"):
+            return True
+        if token.startswith("M"):
+            return True
+        if token.startswith("$"):
+            return True
+        if token in {"!", "?", "~"}:
+            return True
+        return False
+
     def _send_next_line(self):
         """发送下一行 GCode"""
         if not self.is_sending:
             return
 
-        # 简单逻辑：只发送 G1 指令，或者全部发送？
-        # 参考 laser.py，它似乎跳过了非 G1 行，但又在 generate_gcode 里生成了 G0 等。
-        # laser.py 的 send_next_line 里有：
-        # while (self.current_line < len(self.gcode_lines) and
-        #        not self.gcode_lines[self.current_line].startswith("G1 X")):
-        #     self.current_line += 1
-        # 这意味着它只发送 G1 指令给下位机执行雕刻？这有点奇怪，G0 移动指令不发吗？
-        # 仔细看 laser.py 的 generate_gcode:
-        # self.gcode_lines.append(f"G0 X0 Y{y_pos} F{rapid}")
-        # self.gcode_lines.append(f"G1 X{x_end} Y{y_pos} F{speed} ; row={y}")
-        # 如果只发 G1，那 G0 怎么执行？
-        # 也许下位机逻辑是收到 G1 就自动处理移动？或者 laser.py 的逻辑是特定的。
-        # 为了保持一致性，我先照搬 laser.py 的逻辑：只发送 G1 行。
-        
-        while (self.current_line < len(self.gcode_lines) and 
-               not self.gcode_lines[self.current_line].startswith("G1 X")):
+        line_to_send = ""
+        while self.current_line < len(self.gcode_lines):
+            raw_line = self.gcode_lines[self.current_line]
+            candidate = self._sanitize_command_line(raw_line)
+            if self._is_runnable_line(candidate):
+                line_to_send = candidate
+                break
             self.current_line += 1
 
         if self.current_line >= len(self.gcode_lines):
@@ -395,8 +445,8 @@ class LaserCommunicator(QObject):
             return
 
         try:
-            line = self.gcode_lines[self.current_line]
-            
+            line = line_to_send
+
             # 使用 FC35 (RunGCodeRequest) 直接发送指令
             req = RunGCodeRequest(address=0, data=line)
             req.slave_id = 1

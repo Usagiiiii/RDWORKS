@@ -2,7 +2,14 @@ from typing import List
 
 from PyQt5.QtWidgets import QGraphicsItem, QUndoCommand, QGraphicsTextItem
 
-from ui.graphics_items import EditablePathItem
+from ui.graphics_items import (
+    EditablePathItem,
+    EditableTextItem,
+    EditablePixmapItem,
+    get_item_group_id,
+    set_item_group_id,
+    clear_item_group_id,
+)
 from PyQt5.QtWidgets import QGraphicsPixmapItem, QGraphicsTextItem
 from PyQt5.QtGui import QTransform, QColor
 import math
@@ -63,6 +70,35 @@ class DeleteItemsCommand(Command):
             for item in self.items:
                 self.canvas.scene.addItem(item)
             self.deleted = False
+
+
+class SetItemsGroupCommand(Command):
+    """Set or clear logical group id for a batch of items."""
+
+    def __init__(self, canvas, items: List[QGraphicsItem], target_group_id=None):
+        self.canvas = canvas
+        self.items = [it for it in items if it is not None]
+        self.target_group_id = None if target_group_id is None else int(target_group_id)
+        self._old_group_ids = {id(it): get_item_group_id(it) for it in self.items}
+        if self.target_group_id is None:
+            self.desc = f"解散群组: {len(self.items)} 项"
+        else:
+            self.desc = f"群组: {len(self.items)} 项"
+
+    def redo(self):
+        for item in self.items:
+            if self.target_group_id is None:
+                clear_item_group_id(item)
+            else:
+                set_item_group_id(item, self.target_group_id)
+
+    def undo(self):
+        for item in self.items:
+            old_id = self._old_group_ids.get(id(item))
+            if old_id is None:
+                clear_item_group_id(item)
+            else:
+                set_item_group_id(item, old_id)
 
 # 在 commands.py 中添加定位点命令类
 class AddFiducialCommand(Command):
@@ -252,7 +288,7 @@ class AddTextCommand(QUndoCommand):
 
     def redo(self):
         if not self.text_item:
-            self.text_item = QGraphicsTextItem(self.text)
+            self.text_item = EditableTextItem(self.text)
             self.text_item.setDefaultTextColor(self.color)
             self.text_item.setPos(self.x, self.y)
             self.text_item.setFlag(QGraphicsItem.ItemIsSelectable, True)
@@ -409,7 +445,7 @@ class MirrorCopyCommand(Command):
 
                 elif isinstance(it, QGraphicsPixmapItem):
                     pix = it.pixmap()
-                    new_item = QGraphicsPixmapItem(pix)
+                    new_item = EditablePixmapItem(pix)
                     # 复制 transform 并应用镜像
                     try:
                         br = it.sceneBoundingRect()
@@ -447,7 +483,7 @@ class MirrorCopyCommand(Command):
 
                 elif isinstance(it, QGraphicsTextItem):
                     text = it.toPlainText()
-                    new_item = QGraphicsTextItem(text)
+                    new_item = EditableTextItem(text)
                     new_item.setDefaultTextColor(it.defaultTextColor())
                     new_item.setFont(it.font())
                     # mirror transform similar to pixmap

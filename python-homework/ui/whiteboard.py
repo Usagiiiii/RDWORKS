@@ -21,7 +21,7 @@ from typing import List, Tuple, Optional
 from edit.commands import AddItemCommand
 from edit.edit_manager import EditManager
 from my_io.gcode.gcode_exporter import Point
-from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem, get_item_group_id
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -744,6 +744,8 @@ class GridCanvas(QGraphicsView):
 
         # 连接场景的选中状态变化信号 → 通知EditManager更新可用性
         self.scene.selectionChanged.connect(self._on_selection_changed)
+        self._group_selection_syncing = False
+        self._next_group_id = 1
         # 旋转把手（场景中的 QGraphicsItem），根据选中项显示/隐藏
         self._rotate_handle = None
 
@@ -883,6 +885,7 @@ class GridCanvas(QGraphicsView):
     # -------------------------- 新增：选中状态变化处理 --------------------------
     def _on_selection_changed(self):
         """当画布选中项变化时，通知EditManager"""
+        self._sync_group_selection()
         # logging.info(f"Selection changed. Count: {len(self.scene.selectedItems())}")
         has_selection = len(self.get_selected_items()) > 0
         self.edit_manager.set_has_selection(has_selection)
@@ -1104,36 +1107,106 @@ class GridCanvas(QGraphicsView):
 
     # -------------------------- 新增：供EditManager调用的接口 --------------------------
     def get_selected_items(self) -> List[QGraphicsItem]:
-        """获取所有选中的图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item]
+        """获取所有选中的可编辑图形项。"""
+        return [item for item in self.scene.selectedItems() if self._is_groupable_item(item)]
 
-        # 使用新的 FiducialManager 获取定位点项
-        if hasattr(self, 'fiducial_manager'):
-            fiducial_item = self.fiducial_manager.get_fiducial_item()
-            if fiducial_item:
-                exclude_items.append(fiducial_item)
+    def _is_groupable_item(self, item) -> bool:
+        if item is None:
+            return False
+        if item is getattr(self, "_work_item", None):
+            return False
+        if hasattr(self, "fiducial_manager"):
+            try:
+                if item is self.fiducial_manager.get_fiducial_item():
+                    return False
+            except Exception:
+                pass
+        try:
+            if not (item.flags() & QGraphicsItem.ItemIsSelectable):
+                return False
+        except Exception:
+            return False
+        return isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem))
 
-        # 包含文字项（QGraphicsTextItem）以支持删除/剪切/复制
-        return [
-            item for item in self.scene.selectedItems()
-            if item not in exclude_items  # 不处理网格和定位点
-               and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem))  # 处理路径、图片和文字
-        ]
+    def _iter_groupable_scene_items(self):
+        for item in self.scene.items():
+            if self._is_groupable_item(item):
+                yield item
+
+    def _sync_group_selection(self):
+        if self._group_selection_syncing:
+            return
+
+        selected = self.get_selected_items()
+        group_ids = set()
+        for item in selected:
+            gid = get_item_group_id(item)
+            if gid is not None:
+                group_ids.add(gid)
+        if not group_ids:
+            return
+
+        self._group_selection_syncing = True
+        try:
+            for item in self._iter_groupable_scene_items():
+                gid = get_item_group_id(item)
+                if gid is not None and gid in group_ids and not item.isSelected():
+                    item.setSelected(True)
+        finally:
+            self._group_selection_syncing = False
+
+    def _alloc_group_id(self) -> int:
+        max_gid = 0
+        for item in self._iter_groupable_scene_items():
+            gid = get_item_group_id(item)
+            if gid is not None and gid > max_gid:
+                max_gid = gid
+        if self._next_group_id <= max_gid:
+            self._next_group_id = max_gid + 1
+        gid = self._next_group_id
+        self._next_group_id += 1
+        return gid
+
+    def group_selected_items(self):
+        items = self.get_selected_items()
+        if len(items) < 2:
+            return False, 0
+
+        from edit.commands import SetItemsGroupCommand
+
+        gid = self._alloc_group_id()
+        cmd = SetItemsGroupCommand(self, items, gid)
+        cmd.redo()
+        self.edit_manager.push_undo(cmd)
+        self.scene.update()
+        return True, gid
+
+    def ungroup_selected_items(self):
+        selected = self.get_selected_items()
+        group_ids = set()
+        for item in selected:
+            gid = get_item_group_id(item)
+            if gid is not None:
+                group_ids.add(gid)
+        if not group_ids:
+            return False, 0
+
+        items = [item for item in self._iter_groupable_scene_items() if get_item_group_id(item) in group_ids]
+        if not items:
+            return False, 0
+
+        from edit.commands import SetItemsGroupCommand
+
+        cmd = SetItemsGroupCommand(self, items, None)
+        cmd.redo()
+        self.edit_manager.push_undo(cmd)
+        self.scene.update()
+        return True, len(items)
 
     def select_all_items(self):
-        """全选所有图形项（排除定位点和工作区网格）"""
-        exclude_items = [self._work_item]
-
-        # 使用新的 FiducialManager 获取定位点项
-        if hasattr(self, 'fiducial_manager'):
-            fiducial_item = self.fiducial_manager.get_fiducial_item()
-            if fiducial_item:
-                exclude_items.append(fiducial_item)
-
-        for item in self.scene.items():
-            # 选中路径、图片和文字项
-            if item not in exclude_items and isinstance(item, (EditablePathItem, EditableEllipseItem, QGraphicsPixmapItem, QGraphicsTextItem, TextGraphicsItem)):
-                item.setSelected(True)
+        """全选所有可编辑图形项。"""
+        for item in self._iter_groupable_scene_items():
+            item.setSelected(True)
 
     # --- 定位点相关方法（更新为使用命令模式）---
     def set_fiducial_size(self, size: float):

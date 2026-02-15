@@ -15,8 +15,6 @@ import numpy as np
 from PIL import Image
 
 LAYER_COLOR_ROLE = Qt.UserRole + 100
-FILL_SCAN_BITMAP_ROLE = Qt.UserRole + 310
-FILL_SCAN_SOURCE_ID_ROLE = Qt.UserRole + 311
 # 尝试导入 EditableEllipseItem，如果失败则忽略（避免循环依赖或路径问题）
 try:
     from ui.graphics_items import EditableEllipseItem
@@ -139,7 +137,7 @@ class GCodeExporter:
         # 修复配置参数
         self.config = {
             'feed_rate': 1000,  # 进给速度 mm/min
-            'max_laser_power': 100,  # 最大激光功率(0~100)
+            'max_laser_power': 255,  # 最大激光功率
             'rapid_move_rate': 3000,  # 快速移动速度
             'units': 'G21',  # 毫米单位
             'absolute_positioning': 'G90',  # 绝对坐标
@@ -311,54 +309,6 @@ class GCodeExporter:
 
 
 
-    def _is_auxiliary_bitmap(self, item) -> bool:
-        """Detect generated helper bitmaps (fill-scan temporary pixmaps)."""
-        if not isinstance(item, QGraphicsPixmapItem):
-            return False
-        try:
-            if bool(item.data(FILL_SCAN_BITMAP_ROLE)):
-                return True
-            # Compatibility: helper bitmap may only carry source-id role.
-            return item.data(FILL_SCAN_SOURCE_ID_ROLE) is not None
-        except Exception:
-            return False
-
-    def _clamp_power_percent(self, value: float) -> float:
-        """Clamp laser power to [0, 100] percent."""
-        try:
-            v = float(value)
-        except Exception:
-            v = 0.0
-        if v < 0.0:
-            return 0.0
-        if v > 100.0:
-            return 100.0
-        return v
-
-    def _resolve_power_pair(self, params) -> Tuple[float, float]:
-        """Return normalized (min_power, max_power) in percent."""
-        p_min = self._clamp_power_percent(params.get('min_power', 0.0))
-        p_max = self._clamp_power_percent(
-            params.get('max_power', params.get('power', self.config.get('max_laser_power', 100.0)))
-        )
-        if p_min > p_max:
-            p_min, p_max = p_max, p_min
-        return p_min, p_max
-
-    def _power_to_hex4(self, power_percent: float) -> str:
-        """Convert 0~100 power percent to 4-digit upper HEX."""
-        return f"{int(round(self._clamp_power_percent(power_percent))):04X}"
-
-    def _format_feed(self, feed_value: float) -> str:
-        """Format feed text, keeping integer values compact."""
-        try:
-            feed = float(feed_value)
-        except Exception:
-            feed = float(self.config.get('feed_rate', 1000))
-        if abs(feed - round(feed)) < 1e-9:
-            return str(int(round(feed)))
-        return f"{feed:.3f}".rstrip('0').rstrip('.')
-
     def _get_item_color_hex(self, item) -> Optional[str]:
         """提取图元颜色（HEX 大写），用于匹配图层参数。"""
         color_hex = None
@@ -409,8 +359,8 @@ class GCodeExporter:
         params = {
             'speed': self.config.get('feed_rate', 1000),
             'min_power': 0.0,
-            'max_power': self._clamp_power_percent(self.config.get('max_laser_power', 100)),
-            'power': self._clamp_power_percent(self.config.get('max_laser_power', 100)),
+            'max_power': self.config.get('max_laser_power', 255),
+            'power': self.config.get('max_laser_power', 255),
             'mode': 'cut', # cut or scan
             'scan_interval': self.config.get('scan_interval', 0.1),
             'scan_mode': 'horizontal', # horizontal or bidirectional
@@ -422,9 +372,9 @@ class GCodeExporter:
         if color_hex and hasattr(self, 'layer_settings') and color_hex in self.layer_settings:
             layer = self.layer_settings[color_hex]
             # LayerParams 对象
-            params['speed'] = float(getattr(layer, 'speed', params['speed']))
-            params['min_power'] = self._clamp_power_percent(getattr(layer, 'min_power', params['min_power']))
-            params['max_power'] = self._clamp_power_percent(getattr(layer, 'max_power', params['max_power']))
+            params['speed'] = layer.speed * 60 # mm/s -> mm/min
+            params['min_power'] = layer.min_power * 2.55 # % -> 0-255
+            params['max_power'] = layer.max_power * 2.55 # % -> 0-255
             params['power'] = params['max_power']
 
             # 判断模式
@@ -551,18 +501,6 @@ class GCodeExporter:
                 # 检查图层是否允许输出
                 processed_color = "NONE"
                 should_skip_color = False
-                strict_color_hex = self._get_item_color_hex(item)
-                processed_color = str(strict_color_hex) if strict_color_hex else "NONE"
-
-                # Strict export filter #1: no layer color -> never export.
-                if not strict_color_hex:
-                    self.debug_logs.append(f"Skip {item_name}, no layer color")
-                    continue
-
-                # Strict export filter #2: helper bitmap -> never export.
-                if self._is_auxiliary_bitmap(item):
-                    self.debug_logs.append(f"Skip {item_name}, auxiliary bitmap")
-                    continue
                 
                 if allowed_colors is not None:
                     item_color_hex = self._get_item_color_hex(item)
@@ -582,12 +520,6 @@ class GCodeExporter:
                     # [Critical Fallback] If no color found, should we skip?
                     # For now, allow it but log it. Usually user drawing has color.
                     
-                if not should_skip_color and self.layer_settings:
-                    layer = self.layer_settings.get(strict_color_hex)
-                    if layer and not layer.is_output:
-                        self.debug_logs.append(f"Skip {item_name}, is_output=False, Color: {strict_color_hex}")
-                        should_skip_color = True
-
                 if should_skip_color:
                     continue
 
@@ -821,9 +753,7 @@ class GCodeExporter:
             # 如果是 EditablePathItem，points() 返回的是局部坐标
             # 我们应该应用 mapToScene
             points = item.points()
-            params.setdefault('power', self._clamp_power_percent(self.config.get('max_laser_power', 100)))
-            params.setdefault('min_power', 0.0)
-            params.setdefault('max_power', params.get('power', 100.0))
+            params.setdefault('power', 255) # Ensure power is set
             params.setdefault('speed', 1000)
 
             if points and len(points) >= 2:
@@ -1066,11 +996,7 @@ class GCodeExporter:
              feed = min(feed, limit_speed * 60)
              self.gcode_lines.append(f"(小圆限速生效: Dia={diameter:.2f}mm, Speed={limit_speed}mm/s, Feed={feed:.1f})")
 
-        p_min, p_max = self._resolve_power_pair(params)
-        p_min_i = int(round(p_min))
-        p_max_i = int(round(p_max))
-        feed_text = self._format_feed(feed)
-        self.gcode_lines.append(f"M3 S{p_max_i}") # 激光开启
+        self.gcode_lines.append(f"M3 S{int(params['power'])}") # 激光开启
         
         # 使用G2（顺时针）或G3（逆时针）画圆
         # 兼容性处理：分成两段半圆
@@ -1078,9 +1004,9 @@ class GCodeExporter:
         mid_y = cy
         
         # Segment 1
-        self.gcode_lines.append(f"G03 X{mid_x:.3f} Y{mid_y:.3f} I{-r:.3f} J0.000 F{feed_text} P{p_min_i} S{p_max_i}")
+        self.gcode_lines.append(f"G3 X{mid_x:.3f} Y{mid_y:.3f} I{-r:.3f} J0.000 F{feed:.1f}")
         # Segment 2
-        self.gcode_lines.append(f"G03 X{start_x:.3f} Y{start_y:.3f} I{r:.3f} J0.000 F{feed_text} P{p_min_i} S{p_max_i}")
+        self.gcode_lines.append(f"G3 X{start_x:.3f} Y{start_y:.3f} I{r:.3f} J0.000")
         
         self.gcode_lines.append("M5") # 激光关闭
 
@@ -1252,10 +1178,8 @@ class GCodeExporter:
             
             rows, cols = image.shape
             
-            min_power, max_power = self._resolve_power_pair(params)
-            min_power_i = int(round(min_power))
-            max_power_i = int(round(max_power))
-            feed_text = self._format_feed(params.get('speed', self.config.get('feed_rate', 1000)))
+            max_power = float(params.get('max_power', params.get('power', 255)))
+            min_power = float(params.get('min_power', 0.0))
             scan_mode = params.get('scan_mode', '水平单向')
             scan_direction = params.get('scan_direction', '从上往下(从左往右)')
 
@@ -1313,47 +1237,58 @@ class GCodeExporter:
             logger.info(f"Bitmap Scan: {target_w}x{target_h}, Res: {resolution:.2f}")
             self.gcode_lines.append(f"(Bitmap Scan: {target_w}x{target_h} pixels, Step={scan_interval}mm)")
 
-            # 3. Scanning Loop (one G01 per row/column)
+            # 3. Scanning Loop (respect scan direction)
             if is_vertical:
                 line_indices = range(cols) if start_from_left else range(cols - 1, -1, -1)
             else:
                 line_indices = range(rows - 1, -1, -1) if start_from_bottom else range(rows)
 
-            for row_no, line_idx in enumerate(line_indices):
-                forward = start_from_bottom if is_vertical else start_from_left
-                if is_bidirectional and (row_no % 2 == 1):
+            for line_i, line_idx in enumerate(line_indices):
+                if is_vertical:
+                    forward = start_from_bottom
+                else:
+                    forward = start_from_left
+
+                if is_bidirectional and (line_i % 2 == 1):
                     forward = not forward
 
-                start_idx = 0 if forward else scan_count - 1
-                end_idx = scan_count - 1 if forward else 0
+                start = 0 if forward else scan_count - 1
+                end = scan_count if forward else -1
                 step = 1 if forward else -1
 
-                # Move to row start, then one linear move to row end.
-                s_px, s_py = map_scan_to_pixel(start_idx, line_idx)
-                e_px, e_py = map_scan_to_pixel(end_idx, line_idx)
-                sx, sy = get_position(s_px, s_py)
-                ex, ey = get_position(e_px, e_py)
-                self.gcode_lines.append(f"G00 X{sx:.3f} Y{sy:.3f}")
-                self.gcode_lines.append(
-                    f"G01 X{ex:.3f} Y{ey:.3f} F{feed_text} P{min_power_i} S{max_power_i} ;row={row_no}"
-                )
-
-                # Emit row power stream in travel order.
-                row_hex = []
-                scan_idx = start_idx
-                while True:
+                scan_idx = start
+                while scan_idx != end:
                     px, py = map_scan_to_pixel(scan_idx, line_idx)
-                    gray = float(image[py, px])
-                    p_val = min_power + (max_power - min_power) * (1.0 - gray / 255.0)
-                    row_hex.append(self._power_to_hex4(p_val))
-                    if scan_idx == end_idx:
-                        break
+                    pixel = image[py, px]
+
+                    if pixel == 255:
+                        scan_idx += step
+                        continue
+
+                    current_gray = pixel
+                    seg_start = scan_idx
+
+                    while True:
+                        next_idx = scan_idx + step
+                        if next_idx == end:
+                            break
+                        n_px, n_py = map_scan_to_pixel(next_idx, line_idx)
+                        next_pixel = image[n_py, n_px]
+                        if next_pixel == 255 or next_pixel != current_gray:
+                            break
+                        scan_idx = next_idx
+
+                    seg_end = scan_idx
+
+                    p_val = min_power + (max_power - min_power) * (1.0 - float(current_gray) / 255.0)
+                    s_cmd = f"S{int(p_val)}"
+                    self.gcode_lines.append(get_g_move_idx(seg_start, line_idx))
+                    self.gcode_lines.append(get_g_linear_idx(seg_end, line_idx, s_cmd))
+
                     scan_idx += step
 
-                chunk = 64
-                for i in range(0, len(row_hex), chunk):
-                    self.gcode_lines.append(" ".join(row_hex[i:i + chunk]))
-
+            
+            # Post-loop cleanup
             self.gcode_lines.append("M5")
             
         except Exception as e:
@@ -1389,20 +1324,16 @@ class GCodeExporter:
         # 移动到起点
         start_x, start_y = points[0]
         self._add_rapid_move(start_x, start_y)
-        p_min, p_max = self._resolve_power_pair(params)
-        p_min_i = int(round(p_min))
-        p_max_i = int(round(p_max))
 
         # 开启激光
-        self.gcode_lines.append(f"M3 S{p_max_i}")
+        self.gcode_lines.append(f"M3 S{int(params['power'])}")
         self.laser_on = True
 
         # 连续移动
         feed = params['speed']
-        feed_text = self._format_feed(feed)
         for i in range(1, len(points)):
             x, y = points[i]
-            self.gcode_lines.append(f"G01 X{x:.3f} Y{y:.3f} F{feed_text} P{p_min_i} S{p_max_i}")
+            self.gcode_lines.append(f"G1 X{x:.3f} Y{y:.3f} F{feed:.1f}")
             self.current_x = x
             self.current_y = y
 
@@ -1553,7 +1484,7 @@ def get_default_config() -> dict:
     """获取默认配置"""
     return {
         'feed_rate': 1000,
-        'max_laser_power': 100,
+        'max_laser_power': 255,
         'rapid_move_rate': 3000,
         'units': 'G21',
         'absolute_positioning': 'G90',

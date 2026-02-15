@@ -4,19 +4,21 @@
 右侧属性面板
 """
 import os
+import re
+import time
+import tempfile
 import configparser
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
                              QPushButton, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
                              QRadioButton, QGridLayout, QStackedWidget, QHeaderView, QSizePolicy, QFileDialog, QMessageBox, QDialog, QButtonGroup,
-                             QStyledItemDelegate, QStyle, QMenu, QTreeWidget, QTreeWidgetItem, QDialogButtonBox, QFrame)
+                             QStyledItemDelegate, QStyle, QTreeWidget, QTreeWidgetItem, QDialogButtonBox, QFrame)
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QAbstractItemView, QListView
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter, QPen, QDoubleValidator
 from utils.tool_utils import get_resource_path
 from .device_config_dialog import DeviceConfigDialog
-from .debug_control_dialog import CommandDebugDialog
 from my_io.gcode.gcode_exporter import GCodeExporter
 from utils.device_manager import DeviceManager
 from my_io.communication.laser_communicator import LaserCommunicator
@@ -31,11 +33,10 @@ class LayerParams:
         self.is_visible = True
         self.is_locked = False
         self.speed = 100.0
-        self.min_power = 30.0
-        self.max_power = 30.0
+        self.min_power = 0.0
+        self.max_power = 100.0
         self.scan_mode = "水平单向"
         self.scan_interval = 0.1
-        self.scan_direction = "跟随全局"
         self.priority = 1
         self.name = "" # 预留
         
@@ -51,8 +52,9 @@ class LayerParams:
 
         # 激光2参数
         self.speed_2 = 100.0
-        self.min_power_2 = 30.0
-        self.max_power_2 = 30.0
+        self.min_power_2 = 0.0
+        self.max_power_2 = 100.0
+
 
 PARAM_OPTIONS = {
     "扫描模式": ["一般模式", "特殊模式"],
@@ -394,113 +396,301 @@ class RightPanel(QWidget):
     
     # 信号：当图层参数发生变化时发出（用于通知主窗口更新路径预览等）
     layerParamsChanged = pyqtSignal()
+    USER_PARAMS_PERSIST_FILENAME = "user_params.ini"
+    USER_PARAMS_REMOTE_FILENAME = "user_params.ini"
+    # 按顺序尝试，直到返回可解析 INI 文本
+    USER_PARAMS_READ_COMMANDS = [
+        "+CPRM:READ,{filename}",
+        "+CREG:16,0,{filename}",
+        "+CREG:16,0",
+    ]
+    # 上传后尝试通知下位机应用参数（命令因固件而异，按顺序兜底）
+    USER_PARAMS_APPLY_COMMANDS = [
+        "+CPRM:LOAD,{filename}",
+        "+CPRM:APPLY,{filename}",
+        "+CREG:12,1,{filename}",
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.canvas = None # 持有 Canvas 引用
-        self._internal_selection_change = False  # 防止循环触发选中的标志
         self.layer_data = {} # Key: hex color string, Value: LayerParams
         self.layer_order = [] # 存储图层顺序（hex color string list）
+        self.user_params_file_path = self._get_user_params_persist_path()
+        self.user_params_last_open_path = self.user_params_file_path
         
         self.communicator = LaserCommunicator()
         self.communicator.log_message.connect(self.on_comm_log)
         self.communicator.error_occurred.connect(self.on_comm_error)
         self.communicator.sending_finished.connect(self.on_sending_finished)
-        self.communicator.connection_changed.connect(self.on_connection_changed) # 添加连接状态监听
         
         self.current_layer_color = None # 当前选中的图层颜色（用于解决焦点丢失时的参数保存问题）
-        
-        self.init_ui()
-        
-        # 监听设备列表变化
-        DeviceManager().devices_changed.connect(self.refresh_device_list_and_restore_selection)
+        self._process_defaults = {
+            'position_mode': '当前位置',
+            'path_optimize': True,
+            'output_selected': False,
+            'selected_position': False,
+        }
+        self._output_defaults = {
+            'cycle_enabled': False,
+            'cycle_count': 0,
+            'cycle_order': '先切割后送料',
+            'feed_length': 500.0,
+            'feed_source': '手动输入',
+            'feed_comp': 0.0,
+            'pause_after_feed': False,
+            'split_enabled': False,
+            'panel_height': 500.0,
+            'force_split': False,
+            'angle_comp': 0.0,
+            'end_feed': False,
+            'comp_diameter': 1.0,
+            'joint_comp': False,
+            'dual_head_priority': False,
+        }
 
-    def on_connection_changed(self, connected):
-        """当底层连接状态改变时触发"""
-        # 可以更新UI状态，例如按钮颜色等
-        pass
-        
-    def refresh_device_list_and_restore_selection(self):
-        """刷新设备列表，并尝试保持选中项（如果有新增，选中新增）"""
-        current_text = self.combo_device.currentText()
-        old_count = self.combo_device.count() # 记录刷新前的数量
-        
-        self.refresh_device_list()
-        
-        new_count = self.combo_device.count()
-        
-        # 如果数量增加了，说明很可能是 CommandDebugDialog 添加了新设备，此时应自动选中最新的那个
-        if new_count > old_count:
-            self.combo_device.setCurrentIndex(new_count - 1)
-        else:
-            # 否则尝试保持之前的选中
-            idx = self.combo_device.findText(current_text)
-            if idx >= 0:
-                self.combo_device.setCurrentIndex(idx)
-            else:
-                # 如果之前的项不存在了（被修改了），默认选中第一个
-                 if self.combo_device.count() > 0:
-                     self.combo_device.setCurrentIndex(0)
+        self._debug_process_start_ts = None
+        self._debug_last_process_duration_ms = None
+        self._process_paused = False
+        self._last_remote_job_name = ""
+        self._manual_stop_requested = False
+
+        self.init_ui()
 
     def set_canvas(self, canvas):
         """设置画布引用并连接信号"""
         self.canvas = canvas
-        # 监听场景变化以更新图层列表
         self.canvas.scene.changed.connect(self.update_layer_list)
-        # 监听选择变化以更新参数显示
         self.canvas.scene.selectionChanged.connect(self.on_selection_changed)
-        # 初始化图层列表
         self.update_layer_list(force=True)
-        # 延迟加载反向间隙值（确保控件已创建）
+        self._load_process_settings_from_canvas()
+        self._load_output_settings_from_canvas()
         QTimer.singleShot(100, self._load_backlash_values)
-    
+
     def _load_backlash_values(self):
         """加载反向间隙X和Y的值"""
-        if not self.canvas or not hasattr(self, 'backlash_x_edit'):
+        if not self.canvas:
             return
-        
+
+        backlash_x = 0.0
+        backlash_y = 0.0
         try:
-            # 从canvas的user_params或optimize_settings中读取
-            if hasattr(self.canvas, 'user_params'):
+            # 优先从 canvas.user_params 读取，回退到 optimize_settings
+            if hasattr(self.canvas, 'user_params') and isinstance(self.canvas.user_params, dict):
                 params = self.canvas.user_params
-                if 'backlash_x' in params:
-                    self.backlash_x_edit.setText(f"{params['backlash_x']:.3f}")
-                if 'backlash_y' in params:
-                    self.backlash_y_edit.setText(f"{params['backlash_y']:.3f}")
-            elif hasattr(self.canvas, 'optimize_settings') and 'user_backlash' in self.canvas.optimize_settings:
-                config = self.canvas.optimize_settings['user_backlash']
-                self.backlash_x_edit.setText(f"{config.get('x', 0.0):.3f}")
-                self.backlash_y_edit.setText(f"{config.get('y', 0.0):.3f}")
+                backlash_x = float(params.get('backlash_x', 0.0) or 0.0)
+                backlash_y = float(params.get('backlash_y', 0.0) or 0.0)
+            elif hasattr(self.canvas, 'optimize_settings') and isinstance(self.canvas.optimize_settings, dict):
+                config = self.canvas.optimize_settings.get('user_backlash', {}) or {}
+                backlash_x = float(config.get('x', 0.0) or 0.0)
+                backlash_y = float(config.get('y', 0.0) or 0.0)
         except Exception as e:
             print(f"加载反向间隙值失败: {e}")
-    
+
+        # 兼容旧版输入框
+        if hasattr(self, 'backlash_x_edit'):
+            self.backlash_x_edit.setText(f"{backlash_x:.3f}")
+        if hasattr(self, 'backlash_y_edit'):
+            self.backlash_y_edit.setText(f"{backlash_y:.3f}")
+
+        # 同步到当前用户参数树数据（用于“切割反向间隙”）
+        changed = False
+        changed |= self._set_user_param_value(2, "其他参数", "反向间隙X(mm)", f"{backlash_x:.3f}")
+        changed |= self._set_user_param_value(2, "其他参数", "反向间隙Y(mm)", f"{backlash_y:.3f}")
+        if changed and hasattr(self, 'user_param_tree'):
+            self.update_user_param_tree()
+
     def _save_backlash_values(self):
         """保存反向间隙X和Y的值"""
-        if not self.canvas or not hasattr(self, 'backlash_x_edit'):
+        if not self.canvas:
             return
-        
+
         try:
-            # 读取输入框的值
-            try:
-                backlash_x = float(self.backlash_x_edit.text().strip() or "0")
-            except ValueError:
-                backlash_x = 0.0
-            
-            try:
-                backlash_y = float(self.backlash_y_edit.text().strip() or "0")
-            except ValueError:
-                backlash_y = 0.0
-            
-            # 保存到canvas的optimize_settings中
-            if not hasattr(self.canvas, 'optimize_settings'):
+            backlash_x = 0.0
+            backlash_y = 0.0
+
+            # 优先读旧版输入框，回退到用户参数树
+            if hasattr(self, 'backlash_x_edit') and hasattr(self, 'backlash_y_edit'):
+                try:
+                    backlash_x = float(self.backlash_x_edit.text().strip() or "0")
+                except ValueError:
+                    backlash_x = 0.0
+
+                try:
+                    backlash_y = float(self.backlash_y_edit.text().strip() or "0")
+                except ValueError:
+                    backlash_y = 0.0
+            else:
+                try:
+                    backlash_x = float(self._get_user_param_value(2, "其他参数", "反向间隙X(mm)", "0").strip() or "0")
+                except ValueError:
+                    backlash_x = 0.0
+                try:
+                    backlash_y = float(self._get_user_param_value(2, "其他参数", "反向间隙Y(mm)", "0").strip() or "0")
+                except ValueError:
+                    backlash_y = 0.0
+
+            # 保存到 canvas.optimize_settings
+            if not hasattr(self.canvas, 'optimize_settings') or self.canvas.optimize_settings is None:
                 self.canvas.optimize_settings = {}
-            
+
             self.canvas.optimize_settings['user_backlash'] = {
                 'x': backlash_x,
                 'y': backlash_y
             }
+
+            # 同步到 canvas.user_params，兼容旧读取路径
+            if not hasattr(self.canvas, 'user_params') or not isinstance(self.canvas.user_params, dict):
+                self.canvas.user_params = {}
+            self.canvas.user_params['backlash_x'] = backlash_x
+            self.canvas.user_params['backlash_y'] = backlash_y
         except Exception as e:
             print(f"保存反向间隙值失败: {e}")
+
+    def _get_user_param_value(self, group_idx, category_name, key_name, default=""):
+        if not hasattr(self, 'user_params'):
+            return default
+        categories = self.user_params.get(group_idx, [])
+        for cat_name, items in categories:
+            if cat_name != category_name:
+                continue
+            for key, value in items:
+                if key == key_name:
+                    return str(value)
+        return default
+
+    def _set_user_param_value(self, group_idx, category_name, key_name, value):
+        if not hasattr(self, 'user_params'):
+            return False
+        categories = self.user_params.get(group_idx)
+        if categories is None:
+            return False
+
+        new_value = str(value)
+        for cat_idx, (cat_name, items) in enumerate(categories):
+            if cat_name != category_name:
+                continue
+            for item_idx, (key, old_value) in enumerate(items):
+                if key != key_name:
+                    continue
+                if str(old_value) == new_value:
+                    return False
+                new_items = list(items)
+                new_items[item_idx] = (key, new_value)
+                categories[cat_idx] = (cat_name, new_items)
+                return True
+        return False
+
+    def _get_user_params_persist_path(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.normpath(os.path.join(base_dir, "..", self.USER_PARAMS_PERSIST_FILENAME))
+
+    def _build_user_params_config(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        for _, categories in (self.user_params or {}).items():
+            for cat_name, items in categories:
+                if not cfg.has_section(cat_name):
+                    cfg.add_section(cat_name)
+                for key, value in items:
+                    if key in ("一键设置", "周脉冲测试"):
+                        continue
+                    cfg.set(cat_name, key, str(value))
+        return cfg
+
+    def _apply_user_params_config(self, cfg):
+        if not hasattr(self, 'user_params'):
+            return
+        for _, categories in self.user_params.items():
+            for cat_idx, (cat_name, items) in enumerate(categories):
+                if not cfg.has_section(cat_name):
+                    continue
+                section = cfg[cat_name]
+                new_items = []
+                for key, value in items:
+                    if key in ("一键设置", "周脉冲测试"):
+                        new_items.append((key, value))
+                        continue
+                    new_items.append((key, section.get(key, str(value))))
+                categories[cat_idx] = (cat_name, new_items)
+
+    def _save_user_params_to_ini(self, filename):
+        cfg = self._build_user_params_config()
+        with open(filename, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+    def _load_user_params_from_ini(self, filename):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(filename, encoding="utf-8")
+        if not cfg.sections():
+            raise ValueError("INI文件为空或格式不正确")
+        self._apply_user_params_config(cfg)
+        self.update_user_param_tree()
+        self._save_backlash_values()
+
+    def _persist_user_params_silent(self):
+        try:
+            self._save_user_params_to_ini(self.user_params_file_path)
+        except Exception:
+            pass
+
+    def _looks_like_ini_text(self, text):
+        if not text:
+            return False
+        lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+        if not lines:
+            return False
+        has_section = any(ln.startswith("[") and ln.endswith("]") for ln in lines)
+        has_kv = any("=" in ln for ln in lines)
+        return has_section and has_kv
+
+    def _extract_ini_text_from_response(self, text):
+        raw = str(text or "")
+        if not raw.strip():
+            return ""
+
+        if self._looks_like_ini_text(raw):
+            return raw
+
+        up = raw.upper()
+        begin_tag = "INI_BEGIN"
+        end_tag = "INI_END"
+        b = up.find(begin_tag)
+        e = up.find(end_tag)
+        if b >= 0 and e > b:
+            block = raw[b + len(begin_tag):e]
+            if self._looks_like_ini_text(block):
+                return block
+
+        # 兜底：从混合响应中提取 section/key=value 行
+        ini_lines = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if (s.startswith("[") and s.endswith("]")) or ("=" in s):
+                ini_lines.append(s)
+        candidate = "\n".join(ini_lines)
+        if self._looks_like_ini_text(candidate):
+            return candidate
+        return ""
+
+    def _parse_machine_ini_text(self, text):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read_string(text)
+        if not cfg.sections():
+            raise ValueError("下位机返回内容不是有效INI")
+        self._apply_user_params_config(cfg)
+        self.update_user_param_tree()
+        self._save_backlash_values()
+
+    def _remote_user_params_filename(self):
+        if self.user_params_last_open_path:
+            base = os.path.basename(self.user_params_last_open_path).strip()
+            if base:
+                return base
+        return self.USER_PARAMS_REMOTE_FILENAME
+    def sync_user_backlash_to_canvas(self):
+        self._save_backlash_values()
 
     def init_ui(self):
         """初始化界面"""
@@ -514,7 +704,7 @@ class RightPanel(QWidget):
         self.tabs.addTab(self._wrap_tab(self.create_output_tab()), "输出")
         self.tabs.addTab(self._wrap_tab(self.create_file_tab()), "文档")
         self.tabs.addTab(self._wrap_tab(self.create_user_tab()), "用户")
-        self.tabs.addTab(self._wrap_tab(self.create_test_tab()), "测试")
+        self.tabs.addTab(self._wrap_tab(self.create_test_tab()), "调试")
         # 历史面板（列出撤销/重做历史）
         self.tabs.addTab(self._wrap_tab(self.create_history_tab()), "历史")
 
@@ -644,17 +834,18 @@ class RightPanel(QWidget):
         row3_layout.setSpacing(2)
         
         lbl_pos = QLabel("图形定位位置:")
-        combo_pos = QComboBox()
-        combo_pos.setView(QListView())
-        combo_pos.setMaxVisibleItems(10)
-        combo_pos.setEditable(True)
-        combo_pos.lineEdit().setReadOnly(True)
-        combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
-        combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
-        combo_pos.setMinimumHeight(24)
+        self.proc_combo_pos = QComboBox()
+        self.proc_combo_pos.setView(QListView())
+        self.proc_combo_pos.setMaxVisibleItems(10)
+        self.proc_combo_pos.setEditable(True)
+        self.proc_combo_pos.lineEdit().setReadOnly(True)
+        self.proc_combo_pos.addItems(["当前位置", "原定位点", "机械原点", "绝对坐标"])
+        self.proc_combo_pos.setSizePolicy(_QSizePolicy.Expanding, _QSizePolicy.Fixed)
+        self.proc_combo_pos.setMinimumHeight(24)
+        self.proc_combo_pos.currentIndexChanged.connect(self._on_process_settings_changed)
 
         row3_layout.addWidget(lbl_pos)
-        row3_layout.addWidget(combo_pos)
+        row3_layout.addWidget(self.proc_combo_pos)
         process_layout.addLayout(row3_layout)
 
         # Row 4: Checkboxes and Border buttons
@@ -664,22 +855,20 @@ class RightPanel(QWidget):
         checks_layout = QVBoxLayout()
         checks_layout.setSpacing(2)
         
-        chk_optimize = QCheckBox("路径优化")
-        chk_optimize.setChecked(True)
-        chk_output_selected = QCheckBox("输出选中图形")
-        chk_selected_pos = QCheckBox("选中图形定位")
-        chk_selected_pos.setEnabled(False)
-        chk_selected_pos.setStyleSheet("color: gray;")
+        self.proc_chk_optimize = QCheckBox("路径优化")
+        self.proc_chk_optimize.setChecked(True)
+        self.proc_chk_output_selected = QCheckBox("输出选中图形")
+        self.proc_chk_selected_pos = QCheckBox("选中图形定位")
+        self.proc_chk_selected_pos.setEnabled(False)
+        self.proc_chk_selected_pos.setStyleSheet("color: gray;")
 
-        def on_output_selected_changed(checked):
-            chk_selected_pos.setEnabled(checked)
-            chk_selected_pos.setStyleSheet("color: black;" if checked else "color: gray;")
-        
-        chk_output_selected.toggled.connect(on_output_selected_changed)
+        self.proc_chk_optimize.toggled.connect(self._on_process_settings_changed)
+        self.proc_chk_selected_pos.toggled.connect(self._on_process_settings_changed)
+        self.proc_chk_output_selected.toggled.connect(self._on_output_selected_changed)
 
-        checks_layout.addWidget(chk_optimize)
-        checks_layout.addWidget(chk_output_selected)
-        checks_layout.addWidget(chk_selected_pos)
+        checks_layout.addWidget(self.proc_chk_optimize)
+        checks_layout.addWidget(self.proc_chk_output_selected)
+        checks_layout.addWidget(self.proc_chk_selected_pos)
         
         row4_layout.addLayout(checks_layout)
 
@@ -703,6 +892,8 @@ class RightPanel(QWidget):
         process_layout.addLayout(row4_layout)
         process_group.setLayout(process_layout)
         bottom_layout.addWidget(process_group)
+
+        self._apply_process_settings_to_ui(dict(self._process_defaults))
 
         # 2. 设备端口 GroupBox
         device_group = QGroupBox("设备端口")
@@ -816,210 +1007,657 @@ class RightPanel(QWidget):
                     allowed.append(color_hex)
         return allowed
 
-    def on_btn_start_clicked(self):
-        """开始加工"""
-        # 1. 检查连接
-        if not self.check_connection_and_alert():
+    def _normalize_process_settings(self, raw):
+        base = dict(self._process_defaults)
+        if isinstance(raw, dict):
+            base.update(raw)
+
+        valid_modes = {"当前位置", "原定位点", "机械原点", "绝对坐标"}
+        try:
+            base['position_mode'] = str(base.get('position_mode', '当前位置'))
+            if base['position_mode'] not in valid_modes:
+                base['position_mode'] = '当前位置'
+
+            base['path_optimize'] = bool(base.get('path_optimize', True))
+            base['output_selected'] = bool(base.get('output_selected', False))
+            base['selected_position'] = bool(base.get('selected_position', False))
+            if not base['output_selected']:
+                base['selected_position'] = False
+        except Exception:
+            return dict(self._process_defaults)
+        return base
+
+    def _collect_process_settings_from_ui(self):
+        if not hasattr(self, 'proc_combo_pos'):
+            return dict(self._process_defaults)
+        settings = {
+            'position_mode': self.proc_combo_pos.currentText(),
+            'path_optimize': self.proc_chk_optimize.isChecked(),
+            'output_selected': self.proc_chk_output_selected.isChecked(),
+            'selected_position': self.proc_chk_selected_pos.isChecked(),
+        }
+        return self._normalize_process_settings(settings)
+
+    def _refresh_process_option_state(self):
+        if not hasattr(self, 'proc_chk_selected_pos'):
             return
-        
-        # 2. 生成 GCode
+        enabled = bool(self.proc_chk_output_selected.isChecked())
+        self.proc_chk_selected_pos.setEnabled(enabled)
+        self.proc_chk_selected_pos.setStyleSheet("color: black;" if enabled else "color: gray;")
+        if not enabled and self.proc_chk_selected_pos.isChecked():
+            self.proc_chk_selected_pos.blockSignals(True)
+            self.proc_chk_selected_pos.setChecked(False)
+            self.proc_chk_selected_pos.blockSignals(False)
+
+    def _apply_process_settings_to_ui(self, settings):
+        if not hasattr(self, 'proc_combo_pos'):
+            return
+        cfg = self._normalize_process_settings(settings)
+        controls = [
+            self.proc_combo_pos,
+            self.proc_chk_optimize,
+            self.proc_chk_output_selected,
+            self.proc_chk_selected_pos,
+        ]
+        for w in controls:
+            w.blockSignals(True)
+        try:
+            self.proc_combo_pos.setCurrentText(cfg['position_mode'])
+            self.proc_chk_optimize.setChecked(cfg['path_optimize'])
+            self.proc_chk_output_selected.setChecked(cfg['output_selected'])
+            self.proc_chk_selected_pos.setChecked(cfg['selected_position'])
+        finally:
+            for w in controls:
+                w.blockSignals(False)
+        self._refresh_process_option_state()
+
+    def _save_process_settings_to_canvas(self):
         if not self.canvas:
             return
-            
         try:
-            exporter = GCodeExporter()
-            # 更新配置
-            exporter.set_config({
-                'feed_rate': self.speed_spin.value() * 60, # mm/s -> mm/min
-                'max_laser_power': self.max_power_spin.value() * 2.55 # % -> 0-255
-            })
+            if not hasattr(self.canvas, 'optimize_settings') or self.canvas.optimize_settings is None:
+                self.canvas.optimize_settings = {}
+            self.canvas.optimize_settings['process_panel'] = self._collect_process_settings_from_ui()
+        except Exception:
+            pass
 
-            # 从当前 layer_data 构建导出用的简化图层参数
+    def _load_process_settings_from_canvas(self):
+        if not hasattr(self, 'proc_combo_pos'):
+            return
+        try:
+            raw = {}
+            if self.canvas and hasattr(self.canvas, 'optimize_settings') and isinstance(self.canvas.optimize_settings, dict):
+                raw = self.canvas.optimize_settings.get('process_panel', {}) or {}
+            self._apply_process_settings_to_ui(raw)
+        except Exception:
+            self._apply_process_settings_to_ui(dict(self._process_defaults))
+
+    def _on_process_settings_changed(self, *_args):
+        self._save_process_settings_to_canvas()
+
+    def _on_output_selected_changed(self, checked):
+        self._refresh_process_option_state()
+        self._on_process_settings_changed()
+
+    def _normalize_output_settings(self, raw):
+        """规范化输出页参数，保证类型和枚举值稳定。"""
+        base = dict(self._output_defaults)
+        if not isinstance(raw, dict):
+            return base
+
+        base.update(raw)
+
+        cycle_orders = {"先切割后送料", "先送料后切割", "往返送料"}
+        feed_sources = {"手动输入", "Y向幅面", "图形高度", "最小送料长度"}
+
+        try:
+            base['cycle_enabled'] = bool(base.get('cycle_enabled', False))
+            base['cycle_count'] = max(0, int(base.get('cycle_count', 0)))
+            base['cycle_order'] = str(base.get('cycle_order', '先切割后送料'))
+            if base['cycle_order'] not in cycle_orders:
+                base['cycle_order'] = '先切割后送料'
+
+            base['feed_length'] = max(0.0, float(base.get('feed_length', 500.0)))
+            base['feed_source'] = str(base.get('feed_source', '手动输入'))
+            if base['feed_source'] not in feed_sources:
+                base['feed_source'] = '手动输入'
+            base['feed_comp'] = float(base.get('feed_comp', 0.0))
+            base['pause_after_feed'] = bool(base.get('pause_after_feed', False))
+
+            base['split_enabled'] = bool(base.get('split_enabled', False))
+            base['panel_height'] = max(1e-6, float(base.get('panel_height', 500.0)))
+            base['force_split'] = bool(base.get('force_split', False))
+            base['angle_comp'] = float(base.get('angle_comp', 0.0))
+            base['end_feed'] = bool(base.get('end_feed', False))
+            base['comp_diameter'] = max(0.0, float(base.get('comp_diameter', 1.0)))
+            base['joint_comp'] = bool(base.get('joint_comp', False))
+
+            base['dual_head_priority'] = bool(base.get('dual_head_priority', False))
+        except Exception:
+            return dict(self._output_defaults)
+
+        return base
+
+    def _collect_output_settings_from_ui(self):
+        """从输出页控件读取当前参数。"""
+        if not hasattr(self, 'output_cycle_check'):
+            return dict(self._output_defaults)
+
+        settings = {
+            'cycle_enabled': self.output_cycle_check.isChecked(),
+            'cycle_count': self.output_cycle_count.value(),
+            'cycle_order': self.output_cycle_order.currentText(),
+            'feed_length': self.output_feed_length.value(),
+            'feed_source': self.output_feed_source.currentText(),
+            'feed_comp': self.output_feed_comp.value(),
+            'pause_after_feed': self.output_pause_after_feed.isChecked(),
+            'split_enabled': self.output_split_check.isChecked(),
+            'panel_height': self.output_panel_height.value(),
+            'force_split': self.output_force_split.isChecked(),
+            'angle_comp': self.output_angle_comp.value(),
+            'end_feed': self.output_end_feed.isChecked(),
+            'comp_diameter': self.output_comp_diameter.value(),
+            'joint_comp': self.output_joint_comp.isChecked(),
+            'dual_head_priority': self.output_dual_head_priority.isChecked(),
+        }
+        return self._normalize_output_settings(settings)
+
+    def _apply_output_settings_to_ui(self, settings):
+        """将输出页参数回填到界面控件。"""
+        if not hasattr(self, 'output_cycle_check'):
+            return
+
+        cfg = self._normalize_output_settings(settings)
+        controls = [
+            self.output_cycle_check,
+            self.output_cycle_count,
+            self.output_cycle_order,
+            self.output_feed_length,
+            self.output_feed_source,
+            self.output_feed_comp,
+            self.output_pause_after_feed,
+            self.output_split_check,
+            self.output_panel_height,
+            self.output_force_split,
+            self.output_angle_comp,
+            self.output_end_feed,
+            self.output_comp_diameter,
+            self.output_joint_comp,
+            self.output_dual_head_priority,
+        ]
+
+        for w in controls:
+            w.blockSignals(True)
+
+        try:
+            self.output_cycle_check.setChecked(cfg['cycle_enabled'])
+            self.output_cycle_count.setValue(cfg['cycle_count'])
+            self.output_cycle_order.setCurrentText(cfg['cycle_order'])
+            self.output_feed_length.setValue(cfg['feed_length'])
+            self.output_feed_source.setCurrentText(cfg['feed_source'])
+            self.output_feed_comp.setValue(cfg['feed_comp'])
+            self.output_pause_after_feed.setChecked(cfg['pause_after_feed'])
+
+            self.output_split_check.setChecked(cfg['split_enabled'])
+            self.output_panel_height.setValue(cfg['panel_height'])
+            self.output_force_split.setChecked(cfg['force_split'])
+            self.output_angle_comp.setValue(cfg['angle_comp'])
+            self.output_end_feed.setChecked(cfg['end_feed'])
+            self.output_comp_diameter.setValue(cfg['comp_diameter'])
+            self.output_joint_comp.setChecked(cfg['joint_comp'])
+
+            self.output_dual_head_priority.setChecked(cfg['dual_head_priority'])
+        finally:
+            for w in controls:
+                w.blockSignals(False)
+
+        self._refresh_output_section_visibility()
+        self._refresh_feed_length_editor_state()
+
+    def _save_output_settings_to_canvas(self):
+        """保存输出页参数到 canvas.optimize_settings。"""
+        if not self.canvas:
+            return
+        try:
+            if not hasattr(self.canvas, 'optimize_settings') or self.canvas.optimize_settings is None:
+                self.canvas.optimize_settings = {}
+            self.canvas.optimize_settings['output_panel'] = self._collect_output_settings_from_ui()
+        except Exception:
+            pass
+
+    def _load_output_settings_from_canvas(self):
+        """从 canvas.optimize_settings 加载输出页参数。"""
+        if not hasattr(self, 'output_cycle_check'):
+            return
+        try:
+            raw = {}
+            if self.canvas and hasattr(self.canvas, 'optimize_settings') and isinstance(self.canvas.optimize_settings, dict):
+                raw = self.canvas.optimize_settings.get('output_panel', {}) or {}
+            self._apply_output_settings_to_ui(self._normalize_output_settings(raw))
+        except Exception:
+            self._apply_output_settings_to_ui(dict(self._output_defaults))
+
+    def _on_output_settings_changed(self, *_args):
+        self._refresh_output_section_visibility()
+        self._refresh_feed_length_editor_state()
+        self._save_output_settings_to_canvas()
+
+    def _refresh_output_section_visibility(self):
+        if hasattr(self, 'output_cycle_content'):
+            self.output_cycle_content.setVisible(True)
+            self.output_cycle_content.setEnabled(self.output_cycle_check.isChecked())
+        if hasattr(self, 'output_split_content'):
+            self.output_split_content.setVisible(True)
+            self.output_split_content.setEnabled(self.output_split_check.isChecked())
+
+    def _refresh_feed_length_editor_state(self):
+        if not hasattr(self, 'output_feed_source'):
+            return
+        is_manual = self.output_feed_source.currentText() == "手动输入"
+        if hasattr(self, 'output_cycle_check'):
+            is_manual = is_manual and self.output_cycle_check.isChecked()
+        self.output_feed_length.setEnabled(is_manual)
+
+    def get_output_panel_settings(self):
+        return self._collect_output_settings_from_ui()
+
+    def _is_system_scene_item(self, item) -> bool:
+        if not self.canvas:
+            return False
+        try:
+            for attr in ('_work_item', '_fiducial_item', '_grid_item'):
+                if hasattr(self.canvas, attr) and item == getattr(self.canvas, attr):
+                    return True
+            if hasattr(self.canvas, '_workarea_items') and item in self.canvas._workarea_items:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_item_color_hex(self, item):
+        color_hex = None
+        layer_role = Qt.UserRole + 100
+        try:
+            if hasattr(item, 'data'):
+                c = item.data(layer_role)
+                if isinstance(c, QColor):
+                    color_hex = c.name().upper()
+                elif isinstance(c, str):
+                    color_hex = c.upper()
+        except Exception:
+            pass
+        if not color_hex and hasattr(item, 'pen'):
             try:
-                layer_params_map = {}
-                for hex_color, p in self.layer_data.items():
-                    key = str(hex_color).upper()
-                    layer_params_map[key] = {
-                        'seal_gap': getattr(p, 'seal_gap', 0.0),
-                        'laser_on_delay': getattr(p, 'laser_on_delay', 0),
-                        'laser_off_delay': getattr(p, 'laser_off_delay', 0),
-                        'mode': getattr(p, 'mode', '激光切割'),
-                    }
-                exporter.set_layer_params(layer_params_map)
+                p = item.pen()
+                if p and p.color().isValid():
+                    color_hex = p.color().name().upper()
             except Exception:
                 pass
-            
-            lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors(), layer_settings=self.layer_data)
+        if not color_hex and hasattr(item, 'defaultTextColor'):
+            try:
+                c = item.defaultTextColor()
+                if c and c.isValid():
+                    color_hex = c.name().upper()
+            except Exception:
+                pass
+        return color_hex
+
+    def _get_scene_data_bounds(self, selected_only=False):
+        """计算可输出图形在场景中的包围盒。"""
+        if not self.canvas:
+            return None
+
+        bounds = None
+        try:
+            all_items = self.canvas.scene.items(order=Qt.AscendingOrder)
+        except Exception:
+            all_items = self.canvas.scene.items()
+
+        for item in all_items:
+            if self._is_system_scene_item(item):
+                continue
+            color_hex = self._get_item_color_hex(item)
+            layer_cfg = self.layer_data.get(color_hex) if color_hex else None
+            if layer_cfg and not layer_cfg.is_output:
+                continue
+
+            try:
+                visible = bool(item.isVisible())
+            except Exception:
+                visible = True
+
+            # 隐藏图层仍可参与输出路径：仅当该层允许输出时纳入边界计算
+            if (not visible) and not (layer_cfg and layer_cfg.is_output):
+                continue
+
+            if selected_only:
+                try:
+                    if not item.isSelected():
+                        continue
+                except Exception:
+                    continue
+
+            try:
+                br = item.sceneBoundingRect()
+            except Exception:
+                continue
+            if not br.isValid() or br.isNull():
+                continue
+
+            if bounds is None:
+                bounds = br
+            else:
+                bounds = bounds.united(br)
+        return bounds
+
+    def _resolve_cycle_feed_length(self, settings):
+        """根据送料长度来源计算实际送料长度。"""
+        cfg = self._normalize_output_settings(settings)
+        src = cfg['feed_source']
+        if src == "手动输入":
+            return cfg['feed_length']
+
+        process_cfg = self._collect_process_settings_from_ui()
+        data_bounds = self._get_scene_data_bounds(selected_only=process_cfg['output_selected'])
+        data_h = float(data_bounds.height()) if data_bounds and data_bounds.isValid() else 0.0
+        work_h = float(getattr(self.canvas, '_work_h', 0.0) or 0.0) if self.canvas else 0.0
+
+        if src == "Y向幅面":
+            return work_h if work_h > 0 else cfg['feed_length']
+        if src == "图形高度":
+            return data_h if data_h > 0 else cfg['feed_length']
+        if src == "最小送料长度":
+            vals = [v for v in (data_h, work_h) if v > 0]
+            if vals:
+                return min(vals)
+            return cfg['feed_length']
+        return cfg['feed_length']
+
+    def _build_exporter_config(self):
+        """构建导出器配置（含输出页高级参数）。"""
+        output_cfg = self.get_output_panel_settings()
+        process_cfg = self._collect_process_settings_from_ui()
+        resolved_feed_length = self._resolve_cycle_feed_length(output_cfg)
+        gap_comp_optimize = None
+        small_circle_enable = None
+        if self.canvas:
+            exp = getattr(self.canvas, 'export_settings', {}) or {}
+            optimize = getattr(self.canvas, 'optimize_settings', {}) or {}
+            gap_comp_optimize = optimize.get('gap_comp_optimize', exp.get('gap_comp_optimize', None))
+            small_circle_enable = exp.get('small_circle_enable', None)
+
+        config = {
+            'feed_rate': self.speed_spin.value(),
+            'max_laser_power': self.max_power_spin.value(),
+            'position_mode': process_cfg['position_mode'],
+            'path_optimize': process_cfg['path_optimize'],
+            'output_selected_only': process_cfg['output_selected'],
+            'selected_positioning': process_cfg['selected_position'],
+            'gap_comp_optimize': gap_comp_optimize,
+            'small_circle_enable': small_circle_enable,
+            'output_cycle': {
+                'enabled': output_cfg['cycle_enabled'],
+                'count': output_cfg['cycle_count'],
+                'order': output_cfg['cycle_order'],
+                'feed_length': resolved_feed_length,
+                'feed_source': output_cfg['feed_source'],
+                'feed_comp': output_cfg['feed_comp'],
+                'pause_after_feed': output_cfg['pause_after_feed'],
+            },
+            'output_split': {
+                'enabled': output_cfg['split_enabled'],
+                'panel_height': output_cfg['panel_height'],
+                'force_split': output_cfg['force_split'],
+                'angle_comp': output_cfg['angle_comp'],
+                'end_feed': output_cfg['end_feed'],
+                'comp_diameter': output_cfg['comp_diameter'],
+                'joint_comp': output_cfg['joint_comp'],
+            },
+            'dual_head_priority': output_cfg['dual_head_priority'],
+        }
+        return config
+
+    def _build_layer_params_map(self):
+        layer_params_map = {}
+        for hex_color, p in self.layer_data.items():
+            key = str(hex_color).upper()
+            layer_params_map[key] = {
+                'seal_gap': getattr(p, 'seal_gap', 0.0),
+                'laser_on_delay': getattr(p, 'laser_on_delay', 0),
+                'laser_off_delay': getattr(p, 'laser_off_delay', 0),
+                'mode': getattr(p, 'mode', '激光切割'),
+            }
+        return layer_params_map
+
+    def _create_configured_exporter(self):
+        self._save_backlash_values()
+        exporter = GCodeExporter()
+        exporter.set_config(self._build_exporter_config())
+        exporter.set_layer_params(self._build_layer_params_map())
+        return exporter
+
+    def _build_current_job_lines(self):
+        if not self.canvas:
+            return []
+        self._save_process_settings_to_canvas()
+        self._save_output_settings_to_canvas()
+        exporter = self._create_configured_exporter()
+        return exporter.export_canvas(
+            self.canvas,
+            allowed_colors=self.get_output_enabled_colors(),
+            layer_settings=self.layer_data,
+        )
+
+    def _make_remote_job_name(self, prefix="job"):
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]", "_", str(prefix or "job"))
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return f"{safe_prefix}_{ts}.nc"
+
+    def _upload_lines_to_device(self, lines, remote_name):
+        if not lines:
+            return False
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".nc",
+                delete=False,
+                encoding="utf-8",
+            ) as fp:
+                fp.write("\n".join(lines))
+                temp_path = fp.name
+
+            ok = self.communicator.upload_file_to_sd(temp_path, remote_name)
+            if ok:
+                self._last_remote_job_name = remote_name
+            return bool(ok)
+        finally:
+            try:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+    def _run_remote_file(self, remote_name):
+        if not remote_name:
+            return False, False
+        ok_select, _ = self.communicator.send_system_command(f"+CREG:12,1,{remote_name}")
+        ok_run, _ = self.communicator.send_system_command("+CREG:13,1")
+        return bool(ok_select), bool(ok_run)
+
+    def _send_realtime_gcode_sequence(self, commands):
+        for cmd in commands:
+            text = str(cmd or "").strip()
+            if not text:
+                continue
+            ok, _ = self.communicator.send_custom_command(35, text)
+            if not ok:
+                return False, text
+        return True, ""
+
+    def _build_border_gcode_commands(self, laser_on=False):
+        if not self.canvas:
+            raise RuntimeError("画布未初始化")
+
+        process_cfg = self._collect_process_settings_from_ui()
+        bounds = self._get_scene_data_bounds(selected_only=process_cfg['output_selected'])
+        if bounds is None or not bounds.isValid() or bounds.isNull():
+            if process_cfg['output_selected']:
+                raise RuntimeError("当前未选中可输出图形")
+            raise RuntimeError("画布为空或没有可输出图形")
+
+        exporter = self._create_configured_exporter()
+        fiducial = exporter._get_fiducial_offset(self.canvas)
+
+        scene_points = [
+            (bounds.left(), bounds.top()),
+            (bounds.right(), bounds.top()),
+            (bounds.right(), bounds.bottom()),
+            (bounds.left(), bounds.bottom()),
+            (bounds.left(), bounds.top()),
+        ]
+        gcode_points = [exporter._apply_fiducial_offset(pt, fiducial) for pt in scene_points]
+
+        commands = ["G90"]
+        x0, y0 = gcode_points[0]
+        commands.append(f"G0 X{x0:.3f} Y{y0:.3f}")
+
+        if laser_on:
+            power = max(0.0, min(100.0, float(self.max_power_spin.value())))
+            if power <= 0:
+                power = 10.0
+            feed = max(1.0, float(self.speed_spin.value()) * 60.0)
+            commands.append(f"M3 S{power:.1f}")
+            for x, y in gcode_points[1:]:
+                commands.append(f"G1 X{x:.3f} Y{y:.3f} F{feed:.1f}")
+            commands.append("M5")
+        else:
+            for x, y in gcode_points[1:]:
+                commands.append(f"G0 X{x:.3f} Y{y:.3f}")
+
+        return commands
+
+    def on_btn_start_clicked(self):
+        """开始加工"""
+        if not self.check_connection_and_alert():
+            return
+
+        if not self.canvas:
+            return
+
+        try:
+            lines = self._build_current_job_lines()
             if not lines:
                 QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
                 return
-                
-            # 3. 发送
+
+            self._manual_stop_requested = False
+            self._process_paused = False
+            self._debug_process_start_ts = time.time()
             self.communicator.start_sending(lines)
-            
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动失败: {str(e)}")
 
     def on_btn_pause_clicked(self):
         """暂停/继续"""
+        # 上位机流式发送：直接暂停/恢复发送定时器
+        if self.communicator.is_sending:
+            if self.communicator.send_timer.isActive():
+                self.communicator.send_timer.stop()
+                self._process_paused = True
+                QMessageBox.information(self, "提示", "已暂停上位机发送")
+            else:
+                self.communicator.send_timer.start(10)
+                self._process_paused = False
+                QMessageBox.information(self, "提示", "已继续上位机发送")
+            return
+
+        # 下位机离线任务：通过系统指令暂停/继续
         if not self.check_connection_and_alert():
             return
-        QMessageBox.information(self, "提示", "暂停功能暂未实现")
+
+        cmd = "+CREG:13,0" if not self._process_paused else "+CREG:13,1"
+        ok, _ = self.communicator.send_system_command(cmd)
+        if ok:
+            self._process_paused = not self._process_paused
+            text = "已暂停下位机离线任务" if self._process_paused else "已继续下位机离线任务"
+            QMessageBox.information(self, "提示", text)
+        else:
+            QMessageBox.warning(self, "提示", "暂停/继续命令下发失败，请确认固件支持 +CREG:13")
 
     def on_btn_stop_clicked(self):
         """停止加工"""
+        if self.communicator.is_sending:
+            self._manual_stop_requested = True
+            self.communicator.stop_sending()
+            self._process_paused = False
+            return
+
         if not self.check_connection_and_alert():
             return
-        self.communicator.stop_sending()
+
+        ok1, _ = self.communicator.send_custom_command(35, "!")
+        ok2, _ = self.communicator.send_system_command("+CREG:13,0")
+        self._process_paused = False
+        if ok1 or ok2:
+            QMessageBox.information(self, "提示", "停止命令已发送")
+        else:
+            QMessageBox.warning(self, "提示", "停止命令下发失败")
 
     def on_btn_download_clicked(self):
-        """下载: 生成 GCode 并作为文件上传到设备"""
+        """下载"""
         if not self.check_connection_and_alert():
             return
-            
         if not self.canvas:
             return
-
         try:
-            # 1. 生成 GCode
-            exporter = GCodeExporter()
-            exporter.set_config({
-                'feed_rate': self.speed_spin.value() * 60, 
-                'max_laser_power': self.max_power_spin.value() * 2.55
-            })
-            
-            lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors(), layer_settings=self.layer_data)
+            lines = self._build_current_job_lines()
             if not lines:
-                QMessageBox.warning(self, "提示", "画布为空")
+                QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
                 return
 
-            # 2. 写入临时文件
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.nc', encoding='utf-8') as tf:
-                tf.write('\n'.join(lines))
-                temp_path = tf.name
-            
-            # 3. 询问用户远程文件名 (可选，这里先硬编码或使用默认)
-            remote_filename = "job_download.nc"
-            
-            # 4. 触发上传
-            # 注意: 上传是阻塞操作还是异步？我们现在的 communicator.upload_file_to_sd 是同步阻塞循环且处理事件
-            # 最好显示一个进度条对话框，但现在先简单处理
-            
-            QMessageBox.information(self, "开始下载", f"即将上传 {len(lines)} 行代码到设备 SD 卡...")
-            
-            success = self.communicator.upload_file_to_sd(temp_path, remote_filename)
-            
-            os.remove(temp_path) # 清理临时文件
-            
-            if success:
-                QMessageBox.information(self, "完成", "文件下载成功")
+            remote_name = self._make_remote_job_name("job")
+            if not self._upload_lines_to_device(lines, remote_name):
+                QMessageBox.warning(self, "提示", "下载失败：文件上传下位机失败")
+                return
+
+            ok_select, _ = self.communicator.send_system_command(f"+CREG:12,1,{remote_name}")
+            self._process_paused = False
+            if ok_select:
+                QMessageBox.information(self, "提示", f"下载成功：{remote_name}\n已设置为当前离线文件")
             else:
-                QMessageBox.warning(self, "失败", "文件下载失败，请查看日志")
-                
+                QMessageBox.warning(self, "提示", f"下载成功：{remote_name}\n但设置当前文件失败，请检查固件支持 +CREG:12")
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"下载过程出错: {str(e)}")
-
-    # ----------------- 测试面板功能实现 -----------------
-    def on_test_read_position(self):
-        """读取当前位置：发送查询指令"""
-        if not self.check_connection_and_alert():
-            return
-        # 常见的查询状态/位置指令，这里使用 '?' 作为示例
-        try:
-            self.communicator.send_immediate_gcode("?")
-            # 临时置为等待状态
-            self.coord_x_label.setText("X: -")
-            self.coord_y_label.setText("Y: -")
-            self.coord_z_label.setText("Z: -")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"发送查询失败: {e}")
-
-    def on_test_move_to_target(self):
-        """移动到目标位置，发送绝对移动指令"""
-        if not self.check_connection_and_alert():
-            return
-        try:
-            x = float(self.x_target.text())
-            y = float(self.y_target.text())
-        except Exception:
-            QMessageBox.warning(self, "输入错误", "目标坐标必须为数字")
-            return
-
-        # 使用快速移动 G0 指令
-        cmd = f"G0 X{float(x):.3f} Y{float(y):.3f}"
-        if self.chk_laser_on.isChecked():
-            # 如果勾选出光，先关闭出光（安全）或按需处理
-            pass
-
-        self.communicator.send_immediate_gcode(cmd)
-
-    def on_test_prev_time(self):
-        """显示前次加工时间（示例为占位）"""
-        # 目前没有真实记录，显示占位
-        self.prev_time_label.setText("00时:00分:00秒:000毫秒")
-
-    def on_axis_move(self, axis: str, direction: int):
-        """单轴点动移动，direction: 1 or -1"""
-        if not self.check_connection_and_alert():
-            return
-        try:
-            offset = float(self.offset_edit.text()) * direction
-        except Exception:
-            QMessageBox.warning(self, "输入错误", "偏移必须为数字")
-            return
-
-        try:
-            speed = float(self.speed_edit.text())
-        except Exception:
-            speed = 50.0
-
-        # 转换速度到 mm/min（G代码通常使用 mm/min）
-        feed = int(speed * 60)
-        # 使用 $J 相对插补点动（参考已有快捷命令）
-        cmd = f"$J=G91 {axis}{offset:.3f} F{feed}"
-        self.communicator.send_immediate_gcode(cmd)
-
-    def on_origin_xy(self):
-        if not self.check_connection_and_alert():
-            return
-        # 将 XY 轴设置为当前为原点
-        self.communicator.send_immediate_gcode("G10 L20 P0 X0 Y0")
-
-    def on_origin_z(self):
-        if not self.check_connection_and_alert():
-            return
-        self.communicator.send_immediate_gcode("G10 L20 P0 Z0")
-
-    def on_origin_u(self):
-        if not self.check_connection_and_alert():
-            return
-        # U 轴同样设置为0（如果存在）
-        self.communicator.send_immediate_gcode("G10 L20 P0 U0")
-
-    def on_focus(self):
-        if not self.check_connection_and_alert():
-            return
-        # 寻焦为示例命令，具体命令需根据设备定义
-        self.communicator.send_immediate_gcode("G28")
-
-    def on_locate(self):
-        if not self.check_connection_and_alert():
-            return
-        # 定位为示例命令
-        self.communicator.send_immediate_gcode("G0 X0 Y0")
+            QMessageBox.critical(self, "错误", f"下载失败: {str(e)}")
 
     def on_btn_cut_border_clicked(self):
         """切边框"""
         if not self.check_connection_and_alert():
             return
-        QMessageBox.information(self, "提示", "切边框功能暂未实现")
+        try:
+            commands = self._build_border_gcode_commands(laser_on=True)
+            ok, failed_cmd = self._send_realtime_gcode_sequence(commands)
+            if ok:
+                QMessageBox.information(self, "提示", "切边框命令已下发")
+            else:
+                QMessageBox.warning(self, "提示", f"切边框失败，命令下发失败: {failed_cmd}")
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"切边框失败: {str(e)}")
 
     def on_btn_walk_border_clicked(self):
         """走边框"""
         if not self.check_connection_and_alert():
             return
-        QMessageBox.information(self, "提示", "走边框功能暂未实现")
+        try:
+            commands = self._build_border_gcode_commands(laser_on=False)
+            ok, failed_cmd = self._send_realtime_gcode_sequence(commands)
+            if ok:
+                QMessageBox.information(self, "提示", "走边框命令已下发")
+            else:
+                QMessageBox.warning(self, "提示", f"走边框失败，命令下发失败: {failed_cmd}")
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"走边框失败: {str(e)}")
 
     def on_comm_log(self, msg):
         print(f"[Comm] {msg}")
@@ -1029,49 +1667,70 @@ class RightPanel(QWidget):
         QMessageBox.critical(self, "通信错误", msg)
 
     def on_sending_finished(self):
-        QMessageBox.information(self, "提示", "加工完成！")
+        self._process_paused = False
+        if self._debug_process_start_ts is not None:
+            self._debug_last_process_duration_ms = max(
+                0,
+                int((time.time() - self._debug_process_start_ts) * 1000),
+            )
+            self._debug_process_start_ts = None
+            if hasattr(self, "dbg_last_time_label"):
+                self.dbg_last_time_label.setText(
+                    self._format_duration_text(self._debug_last_process_duration_ms)
+                )
+        if getattr(self, "_manual_stop_requested", False):
+            self._manual_stop_requested = False
+            QMessageBox.information(self, "提示", "加工已停止")
+        else:
+            QMessageBox.information(self, "提示", "加工完成！")
 
     def on_btn_save_offline_clicked(self):
         """保存为脱机文件"""
         if not self.canvas:
             return
-            
+
         file_path, _ = QFileDialog.getSaveFileName(self, "保存为脱机文件", "", "NC Files (*.nc);;All Files (*)")
         if file_path:
             try:
-                exporter = GCodeExporter()
-                # 这里可以根据界面设置更新 exporter.config
-                # 例如: exporter.set_config({'feed_rate': self.speed_spin.value() * 60}) 
-
-                # 同样传入图层参数
-                try:
-                    layer_params_map = {}
-                    for hex_color, p in self.layer_data.items():
-                        key = str(hex_color).upper()
-                        layer_params_map[key] = {
-                            'seal_gap': getattr(p, 'seal_gap', 0.0),
-                            'laser_on_delay': getattr(p, 'laser_on_delay', 0),
-                            'laser_off_delay': getattr(p, 'laser_off_delay', 0),
-                            'mode': getattr(p, 'mode', '激光切割'),
-                        }
-                    exporter.set_layer_params(layer_params_map)
-                except Exception:
-                    pass
-
-                lines = exporter.export_canvas(self.canvas, allowed_colors=self.get_output_enabled_colors())
+                lines = self._build_current_job_lines()
+                if not lines:
+                    QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
+                    return
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(lines))
-                QMessageBox.information(self, "成功", "脱机文件保存成功！")
+                QMessageBox.information(self, "成功", "脱机文件保存成功")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
 
     def on_btn_offline_output_clicked(self):
         """脱机文件输出"""
-        # 模拟输出功能，实际可能需要连接设备或保存到特定位置
+        if not self.check_connection_and_alert():
+            return
         if not self.canvas:
             return
-            
-        QMessageBox.information(self, "提示", "脱机文件输出功能已就绪。\n(此处应连接设备或执行输出逻辑)")
+
+        try:
+            remote_name = self._last_remote_job_name
+            if not remote_name:
+                lines = self._build_current_job_lines()
+                if not lines:
+                    QMessageBox.warning(self, "提示", "画布为空或没有可输出的图形")
+                    return
+                remote_name = self._make_remote_job_name("offline")
+                if not self._upload_lines_to_device(lines, remote_name):
+                    QMessageBox.warning(self, "提示", "脱机文件输出失败：文件上传下位机失败")
+                    return
+
+            ok_select, ok_run = self._run_remote_file(remote_name)
+            self._process_paused = False
+            if ok_select and ok_run:
+                QMessageBox.information(self, "提示", f"脱机文件已开始输出：{remote_name}")
+            elif ok_select and not ok_run:
+                QMessageBox.warning(self, "提示", f"文件已选中：{remote_name}\n但启动执行失败，请检查固件支持 +CREG:13")
+            else:
+                QMessageBox.warning(self, "提示", f"脱机文件输出失败：{remote_name}\n请检查固件支持 +CREG:12/+CREG:13")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"脱机文件输出失败: {str(e)}")
 
     def on_layer_moved(self, source_row, target_row):
         """处理图层移动"""
@@ -1204,13 +1863,13 @@ class RightPanel(QWidget):
         row2.addWidget(QLabel("最小功率(%)"))
         self.min_power_spin = QDoubleSpinBox()
         self.min_power_spin.setRange(0, 100)
-        self.min_power_spin.setValue(30.0)
+        self.min_power_spin.setValue(0.0)
         row2.addWidget(self.min_power_spin)
         
         row2.addWidget(QLabel("最大功率(%)"))
         self.max_power_spin = QDoubleSpinBox()
         self.max_power_spin.setRange(0, 100)
-        self.max_power_spin.setValue(30.0)
+        self.max_power_spin.setValue(100.0)
         row2.addWidget(self.max_power_spin)
         param_layout.addLayout(row2)
         
@@ -1302,53 +1961,36 @@ class RightPanel(QWidget):
 
         # 1. 扫描画布上的颜色
         used_colors = set()
-        from ui.graphics_items import EditablePathItem, EditableEllipseItem, TextGraphicsItem
+        bitmap_colors = set()
+        from ui.graphics_items import EditablePathItem, EditableEllipseItem
         from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem
         
         LAYER_COLOR_ROLE = Qt.UserRole + 100
-
-        # 辅助：收集每种颜色的项目类型，用于推断默认模式
-        color_item_types = {} 
 
         for item in self.canvas.scene.items():
             color = None
             if isinstance(item, (EditablePathItem, EditableEllipseItem)):
                 color = item.pen().color()
-                item_type = 'vector'
             elif isinstance(item, QGraphicsTextItem):
                 color = item.defaultTextColor()
-                item_type = 'text'
-            elif isinstance(item, TextGraphicsItem):
-                color = item.pen().color()
-                item_type = 'text'
             elif isinstance(item, QGraphicsPixmapItem):
                 # 检查是否有绑定的图层颜色
                 color_data = item.data(LAYER_COLOR_ROLE)
                 if color_data and isinstance(color_data, QColor):
                     color = color_data
-                item_type = 'image'
+                    bitmap_colors.add(color.name().upper())
             
             if color and color.isValid():
-                hex_color = color.name().upper()
-                used_colors.add(hex_color)
-                
-                if hex_color not in color_item_types:
-                    color_item_types[hex_color] = set()
-                color_item_types[hex_color].add(item_type)
+                used_colors.add(color.name().upper())
 
         # 2. 同步数据
         for hex_color in used_colors:
             if hex_color not in self.layer_data:
-                new_params = LayerParams(QColor(hex_color))
-                # 智能识别默认模式
-                if hex_color in color_item_types:
-                    types = color_item_types[hex_color]
-                    if 'image' in types:
-                        new_params.mode = "激光扫描"  # 图片默认扫描
-                    else:
-                        new_params.mode = "激光切割" # 其他默认切割
-                
-                self.layer_data[hex_color] = new_params
+                params = LayerParams(QColor(hex_color))
+                # 位图导入是特例：新建图层默认使用激光扫描模式
+                if hex_color in bitmap_colors:
+                    params.mode = "激光扫描"
+                self.layer_data[hex_color] = params
 
         # --- 优化：检查是否需要重建表格 ---
         if not force:
@@ -1478,59 +2120,6 @@ class RightPanel(QWidget):
         hex_color = self.layer_table.item(row, 0).data(Qt.UserRole)
         self.current_layer_color = hex_color # 更新当前选中的颜色
         
-        # --- 新增：实现点选图层 -> 选中画布对应图形 ---
-        # 只有当不是程序内部同步触发（即用户手动点击图层列表）时才执行
-        if not self._internal_selection_change and self.canvas and self.canvas.scene:
-            try:
-                target_color_name = hex_color
-                
-                from ui.graphics_items import EditablePathItem, EditableEllipseItem
-                from PyQt5.QtWidgets import QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsItem
-                LAYER_COLOR_ROLE = Qt.UserRole + 100
-                
-                # 遍历所有项，匹配颜色的设为选中，不匹配的取消选中
-                # 注意：这里会触发 selectionChanged 信号，进而触发 on_selection_changed
-                # 但由于 on_selection_changed 会再次调用 selectRow (如果是同一行则可能是无操作，或者是重入)
-                # 关键是我们需要防止 on_layer_selected 再次被递归调用导致的逻辑混乱
-                # 基于 self._internal_selection_change 的保护逻辑主要是在 on_selection_changed -> on_layer_selected 这个方向
-                # 这里是 on_layer_selected -> canvas -> on_selection_changed -> on_layer_selected
-                # 所以我们需要在这里也设置标志，告诉 on_selection_changed "这是我触发的，你别管" 
-                # 或者，on_selection_changed 本身就是为了同步 "Canvas -> Layer List"。
-                # 如果 Canvas 变了（因为我们在这里改的），on_selection_changed 会再次尝试 selectRow。
-                # 如果 Row 已经是对的，selectRow 不会有副作用。
-                
-                # 为了安全，我们可以临时禁用 on_selection_changed 的影响？
-                # 但 on_selection_changed 是 MainWindow 连接的。RightPanel 不好直接断开。
-                # 实际上，只要 on_selection_changed 里的 selectRow 不会改变当前行（因为它就是当前行），
-                # 那么 on_layer_selected 就不会再次被触发。
-                # 只有当 Canvas 上选中的东西导致 逻辑认为应该选中 另一行时 才会出问题。
-                # 这里我们是全选该颜色的所有东西，所以 Canvas 选中的只能是这个颜色的，逻辑上会选中当前行。
-                # 所以应该是安全的。
-                
-                for item in self.canvas.scene.items():
-                    # 忽略不可选或隐藏的项
-                    if not item.flags() & QGraphicsItem.ItemIsSelectable or not item.isVisible():
-                        continue
-                        
-                    color = None
-                    if isinstance(item, (EditablePathItem, EditableEllipseItem)):
-                         color = item.pen().color()
-                    elif isinstance(item, QGraphicsTextItem):
-                         color = item.defaultTextColor()
-                    elif isinstance(item, QGraphicsPixmapItem):
-                         color_data = item.data(LAYER_COLOR_ROLE)
-                         if color_data and isinstance(color_data, QColor):
-                             color = color_data
-                    
-                    if color and color.name().upper() == target_color_name:
-                        item.setSelected(True)
-                    else:
-                        item.setSelected(False)
-                     
-            except Exception as e:
-                print(f"Sync layer selection error: {e}")
-        # -----------------------------------------------
-
         params = self.layer_data.get(hex_color)
         if params:
             self.color_bar.setStyleSheet(f"background-color: {hex_color}; border: 1px solid #888;")
@@ -1552,13 +2141,13 @@ class RightPanel(QWidget):
                 # 确保参数存在，如果不存在则初始化
                 if not hasattr(params, 'speed_2'):
                     params.speed_2 = 100.0
-                    params.min_power_2 = 30.0
-                    params.max_power_2 = 30.0
+                    params.min_power_2 = 0.0
+                    params.max_power_2 = 100.0
 
                 self.speed_spin.setValue(params.speed_2)
                 self.speed_spin.setEnabled(True)
-                self.min_power_spin.setValue(getattr(params, 'min_power_2', 30.0))
-                self.max_power_spin.setValue(getattr(params, 'max_power_2', 30.0))
+                self.min_power_spin.setValue(getattr(params, 'min_power_2', 0.0))
+                self.max_power_spin.setValue(getattr(params, 'max_power_2', 100.0))
             else:
                 # 默认显示激光1参数 (或者都选中时优先显示激光1)
                 is_default = getattr(params, 'is_speed_default', False)
@@ -1766,12 +2355,12 @@ class RightPanel(QWidget):
                 
                 # 锁定状态 (锁定 = 不可移动 + 不可选择)
                 # 注意：EditablePathItem 可能还有其他 flag，这里只控制 Movable/Selectable
-                is_unlocked = not params.is_locked
-                item.setFlag(QGraphicsItem.ItemIsMovable, is_unlocked)
-                item.setFlag(QGraphicsItem.ItemIsSelectable, is_unlocked)
+                is_interactive = bool(params.is_visible and (not params.is_locked))
+                item.setFlag(QGraphicsItem.ItemIsMovable, is_interactive)
+                item.setFlag(QGraphicsItem.ItemIsSelectable, is_interactive)
                 
-                # 如果被锁定且当前被选中，则取消选中
-                if params.is_locked and item.isSelected():
+                # 隐藏或锁定时，如果当前被选中则取消选中
+                if (not params.is_visible or params.is_locked) and item.isSelected():
                     item.setSelected(False)
 
     def on_selection_changed(self):
@@ -1803,10 +2392,8 @@ class RightPanel(QWidget):
                 hex_color = color.name().upper()
                 for row in range(self.layer_table.rowCount()):
                     if self.layer_table.item(row, 0).data(Qt.UserRole) == hex_color:
-                        self._internal_selection_change = True  # 设置标志，防止反向触发
                         self.layer_table.selectRow(row)
-                        self.on_layer_selected() # 刷新参数显示
-                        self._internal_selection_change = False # 复位标志
+                        self.on_layer_selected() # 手动触发更新参数
                         break
 
     # 激光按钮点击回调
@@ -1833,129 +2420,144 @@ class RightPanel(QWidget):
 
     def create_output_tab(self):
         """输出页面"""
-        widget=QWidget()
-        layout=QVBoxLayout(widget)
-        layout.setContentsMargins(8,8,8,8)
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        cycle_group=QGroupBox("")
-        cycle_layout=QVBoxLayout()
-        cycle_layout.setContentsMargins(5,5,5,5)
+        def _make_readonly_combo(items):
+            combo = QComboBox()
+            combo.setView(QListView())
+            combo.setMaxVisibleItems(10)
+            combo.setEditable(True)
+            combo.lineEdit().setReadOnly(True)
+            combo.addItems(items)
+            return combo
+
+        # 1) 循环加工
+        cycle_group = QGroupBox("")
+        cycle_layout = QVBoxLayout(cycle_group)
+        cycle_layout.setContentsMargins(5, 5, 5, 5)
         cycle_layout.setSpacing(6)
 
-        cycle_check=QCheckBox("循环加工")
-        cycle_layout.addWidget(cycle_check)
+        self.output_cycle_check = QCheckBox("循环加工")
+        cycle_layout.addWidget(self.output_cycle_check)
 
-        cycle_row1=QHBoxLayout()
-        cycle_row1.setSpacing(5)
-        cycle_row1.addWidget(QLabel("循环次数:"),0)
-        cycle_count=QSpinBox()
-        cycle_count.setRange(0,999)
-        cycle_count.setValue(0)
-        cycle_row1.addWidget(cycle_count,1)
-        cycle_row1.addWidget(QLabel("先切割后送料"),0)
-        cycle_order=QComboBox()
-        cycle_order.setView(QListView()) # 解决遮挡问题
-        cycle_order.setMaxVisibleItems(10)
-        cycle_order.setEditable(True)
-        cycle_order.lineEdit().setReadOnly(True)
-        cycle_order.addItems(["先切割后送料","先送料后切割","往返送料"])
-        cycle_row1.addWidget(cycle_order,1)
-        cycle_layout.addLayout(cycle_row1)
+        self.output_cycle_content = QWidget()
+        cycle_grid = QGridLayout(self.output_cycle_content)
+        cycle_grid.setContentsMargins(22, 0, 0, 0)
+        cycle_grid.setHorizontalSpacing(6)
+        cycle_grid.setVerticalSpacing(6)
 
-        cycle_row2=QHBoxLayout()
-        cycle_row2.setSpacing(5)
-        cycle_row2.addWidget(QLabel("送料长度:"),0)
-        feed_length=QDoubleSpinBox()
-        feed_length.setRange(0,9999)
-        feed_length.setValue(500.0)
-        feed_length.setSuffix("")
-        cycle_row2.addWidget(feed_length,1)
-        cycle_row2.addWidget(QLabel("手动输入"),0)
-        feed_input=QComboBox()
-        feed_input.setView(QListView()) # 解决遮挡问题
-        feed_input.setMaxVisibleItems(10)
-        feed_input.setEditable(True)
-        feed_input.lineEdit().setReadOnly(True)
-        feed_input.addItems(["手动输入","Y向幅面","图形高度","最小送料长度"])
-        cycle_row2.addWidget(feed_input,1)
-        cycle_layout.addLayout(cycle_row2)
+        cycle_grid.addWidget(QLabel("循环次数:"), 0, 0)
+        self.output_cycle_count = QSpinBox()
+        self.output_cycle_count.setRange(0, 9999)
+        self.output_cycle_count.setValue(0)
+        cycle_grid.addWidget(self.output_cycle_count, 0, 1)
 
-        cycle_row3=QHBoxLayout()
-        cycle_row3.setSpacing(5)
-        cycle_row3.addWidget(QLabel("送料补偿:"),0)
-        feed_comp=QDoubleSpinBox()
-        feed_comp.setRange(0,999)
-        feed_comp.setValue(0.000)
-        feed_comp.setSuffix("")
-        cycle_row3.addWidget(feed_comp,1)
-        pause_check=QCheckBox("送料后暂停")
-        cycle_row3.addWidget(pause_check,0)
-        cycle_layout.addLayout(cycle_row3)
+        self.output_cycle_order = _make_readonly_combo(["先切割后送料", "先送料后切割", "往返送料"])
+        cycle_grid.addWidget(self.output_cycle_order, 0, 2)
 
-        cycle_group.setLayout(cycle_layout)
+        cycle_grid.addWidget(QLabel("送料长度:"), 1, 0)
+        self.output_feed_length = QDoubleSpinBox()
+        self.output_feed_length.setRange(0.0, 99999.0)
+        self.output_feed_length.setDecimals(3)
+        self.output_feed_length.setValue(500.0)
+        cycle_grid.addWidget(self.output_feed_length, 1, 1)
+
+        self.output_feed_source = _make_readonly_combo(["手动输入", "Y向幅面", "图形高度", "最小送料长度"])
+        cycle_grid.addWidget(self.output_feed_source, 1, 2)
+
+        cycle_grid.addWidget(QLabel("送料补偿:"), 2, 0)
+        self.output_feed_comp = QDoubleSpinBox()
+        self.output_feed_comp.setRange(-9999.0, 9999.0)
+        self.output_feed_comp.setDecimals(3)
+        self.output_feed_comp.setValue(0.0)
+        cycle_grid.addWidget(self.output_feed_comp, 2, 1)
+
+        self.output_pause_after_feed = QCheckBox("送料后暂停")
+        cycle_grid.addWidget(self.output_pause_after_feed, 2, 2)
+
+        cycle_layout.addWidget(self.output_cycle_content)
         layout.addWidget(cycle_group)
 
-        split_group=QGroupBox("超幅面分块切割")
-        split_layout=QVBoxLayout()
-        split_layout.setContentsMargins(5,5,5,5)
+        # 2) 超幅面分块切割
+        split_group = QGroupBox("")
+        split_layout = QVBoxLayout(split_group)
+        split_layout.setContentsMargins(5, 5, 5, 5)
         split_layout.setSpacing(6)
 
-        split_check=QCheckBox("超幅面分块切割")
-        split_layout.addWidget(split_check)
+        self.output_split_check = QCheckBox("超幅面分块切割")
+        split_layout.addWidget(self.output_split_check)
 
-        split_row1=QHBoxLayout()
-        split_row1.setSpacing(5)
-        split_row1.addWidget(QLabel("幅面高度:"),0)
-        height=QDoubleSpinBox()
-        height.setRange(0,9999)
-        height.setValue(500.000)
-        height.setSuffix("")
-        split_row1.addWidget(height,1)
-        force_split=QCheckBox("强制分块")
-        split_row1.addWidget(force_split,0)
-        split_layout.addLayout(split_row1)
+        self.output_split_content = QWidget()
+        split_grid = QGridLayout(self.output_split_content)
+        split_grid.setContentsMargins(22, 0, 0, 0)
+        split_grid.setHorizontalSpacing(6)
+        split_grid.setVerticalSpacing(6)
 
-        split_row2=QHBoxLayout()
-        split_row2.setSpacing(5)
-        split_row2.addWidget(QLabel("角度补偿:"),0)
-        angle_comp=QDoubleSpinBox()
-        angle_comp.setRange(0,999)
-        angle_comp.setValue(0.000)
-        angle_comp.setSuffix("")
-        split_row2.addWidget(angle_comp,1)
-        end_feed=QCheckBox("结束送料")
-        split_row2.addWidget(end_feed,0)
-        split_layout.addLayout(split_row2)
+        split_grid.addWidget(QLabel("幅面高度:"), 0, 0)
+        self.output_panel_height = QDoubleSpinBox()
+        self.output_panel_height.setRange(0.001, 99999.0)
+        self.output_panel_height.setDecimals(3)
+        self.output_panel_height.setValue(500.0)
+        split_grid.addWidget(self.output_panel_height, 0, 1)
 
-        split_row3=QHBoxLayout()
-        split_row3.setSpacing(5)
-        split_row3.addWidget(QLabel("补偿直径(mm):"),0)
-        comp_dia=QDoubleSpinBox()
-        comp_dia.setRange(0,999)
-        comp_dia.setValue(1.000)
-        comp_dia.setSuffix("")
-        split_row3.addWidget(comp_dia,1)
-        joint_comp=QCheckBox("拼接补偿")
-        split_row3.addWidget(joint_comp,0)
-        split_layout.addLayout(split_row3)
+        self.output_force_split = QCheckBox("强制分块")
+        split_grid.addWidget(self.output_force_split, 0, 2)
 
-        split_group.setLayout(split_layout)
+        split_grid.addWidget(QLabel("角度补偿:"), 1, 0)
+        self.output_angle_comp = QDoubleSpinBox()
+        self.output_angle_comp.setRange(-180.0, 180.0)
+        self.output_angle_comp.setDecimals(4)
+        self.output_angle_comp.setValue(0.0)
+        split_grid.addWidget(self.output_angle_comp, 1, 1)
+
+        self.output_end_feed = QCheckBox("结束送料")
+        split_grid.addWidget(self.output_end_feed, 1, 2)
+
+        split_grid.addWidget(QLabel("补偿直径(mm):"), 2, 0)
+        self.output_comp_diameter = QDoubleSpinBox()
+        self.output_comp_diameter.setRange(0.0, 999.0)
+        self.output_comp_diameter.setDecimals(3)
+        self.output_comp_diameter.setValue(1.0)
+        split_grid.addWidget(self.output_comp_diameter, 2, 1)
+
+        self.output_joint_comp = QCheckBox("拼接补偿")
+        split_grid.addWidget(self.output_joint_comp, 2, 2)
+
+        split_layout.addWidget(self.output_split_content)
         layout.addWidget(split_group)
 
-        head_group=QGroupBox("双头互移头2优先")
-        head_layout=QVBoxLayout()
-        head_layout.setContentsMargins(5,5,5,5)
-        head_layout.setSpacing(6)
-
-        head_check=QCheckBox("双头互移头2优先")
-        head_layout.addWidget(head_check)
-
-        head_group.setLayout(head_layout)
+        # 3) 双头互移头2优先
+        head_group = QGroupBox("")
+        head_layout = QVBoxLayout(head_group)
+        head_layout.setContentsMargins(5, 5, 5, 5)
+        self.output_dual_head_priority = QCheckBox("双头互移头2优先")
+        head_layout.addWidget(self.output_dual_head_priority)
         layout.addWidget(head_group)
+
+        self.output_cycle_check.toggled.connect(self._on_output_settings_changed)
+        self.output_cycle_count.valueChanged.connect(self._on_output_settings_changed)
+        self.output_cycle_order.currentTextChanged.connect(self._on_output_settings_changed)
+        self.output_feed_length.valueChanged.connect(self._on_output_settings_changed)
+        self.output_feed_source.currentTextChanged.connect(self._on_output_settings_changed)
+        self.output_feed_comp.valueChanged.connect(self._on_output_settings_changed)
+        self.output_pause_after_feed.toggled.connect(self._on_output_settings_changed)
+
+        self.output_split_check.toggled.connect(self._on_output_settings_changed)
+        self.output_panel_height.valueChanged.connect(self._on_output_settings_changed)
+        self.output_force_split.toggled.connect(self._on_output_settings_changed)
+        self.output_angle_comp.valueChanged.connect(self._on_output_settings_changed)
+        self.output_end_feed.toggled.connect(self._on_output_settings_changed)
+        self.output_comp_diameter.valueChanged.connect(self._on_output_settings_changed)
+        self.output_joint_comp.toggled.connect(self._on_output_settings_changed)
+        self.output_dual_head_priority.toggled.connect(self._on_output_settings_changed)
 
         layout.addStretch()
 
+        self._apply_output_settings_to_ui(dict(self._output_defaults))
+        self._load_output_settings_from_canvas()
         return widget
 
     def create_file_tab(self):
@@ -2085,6 +2687,7 @@ class RightPanel(QWidget):
         # 设置自定义委托以增加行高
         self.user_param_tree.setItemDelegate(UserParamDelegate(self.user_param_tree))
         self.user_param_tree.itemClicked.connect(self.on_user_param_tree_item_clicked)
+        self.user_param_tree.itemChanged.connect(self.on_user_param_tree_item_changed)
         
         param_layout.addWidget(self.user_param_tree)
 
@@ -2094,7 +2697,14 @@ class RightPanel(QWidget):
         
         # 初始化数据
         self.init_user_params_data()
+        if os.path.exists(self.user_params_file_path):
+            try:
+                self._load_user_params_from_ini(self.user_params_file_path)
+            except Exception as e:
+                print(f"加载用户参数持久化文件失败: {e}")
+        self._load_backlash_values()
         self.update_user_param_tree()
+        self._persist_user_params_silent()
 
         # 右侧按钮区域
         btn_widget = QWidget()
@@ -2208,10 +2818,12 @@ class RightPanel(QWidget):
 
     def update_user_param_tree(self):
         """更新参数树显示"""
+        self.user_param_tree.blockSignals(True)
         self.user_param_tree.clear()
         
         idx = self.user_param_group.checkedId()
         if idx not in self.user_params:
+            self.user_param_tree.blockSignals(False)
             return
             
         categories = self.user_params[idx]
@@ -2226,6 +2838,7 @@ class RightPanel(QWidget):
             for key, value in items:
                 child = QTreeWidgetItem(cat_item)
                 child.setText(0, key)
+                child.setData(0, Qt.UserRole, (idx, cat_name, key))
                 
                 # 特殊处理按钮类型的项
                 if key == "一键设置":
@@ -2249,6 +2862,7 @@ class RightPanel(QWidget):
                 else:
                     child.setText(1, value)
                     child.setFlags(child.flags() | Qt.ItemIsEditable)
+        self.user_param_tree.blockSignals(False)
 
     def on_user_param_tree_item_clicked(self, item, column):
         """用户参数树单击事件处理"""
@@ -2257,6 +2871,26 @@ class RightPanel(QWidget):
         # 如果是下拉框类型的参数，单击即进入编辑状态（显示下拉框）
         if param_name in PARAM_OPTIONS:
             self.user_param_tree.editItem(item, 1)
+
+    def on_user_param_tree_item_changed(self, item, column):
+        """用户参数树编辑完成后，回写到数据模型并同步反向间隙配置"""
+        if column != 1:
+            return
+
+        meta = item.data(0, Qt.UserRole)
+        if not meta or len(meta) != 3:
+            return
+
+        group_idx, cat_name, key_name = meta
+        value = item.text(1)
+        updated = self._set_user_param_value(group_idx, cat_name, key_name, value)
+
+        if not updated:
+            return
+
+        if group_idx == 2 and key_name in ("反向间隙X(mm)", "反向间隙Y(mm)"):
+            self._save_backlash_values()
+        self._persist_user_params_silent()
 
     def on_one_click_setup(self):
         """打开一键设置对话框"""
@@ -2276,246 +2910,531 @@ class RightPanel(QWidget):
 
     def on_open_params_clicked(self):
         """打开参数文件"""
-        filename, _ = QFileDialog.getOpenFileName(self, "打开参数", "", "INI Files (*.ini)")
+        start_dir = os.path.dirname(self.user_params_last_open_path) if self.user_params_last_open_path else ""
+        filename, _ = QFileDialog.getOpenFileName(self, "打开参数", start_dir, "INI Files (*.ini)")
         if not filename:
-             return
-             
+            return
+
         try:
-             config = configparser.ConfigParser()
-             config.read(filename, encoding='utf-8')
-             
-             # 更新 self.user_params
-             for group_idx, categories in self.user_params.items():
-                 for cat_idx, (cat_name, items) in enumerate(categories):
-                     if cat_name in config:
-                         section = config[cat_name]
-                         new_items = []
-                         for key, value in items:
-                              if key in section:
-                                  new_items.append((key, section[key]))
-                              else:
-                                  new_items.append((key, value))
-                         # Update the category items in place
-                         categories[cat_idx] = (cat_name, new_items)
-             
-             self.update_user_param_tree()
-             QMessageBox.information(self, "提示", "参数加载成功")
-             
+            self._load_user_params_from_ini(filename)
+            self.user_params_last_open_path = filename
+            self._persist_user_params_silent()
+            QMessageBox.information(self, "提示", f"参数加载成功\n{filename}")
         except Exception as e:
-             QMessageBox.warning(self, "错误", f"加载参数失败: {str(e)}")
+            QMessageBox.warning(self, "错误", f"加载参数失败: {str(e)}")
 
     def on_save_params_clicked(self):
         """保存参数文件"""
-        filename, _ = QFileDialog.getSaveFileName(self, "保存参数", "params.ini", "INI Files (*.ini)")
+        self._save_backlash_values()
+        default_path = self.user_params_last_open_path or self.user_params_file_path
+        filename, _ = QFileDialog.getSaveFileName(self, "保存参数", default_path, "INI Files (*.ini)")
         if not filename:
-             return
-             
+            return
+
+        if not filename.lower().endswith(".ini"):
+            filename += ".ini"
+
         try:
-             config = configparser.ConfigParser()
-             
-             for group_idx, categories in self.user_params.items():
-                 for cat_name, items in categories:
-                     config[cat_name] = {}
-                     for key, value in items:
-                         # Skip buttons
-                         if key in ["一键设置", "周脉冲测试"]:
-                             continue
-                         config[cat_name][key] = str(value)
-                         
-             with open(filename, 'w', encoding='utf-8') as f:
-                 config.write(f)
-                 
-             QMessageBox.information(self, "提示", "参数保存成功")
-             
+            self._save_user_params_to_ini(filename)
+            self.user_params_last_open_path = filename
+            self._persist_user_params_silent()
+            QMessageBox.information(self, "提示", f"参数保存成功\n{filename}")
         except Exception as e:
-             QMessageBox.warning(self, "错误", f"保存参数失败: {str(e)}")
+            QMessageBox.warning(self, "错误", f"保存参数失败: {str(e)}")
 
     def on_read_params_clicked(self):
         """读取机器参数"""
         if not self.check_connection_and_alert():
-             return
+            return
 
-        # 模拟读取参数
-        QMessageBox.information(self, "提示", "正在从机器读取参数...")
-        
-        # 模拟：更新一些值
-        # 假设读取到了 工件直径=50
         try:
-             # 查找 "其他参数" -> "旋转雕刻" -> "工件直径(mm)"
-             # loop to find
-             found = False
-             categories = self.user_params[2] # Other params
-             for cat_idx, (cat_name, items) in enumerate(categories):
-                 if cat_name == "旋转雕刻":
-                     new_items = []
-                     for key, value in items:
-                         if key == "工件直径(mm)":
-                             new_items.append((key, "50.000")) # Simulated read value
-                             found = True
-                         else:
-                             new_items.append((key, value))
-                     categories[cat_idx] = (cat_name, new_items)
-                     break
-            
-             if found:
-                 self.update_user_param_tree()
-                 QMessageBox.information(self, "提示", "参数读取成功 (模拟: 工件直径已更新为 50.000)")
-             else:
-                 QMessageBox.information(self, "提示", "参数读取成功")
+            remote_name = self._remote_user_params_filename()
+            ini_text = ""
+            tried = []
+
+            for cmd_tpl in self.USER_PARAMS_READ_COMMANDS:
+                cmd = cmd_tpl.format(filename=remote_name)
+                tried.append(cmd)
+                ok, resp_text = self.communicator.send_system_command(cmd)
+                if not ok:
+                    continue
+                extracted = self._extract_ini_text_from_response(resp_text)
+                if extracted:
+                    ini_text = extracted
+                    break
+
+            if not ini_text:
+                raise RuntimeError(
+                    "下位机未返回可解析的 INI 参数文本。\n"
+                    f"已尝试命令: {' | '.join(tried)}"
+                )
+
+            self._parse_machine_ini_text(ini_text)
+            self._persist_user_params_silent()
+            QMessageBox.information(self, "提示", "参数读取成功，界面已更新。")
 
         except Exception as e:
-             QMessageBox.warning(self, "错误", f"读取参数失败: {str(e)}")
+            QMessageBox.warning(self, "错误", f"读取参数失败: {str(e)}")
 
     def on_write_params_clicked(self):
         """写入机器参数"""
         if not self.check_connection_and_alert():
-             return
+            return
 
-        # 模拟写入
-        QMessageBox.information(self, "提示", "正在写入参数到机器...")
-        QMessageBox.information(self, "提示", "参数写入成功 (模拟)")
+        try:
+            # 先确保界面参数落盘为 INI
+            self._save_backlash_values()
+            self._save_user_params_to_ini(self.user_params_file_path)
+            self.user_params_last_open_path = self.user_params_file_path
+            remote_name = self._remote_user_params_filename()
+
+            # 上传 INI 到下位机
+            upload_ok = self.communicator.upload_file_to_sd(self.user_params_file_path, remote_name)
+            if not upload_ok:
+                raise RuntimeError("参数文件上传失败。")
+
+            # 尝试通知下位机应用参数
+            applied = False
+            applied_cmd = ""
+            for cmd_tpl in self.USER_PARAMS_APPLY_COMMANDS:
+                cmd = cmd_tpl.format(filename=remote_name)
+                ok, _ = self.communicator.send_system_command(cmd)
+                if ok:
+                    applied = True
+                    applied_cmd = cmd
+                    break
+
+            self._persist_user_params_silent()
+            if applied:
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    f"参数写入成功。\nINI已上传: {remote_name}\n已发送应用命令: {applied_cmd}",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    f"INI已上传到下位机: {remote_name}\n但未确认应用命令执行，请检查固件支持的参数加载指令。",
+                )
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"写入参数失败: {str(e)}")
 
     def create_test_tab(self):
-        """创建测试标签页"""
-        widget=QWidget()
-        layout=QVBoxLayout(widget)
-        layout.setContentsMargins(8,8,8,8)
-        layout.setSpacing(8)
+        """创建调试标签页（布局与 RDWorks 风格一致）"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
-        coord_group=QGroupBox("坐标控制")
-        coord_layout=QVBoxLayout(coord_group)
-        coord_layout.setContentsMargins(10,10,10,10)
-        coord_layout.setSpacing(6)
+        main_group = QGroupBox()
+        main_layout = QVBoxLayout(main_group)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
 
-        coord_display_layout=QHBoxLayout()
-        self.coord_x_label = QLabel("X=?")
-        self.coord_y_label = QLabel("Y=?")
-        self.coord_z_label = QLabel("Z=?")
-        coord_display_layout.addWidget(self.coord_x_label)
-        coord_display_layout.addWidget(self.coord_y_label)
-        coord_display_layout.addWidget(self.coord_z_label)
-        coord_display_layout.addStretch()
-        self.btn_read_pos = QPushButton("读当前位置")
-        self.btn_read_pos.clicked.connect(self.on_test_read_position)
-        coord_display_layout.addWidget(self.btn_read_pos)
-        coord_layout.addLayout(coord_display_layout)
+        top_grid = QGridLayout()
+        top_grid.setHorizontalSpacing(8)
+        top_grid.setVerticalSpacing(6)
 
-        target_layout=QHBoxLayout()
-        self.x_target = QLineEdit("0.000")
-        self.y_target = QLineEdit("0.000")
-        target_layout.addWidget(self.x_target)
-        target_layout.addWidget(self.y_target)
-        self.btn_move_to_target = QPushButton("移动到目标位置")
-        self.btn_move_to_target.clicked.connect(self.on_test_move_to_target)
-        target_layout.addWidget(self.btn_move_to_target)
-        coord_layout.addLayout(target_layout)
+        self.dbg_pos_label_x = QLabel("X=?")
+        self.dbg_pos_label_y = QLabel("Y=?")
+        self.dbg_pos_label_z = QLabel("Z=?")
 
-        time_layout=QHBoxLayout()
-        self.prev_time_label = QLabel("0时:0分:0秒:0毫秒")
-        time_layout.addWidget(self.prev_time_label)
-        time_layout.addStretch()
-        self.btn_prev_time = QPushButton("前次加工时间")
-        self.btn_prev_time.clicked.connect(self.on_test_prev_time)
-        time_layout.addWidget(self.btn_prev_time)
-        coord_layout.addLayout(time_layout)
-        layout.addWidget(coord_group)
+        pos_box = QWidget()
+        pos_box_layout = QVBoxLayout(pos_box)
+        pos_box_layout.setContentsMargins(4, 4, 4, 4)
+        pos_box_layout.setSpacing(2)
+        pos_box_layout.addWidget(self.dbg_pos_label_x)
+        pos_box_layout.addWidget(self.dbg_pos_label_y)
+        pos_box_layout.addWidget(self.dbg_pos_label_z)
 
-        axis_group=QGroupBox("单轴移动")
-        axis_layout=QVBoxLayout(axis_group)
-        axis_layout.setContentsMargins(10,10,10,10)
+        self.dbg_btn_read_pos = QPushButton("读取当前位置")
+        self.dbg_btn_move_target = QPushButton("移动到目标位置")
+        self.dbg_btn_last_time = QPushButton("前次加工时间")
+
+        self.dbg_target_x_edit = QLineEdit("0.000")
+        self.dbg_target_y_edit = QLineEdit("0.000")
+        self.dbg_target_x_edit.setFixedWidth(96)
+        self.dbg_target_y_edit.setFixedWidth(96)
+
+        target_row = QHBoxLayout()
+        target_row.setContentsMargins(0, 0, 0, 0)
+        target_row.setSpacing(6)
+        target_row.addWidget(self.dbg_target_x_edit)
+        target_row.addWidget(self.dbg_target_y_edit)
+
+        self.dbg_last_time_label = QLabel("0时:0分:0秒:0毫秒")
+
+        top_grid.addWidget(pos_box, 0, 0)
+        top_grid.addWidget(self.dbg_btn_read_pos, 0, 1)
+        top_grid.addLayout(target_row, 1, 0)
+        top_grid.addWidget(self.dbg_btn_move_target, 1, 1)
+        top_grid.addWidget(self.dbg_last_time_label, 2, 0)
+        top_grid.addWidget(self.dbg_btn_last_time, 2, 1)
+
+        main_layout.addLayout(top_grid)
+
+        axis_group = QGroupBox("单轴移动")
+        axis_layout = QVBoxLayout(axis_group)
+        axis_layout.setContentsMargins(8, 8, 8, 8)
         axis_layout.setSpacing(6)
 
-        xy_layout=QHBoxLayout()
-        xy_button_layout=QVBoxLayout()
-        self.btn_y_plus = QPushButton("Y+")
-        self.btn_y_plus.clicked.connect(lambda: self.on_axis_move('Y', 1))
-        xy_button_layout.addWidget(self.btn_y_plus)
-        xy_mid_layout=QHBoxLayout()
-        self.btn_x_minus = QPushButton("X-")
-        self.btn_origin_xy = QPushButton("原点")
-        self.btn_x_plus = QPushButton("X+")
-        self.btn_x_minus.clicked.connect(lambda: self.on_axis_move('X', -1))
-        self.btn_origin_xy.clicked.connect(self.on_origin_xy)
-        self.btn_x_plus.clicked.connect(lambda: self.on_axis_move('X', 1))
-        xy_mid_layout.addWidget(self.btn_x_minus)
-        xy_mid_layout.addWidget(self.btn_origin_xy)
-        xy_mid_layout.addWidget(self.btn_x_plus)
-        xy_button_layout.addLayout(xy_mid_layout)
-        self.btn_y_minus = QPushButton("Y-")
-        self.btn_y_minus.clicked.connect(lambda: self.on_axis_move('Y', -1))
-        xy_button_layout.addWidget(self.btn_y_minus)
-        xy_layout.addLayout(xy_button_layout)
+        upper_layout = QHBoxLayout()
+        upper_layout.setSpacing(10)
 
-        param_layout=QVBoxLayout()
-        param_layout.addWidget(QLabel("偏移(mm):"))
-        self.offset_edit=QLineEdit("10.000")
-        param_layout.addWidget(self.offset_edit)
-        param_layout.addWidget(QLabel("速度(mm/s):"))
-        self.speed_edit=QLineEdit("50")
-        param_layout.addWidget(self.speed_edit)
-        param_layout.addWidget(QLabel("激光功率(%):"))
-        self.power_edit=QLineEdit("0")
-        param_layout.addWidget(self.power_edit)
-        xy_layout.addLayout(param_layout)
-        axis_layout.addLayout(xy_layout)
+        xy_panel = QWidget()
+        xy_panel_layout = QGridLayout(xy_panel)
+        xy_panel_layout.setContentsMargins(0, 0, 0, 0)
+        xy_panel_layout.setHorizontalSpacing(4)
+        xy_panel_layout.setVerticalSpacing(4)
 
-        lower_layout=QHBoxLayout()
-        zu_button_layout=QVBoxLayout()
-        self.btn_z_plus = QPushButton("Z+")
-        self.btn_z_plus.clicked.connect(lambda: self.on_axis_move('Z', 1))
-        zu_button_layout.addWidget(self.btn_z_plus)
-        zu_mid_layout=QHBoxLayout()
-        self.btn_origin_z = QPushButton("原点")
-        self.btn_z_minus = QPushButton("Z-")
-        self.btn_origin_z.clicked.connect(self.on_origin_z)
-        self.btn_z_minus.clicked.connect(lambda: self.on_axis_move('Z', -1))
-        zu_mid_layout.addWidget(self.btn_origin_z)
-        zu_mid_layout.addWidget(self.btn_z_minus)
-        zu_button_layout.addLayout(zu_mid_layout)
-        self.btn_u_plus = QPushButton("U+")
-        self.btn_u_plus.clicked.connect(lambda: self.on_axis_move('U', 1))
-        zu_button_layout.addWidget(self.btn_u_plus)
-        zu_mid2_layout=QHBoxLayout()
-        self.btn_origin_u = QPushButton("原点")
-        self.btn_u_minus = QPushButton("U-")
-        self.btn_origin_u.clicked.connect(self.on_origin_u)
-        self.btn_u_minus.clicked.connect(lambda: self.on_axis_move('U', -1))
-        zu_mid2_layout.addWidget(self.btn_origin_u)
-        zu_mid2_layout.addWidget(self.btn_u_minus)
-        zu_button_layout.addLayout(zu_mid2_layout)
-        lower_layout.addLayout(zu_button_layout)
+        self.dbg_btn_y_plus = QPushButton("Y+")
+        self.dbg_btn_x_minus = QPushButton("X-")
+        self.dbg_btn_xy_home = QPushButton("原点")
+        self.dbg_btn_x_plus = QPushButton("X+")
+        self.dbg_btn_y_minus = QPushButton("Y-")
 
-        check_layout=QVBoxLayout()
-        self.chk_continuous = QCheckBox("连续运动")
-        self.chk_from_origin = QCheckBox("从原点移动")
-        self.chk_laser_on = QCheckBox("是否出光")
-        check_layout.addWidget(self.chk_continuous)
-        check_layout.addWidget(self.chk_from_origin)
-        check_layout.addWidget(self.chk_laser_on)
-        check_layout.addStretch()
-        self.btn_focus = QPushButton("寻焦")
-        self.btn_focus.clicked.connect(self.on_focus)
-        self.btn_locate = QPushButton("定位")
-        self.btn_locate.clicked.connect(self.on_locate)
-        check_layout.addWidget(self.btn_focus)
-        check_layout.addWidget(self.btn_locate)
-        
-        # 新增调试按钮 - 已移除，功能合并至主界面工具箱
-        # btn_debug = QPushButton("高级调试/命令模式")
-        # btn_debug.clicked.connect(self.open_debug_console)
-        # btn_debug.setStyleSheet("background-color: #e1f5fe; border: 1px solid #039be5; color: #0277bd; font-weight: bold;")
-        # check_layout.addWidget(btn_debug)
+        xy_panel_layout.addWidget(self.dbg_btn_y_plus, 0, 1)
+        xy_panel_layout.addWidget(self.dbg_btn_x_minus, 1, 0)
+        xy_panel_layout.addWidget(self.dbg_btn_xy_home, 1, 1)
+        xy_panel_layout.addWidget(self.dbg_btn_x_plus, 1, 2)
+        xy_panel_layout.addWidget(self.dbg_btn_y_minus, 2, 1)
 
-        lower_layout.addLayout(check_layout)
+        upper_layout.addWidget(xy_panel, 0, Qt.AlignTop)
+
+        param_panel = QWidget()
+        param_grid = QGridLayout(param_panel)
+        param_grid.setContentsMargins(0, 0, 0, 0)
+        param_grid.setHorizontalSpacing(6)
+        param_grid.setVerticalSpacing(4)
+
+        self.dbg_offset_edit = QLineEdit("10.000")
+        self.dbg_speed_edit = QLineEdit("50")
+        self.dbg_power_edit = QLineEdit("0")
+        self.dbg_offset_edit.setFixedWidth(88)
+        self.dbg_speed_edit.setFixedWidth(88)
+        self.dbg_power_edit.setFixedWidth(88)
+
+        param_grid.addWidget(QLabel("偏移(mm):"), 0, 0)
+        param_grid.addWidget(self.dbg_offset_edit, 0, 1)
+        param_grid.addWidget(QLabel("速度(mm/s):"), 1, 0)
+        param_grid.addWidget(self.dbg_speed_edit, 1, 1)
+        param_grid.addWidget(QLabel("激光功率(%):"), 2, 0)
+        param_grid.addWidget(self.dbg_power_edit, 2, 1)
+
+        upper_layout.addWidget(param_panel, 1)
+        axis_layout.addLayout(upper_layout)
+
+        check_row = QHBoxLayout()
+        check_row.setSpacing(18)
+
+        self.dbg_chk_continuous = QCheckBox("连续运动")
+        self.dbg_chk_from_origin = QCheckBox("从原点移动")
+        self.dbg_chk_laser_on = QCheckBox("是否出光")
+
+        check_row.addWidget(self.dbg_chk_continuous)
+        check_row.addWidget(self.dbg_chk_from_origin)
+        check_row.addWidget(self.dbg_chk_laser_on)
+        check_row.addStretch()
+        axis_layout.addLayout(check_row)
+
+        lower_layout = QGridLayout()
+        lower_layout.setHorizontalSpacing(4)
+        lower_layout.setVerticalSpacing(4)
+
+        self.dbg_btn_z_plus = QPushButton("Z+")
+        self.dbg_btn_z_home = QPushButton("原点")
+        self.dbg_btn_z_minus = QPushButton("Z-")
+
+        self.dbg_btn_u_plus = QPushButton("U+")
+        self.dbg_btn_u_home = QPushButton("原点")
+        self.dbg_btn_u_minus = QPushButton("U-")
+
+        self.dbg_btn_focus = QPushButton("寻焦")
+        self.dbg_btn_locate = QPushButton("定位")
+        self.dbg_btn_shot = QPushButton("点射")
+
+        lower_layout.addWidget(self.dbg_btn_z_plus, 0, 0)
+        lower_layout.addWidget(self.dbg_btn_z_home, 0, 1)
+        lower_layout.addWidget(self.dbg_btn_z_minus, 0, 2)
+
+        lower_layout.addWidget(self.dbg_btn_u_plus, 0, 3)
+        lower_layout.addWidget(self.dbg_btn_u_home, 0, 4)
+        lower_layout.addWidget(self.dbg_btn_u_minus, 0, 5)
+
+        lower_layout.addWidget(self.dbg_btn_focus, 0, 6)
+        lower_layout.addWidget(self.dbg_btn_locate, 1, 6)
+        lower_layout.addWidget(self.dbg_btn_shot, 2, 6)
+
         axis_layout.addLayout(lower_layout)
-        layout.addWidget(axis_group)
 
+        main_layout.addWidget(axis_group)
+        layout.addWidget(main_group)
+        layout.addStretch()
+
+        self._wire_debug_panel_actions()
         return widget
 
-    def open_debug_console(self):
-        """打开高级调试控制台"""
-        dialog = CommandDebugDialog(self.communicator, self)
-        dialog.exec_()
+    def _wire_debug_panel_actions(self):
+        self.dbg_btn_read_pos.clicked.connect(self.on_debug_read_current_position)
+        self.dbg_btn_move_target.clicked.connect(self.on_debug_move_to_target)
+        self.dbg_btn_last_time.clicked.connect(self.on_debug_show_last_time)
+
+        self.dbg_btn_x_minus.clicked.connect(lambda: self.on_debug_axis_move("X", -1))
+        self.dbg_btn_x_plus.clicked.connect(lambda: self.on_debug_axis_move("X", 1))
+        self.dbg_btn_y_minus.clicked.connect(lambda: self.on_debug_axis_move("Y", -1))
+        self.dbg_btn_y_plus.clicked.connect(lambda: self.on_debug_axis_move("Y", 1))
+
+        self.dbg_btn_z_minus.clicked.connect(lambda: self.on_debug_axis_move("Z", -1))
+        self.dbg_btn_z_plus.clicked.connect(lambda: self.on_debug_axis_move("Z", 1))
+        self.dbg_btn_u_minus.clicked.connect(lambda: self.on_debug_axis_move("U", -1))
+        self.dbg_btn_u_plus.clicked.connect(lambda: self.on_debug_axis_move("U", 1))
+
+        self.dbg_btn_xy_home.clicked.connect(lambda: self.on_debug_axis_home("XY"))
+        self.dbg_btn_z_home.clicked.connect(lambda: self.on_debug_axis_home("Z"))
+        self.dbg_btn_u_home.clicked.connect(lambda: self.on_debug_axis_home("U"))
+
+        self.dbg_btn_focus.clicked.connect(self.on_debug_focus)
+        self.dbg_btn_locate.clicked.connect(self.on_debug_locate)
+        self.dbg_btn_shot.clicked.connect(self.on_debug_shot)
+
+    def _debug_send_gcode(self, command: str, need_connection: bool = True):
+        cmd = (command or "").strip()
+        if not cmd:
+            return False, ""
+        if need_connection and not self.check_connection_and_alert():
+            return False, ""
+        return self.communicator.send_custom_command(35, cmd)
+
+    def _debug_send_system(self, command: str, need_connection: bool = True):
+        cmd = (command or "").strip()
+        if not cmd:
+            return False, ""
+        if need_connection and not self.check_connection_and_alert():
+            return False, ""
+        return self.communicator.send_system_command(cmd)
+
+    def _debug_read_float(self, editor: QLineEdit, field_name: str, default: float = None):
+        raw = editor.text().strip()
+        if raw == "" and default is not None:
+            return float(default)
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"{field_name} 请输入有效数字")
+
+    def _debug_move_rate_to_feed(self, mm_per_sec: float):
+        return max(1.0, float(mm_per_sec) * 60.0)
+
+    def _format_duration_text(self, total_ms: int):
+        ms = max(0, int(total_ms))
+        hour = ms // 3600000
+        ms -= hour * 3600000
+        minute = ms // 60000
+        ms -= minute * 60000
+        second = ms // 1000
+        ms -= second * 1000
+        return f"{hour}时:{minute}分:{second}秒:{ms}毫秒"
+
+    def _parse_position_from_response(self, resp_text: str):
+        text = resp_text or ""
+        result = {}
+
+        mpos = re.search(r"MPos\s*:\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)", text, re.IGNORECASE)
+        if mpos:
+            result["X"] = float(mpos.group(1))
+            result["Y"] = float(mpos.group(2))
+            result["Z"] = float(mpos.group(3))
+
+        for axis in ("X", "Y", "Z"):
+            if axis in result:
+                continue
+            m = re.search(rf"\b{axis}\s*[:=]\s*([-+]?\d*\.?\d+)", text, re.IGNORECASE)
+            if m:
+                result[axis] = float(m.group(1))
+
+        return result
+
+    def _update_debug_position_labels(self, pos_dict):
+        x = pos_dict.get("X")
+        y = pos_dict.get("Y")
+        z = pos_dict.get("Z")
+
+        self.dbg_pos_label_x.setText(f"X={x:.3f}" if x is not None else "X=?")
+        self.dbg_pos_label_y.setText(f"Y={y:.3f}" if y is not None else "Y=?")
+        self.dbg_pos_label_z.setText(f"Z={z:.3f}" if z is not None else "Z=?")
+
+    def on_debug_read_current_position(self):
+        ok, resp = self._debug_send_system("+CREG:6,0")
+        if not ok:
+            QMessageBox.warning(self, "提示", "读取当前位置失败")
+            return
+
+        pos = self._parse_position_from_response(resp)
+        if pos:
+            self._update_debug_position_labels(pos)
+            return
+
+        ok2, resp2 = self._debug_send_gcode("?")
+        if ok2:
+            pos2 = self._parse_position_from_response(resp2)
+            if pos2:
+                self._update_debug_position_labels(pos2)
+                return
+
+        QMessageBox.information(
+            self,
+            "提示",
+            "已发送读取位置命令，但响应未解析到坐标。请检查下位机返回格式。",
+        )
+
+    def _build_debug_motion_command(self, axis_delta: dict, from_origin: bool, continuous: bool, speed_mm_s: float):
+        if from_origin:
+            parts = ["G90", "G0"]
+            for axis, value in axis_delta.items():
+                parts.append(f"{axis}{value:.3f}")
+            parts.append(f"F{self._debug_move_rate_to_feed(speed_mm_s):.1f}")
+            return " ".join(parts)
+
+        if continuous:
+            parts = ["$J=G91"]
+            for axis, value in axis_delta.items():
+                parts.append(f"{axis}{value:.3f}")
+            parts.append(f"F{self._debug_move_rate_to_feed(speed_mm_s):.1f}")
+            return " ".join(parts)
+
+        parts = ["G91", "G0"]
+        for axis, value in axis_delta.items():
+            parts.append(f"{axis}{value:.3f}")
+        parts.append(f"F{self._debug_move_rate_to_feed(speed_mm_s):.1f}")
+        return " ".join(parts)
+
+    def on_debug_axis_move(self, axis: str, direction: int):
+        try:
+            offset = abs(self._debug_read_float(self.dbg_offset_edit, "偏移", 10.0))
+            speed = abs(self._debug_read_float(self.dbg_speed_edit, "速度", 50.0))
+            power = self._debug_read_float(self.dbg_power_edit, "激光功率", 0.0)
+        except ValueError as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+
+        if offset <= 0:
+            QMessageBox.warning(self, "参数错误", "偏移必须大于 0")
+            return
+        if speed <= 0:
+            QMessageBox.warning(self, "参数错误", "速度必须大于 0")
+            return
+        if power < 0 or power > 100:
+            QMessageBox.warning(self, "参数错误", "激光功率范围为 0~100")
+            return
+
+        delta = float(direction) * offset
+        cmd = self._build_debug_motion_command(
+            {axis.upper(): delta},
+            from_origin=self.dbg_chk_from_origin.isChecked(),
+            continuous=self.dbg_chk_continuous.isChecked(),
+            speed_mm_s=speed,
+        )
+
+        if self.dbg_chk_laser_on.isChecked() and power > 0:
+            sequence = [f"M3 S{power:.1f}", cmd, "M5"]
+        else:
+            sequence = [cmd]
+
+        for item in sequence:
+            ok, _ = self._debug_send_gcode(item)
+            if not ok:
+                QMessageBox.warning(self, "执行失败", f"下发失败: {item}")
+                return
+
+    def on_debug_axis_home(self, axis_group: str):
+        axis_group = (axis_group or "").upper()
+        if axis_group == "XY":
+            cmd = "G90 G0 X0 Y0"
+        elif axis_group == "Z":
+            cmd = "G90 G0 Z0"
+        elif axis_group == "U":
+            cmd = "G90 G0 U0"
+        else:
+            return
+
+        ok, _ = self._debug_send_gcode(cmd)
+        if not ok:
+            QMessageBox.warning(self, "执行失败", f"原点回位失败: {axis_group}")
+
+    def on_debug_move_to_target(self):
+        try:
+            target_x = self._debug_read_float(self.dbg_target_x_edit, "目标X", 0.0)
+            target_y = self._debug_read_float(self.dbg_target_y_edit, "目标Y", 0.0)
+            speed = abs(self._debug_read_float(self.dbg_speed_edit, "速度", 50.0))
+        except ValueError as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+
+        if speed <= 0:
+            QMessageBox.warning(self, "参数错误", "速度必须大于 0")
+            return
+
+        cmd = (
+            f"G90 G0 X{target_x:.3f} Y{target_y:.3f} "
+            f"F{self._debug_move_rate_to_feed(speed):.1f}"
+        )
+        ok, _ = self._debug_send_gcode(cmd)
+        if not ok:
+            QMessageBox.warning(self, "执行失败", "移动到目标位置失败")
+            return
+
+        self.dbg_pos_label_x.setText(f"X={target_x:.3f}")
+        self.dbg_pos_label_y.setText(f"Y={target_y:.3f}")
+
+    def on_debug_focus(self):
+        commands = ["+CREG:18,1", "+CREG:17,1"]
+        for cmd in commands:
+            ok, _ = self._debug_send_system(cmd)
+            if ok:
+                return
+        QMessageBox.warning(self, "执行失败", "寻焦命令下发失败，请确认固件支持 +CREG:18 或 +CREG:17")
+
+    def on_debug_locate(self):
+        commands = ["+CREG:10,1", "+CREG:6,0"]
+        for cmd in commands:
+            ok, resp = self._debug_send_system(cmd)
+            if ok:
+                pos = self._parse_position_from_response(resp)
+                if pos:
+                    self._update_debug_position_labels(pos)
+                return
+        QMessageBox.warning(self, "执行失败", "定位命令下发失败，请确认固件支持 +CREG:10")
+
+    def on_debug_shot(self):
+        try:
+            power = self._debug_read_float(self.dbg_power_edit, "激光功率", 0.0)
+        except ValueError as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+
+        if power <= 0 or power > 100:
+            QMessageBox.warning(self, "参数错误", "点射功率需在 0~100 且大于 0")
+            return
+
+        sequence = [
+            f"M3 S{power:.1f}",
+            "G4 P200",
+            "M5",
+        ]
+        for cmd in sequence:
+            ok, _ = self._debug_send_gcode(cmd)
+            if not ok:
+                QMessageBox.warning(self, "执行失败", f"点射失败: {cmd}")
+                return
+
+    def on_debug_show_last_time(self):
+        if self._debug_last_process_duration_ms is None:
+            QMessageBox.information(self, "提示", "当前没有前次加工时间记录")
+            return
+        self.dbg_last_time_label.setText(
+            self._format_duration_text(self._debug_last_process_duration_ms)
+        )
 
     def create_transform_tab(self):
         """创建变换标签页"""
